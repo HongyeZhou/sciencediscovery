@@ -16,7 +16,7 @@ import { expect } from "@playwright/test";
 import { test } from "./helpers/e2e.ts";
 import { cleanupJourney, createProjectAndSession, openProjectSession, type JourneyFixture } from "./helpers/journeys.ts";
 
-test.describe("project panel collapse", { tag: ["@category:e2e", "@os:linux", "@arch:amd64", "@model:mock", "@sandbox:bubblewrap"] }, () => {
+test.describe("project panel collapse", { tag: ["@isolation:session", "@category:e2e", "@os:linux", "@arch:amd64", "@model:mock", "@sandbox:bubblewrap"] }, () => {
   test.use({ locale: "en-US" });
 
   for (const count of [1, 3]) {
