@@ -30,8 +30,9 @@ import yaml
 from sciencediscovery_adapter.gateway import rpc
 
 REPO = Path(__file__).resolve().parents[2]
+(REPO / ".tmp").mkdir(exist_ok=True)
 REPORT = Path(tempfile.mkdtemp(prefix="embedded-swarm-", dir=REPO / ".tmp"))
-SOURCE = Path(os.environ["JIUWENSWARM_SRC"]).resolve()
+SOURCE = Path(os.environ.get("JIUWENSWARM_SRC", REPO / ".sciencediscovery-data/jiuwenswarm/src")).resolve()
 NAME = "sciencediscovery"
 BASE = {**os.environ, "JIUWENSWARM_SRC": str(SOURCE), "JIUWENSWARM_INSTANCE": NAME,
         "JIUWENSWARM_ROOT": str(REPORT / "install-state")}
@@ -151,7 +152,9 @@ try:
         record(f"3. PASS ({second} stopped first): sibling stays live; selected instance stops.")
     assert (roots["embedded"] / f"jiuwenswarm-{NAME}.log").is_file()
     verdict = "PASS"
-except Exception as error:
+except (Exception, KeyboardInterrupt) as error:
+    if "BLOCKED:" in str(error):
+        verdict = "BLOCKED"
     steps.append(f"{type(error).__name__}: {error}")
     raise
 finally:
