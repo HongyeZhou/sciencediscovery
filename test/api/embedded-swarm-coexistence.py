@@ -24,6 +24,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 import yaml
@@ -46,7 +47,7 @@ def command(root, arguments, *, check=True):
     result = subprocess.run(arguments, cwd=REPO,
                             env={**BASE, "JIUWENSWARM_HOME": str(roots[root])},
                             capture_output=True, text=True, timeout=210)
-    (REPORT / f"{len(list(REPORT.glob('command-*.log'))):03d}-command.log").write_text(
+    (REPORT / f"{len(list(REPORT.glob('*-command.log'))):03d}-command.log").write_text(
         f"{root}: {' '.join(arguments)}\nexit={result.returncode}\n{result.stdout}\n{result.stderr}")
     if check:
         assert result.returncode == 0, result.stdout + result.stderr
@@ -83,6 +84,8 @@ def start(root):
                                  stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
         log.close()
         children.append(child)
+        # A user shell reaps the launcher; do likewise so stop can observe its exit.
+        threading.Thread(target=child.wait, daemon=True).start()
     deadline = time.monotonic() + 180
     while time.monotonic() < deadline:
         if wrapper(root, "status", check=False).returncode == 0:
