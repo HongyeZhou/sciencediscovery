@@ -199,7 +199,7 @@ cmd_start() {
   verify_compatibility_patches
   # Detach completely (stdin, stdout, stderr): a background job that keeps the caller's stdout open
   # makes `scripts/jiuwenswarm.sh start | tee ...`, or any script capturing its output, wait forever.
-  cd "$jw_root"
+  cd "$JIUWENSWARM_HOME"
   # Web search is configured from ScienceDiscovery's web settings, which the API applies with config.set.
   # Put our guarded sitecustomize hook in every JiuwenSwarm Python process. It applies JiuwenSwarm's
   # own MCP call-timeout patch before startup prewarming can create a client with the 30-second fallback.
