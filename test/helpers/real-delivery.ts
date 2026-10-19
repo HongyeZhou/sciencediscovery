@@ -35,3 +35,19 @@ export async function collectFinalDelivery(page: Page, sessionId: string, runId:
   }
   return { status: deliveryStatus(run.status, artifacts), run_status: run.status, answer, artifacts, errors };
 }
+
+/** Budget exhaustion is a test outcome even if cancellation wins the subsequent status-read race. */
+export async function collectTeamRunResult(page: Page, sessionId: string, runId: string, budgetExceeded: boolean) {
+  let cancelHttpStatus: number | null = null;
+  let cancelError: string | null = null;
+  if (budgetExceeded) {
+    try {
+      const response = await page.request.post(`${apiBaseUrl()}/api/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/cancel`, { headers: authorizationHeader() });
+      cancelHttpStatus = response.status();
+    } catch (error) { cancelError = error instanceof Error ? error.message : String(error); }
+  }
+  const delivery = await collectFinalDelivery(page, sessionId, runId);
+  return { delivery, integration: budgetExceeded ? "timed_out" : delivery.status,
+    budget_exceeded: budgetExceeded, cancel_requested: budgetExceeded,
+    cancel_http_status: cancelHttpStatus, cancel_error: cancelError };
+}

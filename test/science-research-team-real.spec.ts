@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import { collectFinalDelivery } from "./helpers/real-delivery.ts";
+import { collectTeamRunResult } from "./helpers/real-delivery.ts";
 import { evaluateTeam } from "./helpers/research-team.ts";
 import { expect } from "@playwright/test";
 import { test, allowRealEnvException, requireRealEnv, requireRealStack } from "./helpers/e2e.ts";
@@ -109,21 +109,27 @@ test("TC-E2E-01 research team with custom Specialist and MCP signoff", { tag: ["
     while (Date.now() - started < budget) {
       const runs = await api<any[]>(`${prefix}/runs`);
       const state = runs.find(r => r.id === runId);
+      if (state) metrics.run = state;
       children = await api<any[]>(`${prefix}/subagents`);
       await save("team-children.json", children); await save("signoff-calls.json", checker.calls);
       if (state && ["completed", "failed", "cancelled"].includes(state.status)) {
-        terminal = true; metrics.run = state; break;
+        terminal = true; break;
       }
       await new Promise(resolve => setTimeout(resolve, 10_000));
     }
     metrics.generation_duration_ms = Date.now() - started;
-    if (!terminal) {
-      await page.request.post(`${apiBaseUrl()}${prefix}/runs/${runId}/cancel`, { headers }).catch(() => undefined);
-    }
-    const delivery = await collectFinalDelivery(page, fixture.session.id, runId);
-    metrics.delivery = delivery;
-    metrics.integration = delivery.status;
+    metrics.budget_exceeded = !terminal;
+    // Persist timeout attribution even if cancellation or delivery collection fails.
+    if (!terminal) metrics.integration = "timed_out";
+    metrics.cancel_requested = !terminal;
     await save("team-metrics.json", metrics);
+    const result = await collectTeamRunResult(page, fixture.session.id, runId, !terminal);
+    Object.assign(metrics, result);
+    const { delivery } = result;
+    await save("team-metrics.json", metrics);
+    expect(metrics.budget_exceeded,
+      `Team run exceeded ${budget}ms budget after ${metrics.generation_duration_ms}ms; cancel requested=${metrics.cancel_requested}, HTTP=${metrics.cancel_http_status}, observed run status=${delivery.run_status}`
+    ).toBe(false);
     expect(delivery.status, "Main run must complete and reference a readable nonempty final artifact").toBe("passed");
     try {
       const catalog = await api<any[]>(`${prefix}/artifacts`);

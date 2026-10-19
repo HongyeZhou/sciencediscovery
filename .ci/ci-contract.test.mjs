@@ -383,6 +383,7 @@ test("the real E2E packaging fixture excludes diagnostics from scores without re
     "misnamed-directory/benchmark-metrics.json/trace.zip",
   ];
   const privateFields = {prompt: "PRIVATE_FIXTURE prompt", delivery: {artifacts: [{text: "PRIVATE_FIXTURE output"}]},
+    cancel_error: "PRIVATE_FIXTURE cancel error",
     tool_errors: [{content: "PRIVATE_FIXTURE error"}], configuration: {token: "PRIVATE_FIXTURE credential"},
     turns: [{prompt: "PRIVATE_FIXTURE follow-up"}], run: {messages: ["PRIVATE_FIXTURE message"]}};
   const metadata = {schema_version: 1, integration_status: "passed", started_at: "2026-10-06T21:00:00Z",
@@ -392,7 +393,8 @@ test("the real E2E packaging fixture excludes diagnostics from scores without re
       race: {status: "completed", overall_score: 0.72}, fact: {status: "completed", citation_accuracy: 80,
         verification_coverage: 75, effective_citations: 4}}}],
     ["real-research/e2e/test-results/benchmark-case/benchmark-metrics.json", {...metadata, case_id: "da-13-3", evaluation: {status: "passed", score: 87}}],
-    ["real-team/e2e/.hidden-case/team-metrics.json", {...metadata, case: "TC-E2E-01", integration: "passed", evaluation: {status: "completed", total_score: 92, gating: false}}],
+    ["real-team/e2e/.hidden-case/team-metrics.json", {...metadata, case: "TC-E2E-01", integration: "timed_out",
+      budget_ms: 55 * 60_000, budget_exceeded: true, cancel_requested: true, cancel_http_status: 202, evaluation: {status: "completed", total_score: 92, gating: false}}],
     ["evolve/e2e/test-results/evolve-case/evolve-metrics.json", {...metadata, case: "PUCT-COMPRESS",
       evaluation: {status: "completed", score: 0.61, baseline_gate_score: 0.55, best_gate_score: 0.63},
       llm_evaluation: {status: "error", total_score: null, gating: false}}],

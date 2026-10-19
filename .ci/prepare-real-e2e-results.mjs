@@ -38,7 +38,8 @@ function scoreDocument(doc, name) {
   if (!doc || Array.isArray(doc) || typeof doc !== "object") throw new SyntaxError("Expected an object");
   if (metrics.has(name)) {
     const out = pick(doc, ["schema_version", "case", "case_id", "integration_status", "integration",
-      "started_at", "finished_at", "generation_duration_ms"]);
+      "started_at", "finished_at", "generation_duration_ms", "budget_ms",
+      "budget_exceeded", "cancel_requested", "cancel_http_status"]);
     for (const key of ["evaluation", "llm_evaluation"]) {
       if (doc[key] && typeof doc[key] === "object") out[key] = scoreFields(doc[key]);
     }

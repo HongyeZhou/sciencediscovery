@@ -21,6 +21,7 @@ export function finalReferences(run, messages, artifacts) {
 }
 
 export function deliveryStatus(runStatus, delivered) {
+  if (["queued", "running", "blocked"].includes(runStatus)) return "running";
   return delivered.length ? runStatus === "completed" ? "passed" : "partial" : "failed";
 }
 
