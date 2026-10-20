@@ -80,7 +80,9 @@ class DomainDatabaseTests(unittest.IsolatedAsyncioTestCase):
         getter = AsyncMock(return_value=xml)
         with patch(PATCH + "_get_text", new=getter):
             result = await m.geo_get_samples("GSE1000", limit=1)
-        self.assertEqual(getter.await_args.kwargs["params"]["acc"], "GSE1000")
+        self.assertEqual(getter.await_args_list[0].kwargs["params"]["acc"], "GSE1000")
+        self.assertEqual(getter.await_args_list[1].kwargs["params"]["acc"], "GSM1")
+        self.assertEqual(getter.await_args_list[1].kwargs["params"]["view"], "quick")
         data = result["records"][0]["structuredData"]["metadata"]
         self.assertEqual(data["Channel"][0]["Characteristics"][0]["text"], "dexamethasone")
         self.assertEqual(data["Platform-Ref"][0]["attributes"]["ref"], "GPL1")

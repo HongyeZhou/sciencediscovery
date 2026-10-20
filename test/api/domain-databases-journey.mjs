@@ -27,7 +27,7 @@ const sha = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).tri
 const root = resolve(".tmp", `domain-databases-${randomUUID()}`), data = resolve(root, "data"), token = randomUUID();
 await mkdir(root, { recursive: true });
 let outcome = "FAIL", api, stub, logs = "";
-const steps = [], processes = [], evidence = {};
+const steps = [], processes = [], evidence = {}, failures = [], analysis = [];
 const redact = value => String(value).replaceAll(token, "[redacted]").replaceAll(process.cwd(), "<worktree>");
 async function until(check, timeout = 120_000) {
   const end = Date.now() + timeout;
@@ -68,6 +68,10 @@ async function request(path, body, method = body === undefined ? "GET" : "POST",
 async function step(name, expected, operation) {
   try { const actual = await operation(); steps.push({ name, expected, actual, status: "PASS" }); console.log(name, "PASS", actual); }
   catch (error) { steps.push({ name, expected, actual: redact(error.stack), status: "FAIL" }); throw error; }
+}
+async function independentStep(name, expected, operation) {
+  try { await step(name, expected, operation); }
+  catch (error) { failures.push(`${name}: ${error.message}`); }
 }
 let session, project;
 async function inspect(source, tool, input) {
@@ -117,35 +121,67 @@ try {
     for (const id of ["geo", "chembl", "clinvar", "pdb", "alphafold"]) assert.equal(sources.find(s => s.manifest.id === id)?.status.status, "ready", id);
     return "Five sources ready; Session selections saved; live model calls disabled";
   });
-  await step("2. Retrieve domain evidence", "All providers return structured records and scientific context", async () => {
+  await independentStep("2a. GEO evidence", "Study metadata, paged sample annotations and actual files", async () => {
     const geo = await inspect("geo", "lookup_accession", { accession: "GSE1000" }); assert.equal(geo.result.records[0].identifier, "GSE1000");
-    const samples = await inspect("geo", "get_samples", { accession: "GSE1000", limit: 5 }); assert.ok(samples.result.records.length > 0); assert.match(JSON.stringify(samples.result), /Platform-Ref/);
     const files = await inspect("geo", "list_files", { accession: "GSE1000", limit: 25 }); assert.ok(files.result.data.files.some(f => f.format === "series-matrix"));
-    const chembl = await inspect("chembl", "search_activities", { target_chembl_id: "CHEMBL203", standard_type: "IC50", standard_units: "nM", standard_relation: "=", standard_value_max: 100, confidence_score_min: 8, limit: 2 });
+    const samples = await inspect("geo", "get_samples", { accession: "GSE1000", limit: 1 }); assert.ok(samples.result.records.length > 0); assert.match(JSON.stringify(samples.result), /Platform-Ref/);
+    return "GSE1000 study, real file listings and source-identified sample metadata retrieved";
+  });
+  await independentStep("2b. ChEMBL evidence", "Measurement constraints, assay confidence and non-overlapping pages", async () => {
+    const input = { target_chembl_id: "CHEMBL203", standard_type: "IC50", standard_units: "nM", standard_relation: "=", standard_value_max: 100, confidence_score_min: 8, limit: 2 };
+    const chembl = await inspect("chembl", "search_activities", input);
     assert.ok(chembl.result.records.length > 0); assert.ok(chembl.result.data.pagination.nextOffset > 0);
     for (const r of chembl.result.records) { assert.equal(r.structuredData.standard_units, "nM"); assert.ok(r.structuredData.assay_metadata.confidence_score >= 8); }
-    const next = await inspect("chembl", "search_activities", { target_chembl_id: "CHEMBL203", standard_type: "IC50", standard_units: "nM", standard_relation: "=", standard_value_max: 100, confidence_score_min: 8, limit: 2, offset: chembl.result.data.pagination.nextOffset });
+    const next = await inspect("chembl", "search_activities", { ...input, offset: chembl.result.data.pagination.nextOffset });
     assert.ok(next.result.records.every(r => !chembl.result.records.some(old => old.identifier === r.identifier)));
-    const clinvar = await inspect("clinvar", "get_assertions", { accession: "VCV000014206" }); assert.ok(clinvar.result.records[0].structuredData.assertions[0].accession.startsWith("SCV"));
-    const pdb = await inspect("pdb", "lookup_structure", { pdb_id: "1CRN" }); assert.equal(pdb.result.records[0].structuredData.structureType, "experimental");
-    const af = await inspect("alphafold", "lookup_prediction", { accession: "P69905" }); assert.equal(af.result.records[0].structuredData.structureType, "predicted"); assert.ok(af.result.records[0].primaryCitation.sourceVersion);
-    return "GEO samples/files, distinct ClinVar SCV, paged ChEMBL confidence-filtered activities, experimental PDB and versioned prediction verified";
+    return "Two provider pages retrieved with preserved units, relations, confidence and assay metadata";
   });
-  await step("3. Download, verify and analyze", "Completed governed artifacts have matching SHA-256; real files are parsed and provenance saved", async () => {
+  await independentStep("2c. ClinVar evidence", "Individual SCV submissions and provider versions", async () => {
+    const result = await inspect("clinvar", "get_assertions", { accession: "VCV000014206" });
+    assert.ok(result.result.records[0].structuredData.assertions[0].accession.startsWith("SCV"));
+    assert.ok(result.result.records[0].primaryCitation.sourceVersion);
+    return "Versioned VCV000014206 and distinct SCV submissions retrieved";
+  });
+  await independentStep("2d. PDB evidence", "Experimental entry metadata", async () => {
+    const result = await inspect("pdb", "lookup_structure", { pdb_id: "1CRN" });
+    assert.equal(result.result.records[0].structuredData.structureType, "experimental");
+    return "Experimental PDB 1CRN retrieved";
+  });
+  await independentStep("2e. AlphaFold evidence", "Existing prediction and model version", async () => {
+    const result = await inspect("alphafold", "lookup_prediction", { accession: "P69905" });
+    assert.equal(result.result.records[0].structuredData.structureType, "predicted"); assert.ok(result.result.records[0].primaryCitation.sourceVersion);
+    return "Existing P69905 prediction, confidence metadata and model version retrieved";
+  });
+  await independentStep("3a. PDB download and analysis", "Verified structure artifact and actual atom/chain parsing", async () => {
+    const pdb = (await download("pdb", "prepare_structure_download", { pdb_id: "1CRN", format: "pdb" }, "downloads/1CRN.pdb")).toString();
+    const atoms = pdb.split(/\r?\n/).filter(line => line.startsWith("ATOM  ")); assert.ok(atoms.length > 0);
+    const chains = [...new Set(atoms.map(line => line[21]))]; assert.ok(chains.length > 0);
+    const result = `PDB 1CRN: ${atoms.length} atoms, chains ${chains.join(', ')}.`; analysis.push(result); return result;
+  });
+  await independentStep("3b. AlphaFold download and analysis", "Verified model/confidence artifacts with real residue data", async () => {
+    const af = (await download("alphafold", "prepare_prediction_download", { accession: "P69905", format: "cif" }, "downloads/P69905.cif")).toString();
+    assert.match(af, /_atom_site\./); assert.match(af, /_ma_qa_metric/);
+    const confidence = JSON.parse((await download("alphafold", "prepare_prediction_download", { accession: "P69905", format: "plddt" }, "downloads/P69905-confidence.json")).toString());
+    assert.ok(confidence.confidenceScore?.length > 0);
+    const result = `AlphaFold P69905: predicted CIF, ${confidence.confidenceScore.length} pLDDT values.`; analysis.push(result); return result;
+  });
+  await independentStep("3c. GEO download and analysis", "Verified matrix artifact, dimensions, sample IDs and numeric values", async () => {
     const matrix = gunzipSync(await download("geo", "prepare_dataset_download", { accession: "GSE1000" }, "downloads/GSE1000.txt.gz")).toString();
     const table = matrix.split("!series_matrix_table_begin")[1]?.split("!series_matrix_table_end")[0].trim().split(/\r?\n/);
     assert.ok(table?.length > 1); const columns = table[0].split("\t"); assert.ok(columns.length > 1); assert.match(columns.slice(1).join(), /GSM/);
-    const values = table.slice(1).flatMap(row => row.split("\t").slice(1)).filter(v => v !== 'null' && v !== '"null"').map(Number); assert.ok(values.some(v => Number.isFinite(v)));
-    const pdb = (await download("pdb", "prepare_structure_download", { pdb_id: "1CRN", format: "pdb" }, "downloads/1CRN.pdb")).toString();
-    const atoms = pdb.split(/\r?\n/).filter(line => line.startsWith("ATOM  ")); assert.ok(atoms.length > 0); const chains = [...new Set(atoms.map(line => line[21]))]; assert.ok(chains.length > 0);
-    const af = (await download("alphafold", "prepare_prediction_download", { accession: "P69905", format: "cif" }, "downloads/P69905.cif")).toString(); assert.match(af, /_atom_site\./); assert.match(af, /_ma_qa_metric/);
-    const confidence = JSON.parse((await download("alphafold", "prepare_prediction_download", { accession: "P69905", format: "plddt" }, "downloads/P69905-confidence.json")).toString()); assert.ok(confidence.confidenceScore?.length > 0);
-    const report = `# Analysis of retrieved database artifacts\n\nGSE1000: ${table.length - 1} rows, ${columns.length - 1} samples. Source processing must be reviewed; this validation does not run count-based differential expression.\n\nPDB 1CRN: ${atoms.length} atoms, chains ${chains.join(', ')}. AlphaFold P69905: predicted CIF and ${confidence.confidenceScore.length} pLDDT values.\n\n` + Object.values(evidence).filter(e => e.result).flatMap(e => e.result.records.map(r => `${r.identifier}: ${r.url}; retrieved ${e.result.retrievedAt}; version ${r.primaryCitation.sourceVersion ?? 'not supplied'}`)).join("\n");
+    const values = table.slice(1).flatMap(row => row.split("\t").slice(1)).filter(v => v !== 'null' && v !== '\"null\"').map(Number);
+    assert.ok(values.some(v => Number.isFinite(v)));
+    const result = `GSE1000: ${table.length - 1} rows, ${columns.length - 1} samples. Review source processing before count-based analysis; this journey does not run DESeq2.`;
+    analysis.push(result); return result;
+  });
+  await independentStep("3d. Persist analysis provenance", "Analysis output retains source URLs, identifiers and retrieval times", async () => {
+    assert.ok(analysis.length > 0, "Actual file analysis is required");
+    const report = "# Analysis of retrieved database artifacts\n\n" + analysis.join("\n\n") + "\n\n" + Object.values(evidence).filter(e => e.result).flatMap(e => e.result.records.map(r => `${r.identifier}: ${r.url}; retrieved ${e.result.retrievedAt}; version ${r.primaryCitation.sourceVersion ?? 'not supplied'}`)).join("\n");
     await request(`/api/sessions/${session.id}/files`, { path: "domain-analysis.md", content: report }, "POST", 201);
     const r = await fetch(`${api}/api/sessions/${session.id}/file?path=domain-analysis.md`, { headers: { authorization: `Bearer ${token}` } }); assert.equal(await r.text(), report);
-    return `Matrix ${table.length - 1} x ${columns.length - 1}; PDB ${atoms.length} atoms; confidence ${confidence.confidenceScore.length} residues; persisted analysis with source URLs and retrieval times`;
+    return "Read completed artifacts and persisted analysis with original source provenance";
   });
-  await step("4. Agent use and recovery", "Selected AlphaFold tool executes through Agent; audit, validation feedback and subsequent Session turn remain usable", async () => {
+  await independentStep("4. Agent use and recovery", "Selected AlphaFold tool executes through Agent; audit, validation feedback and subsequent Session turn remain usable", async () => {
     const invalid = await request("/api/mcp/sources/alphafold/inspect", { sessionId: session.id, toolName: "alphafold_lookup_prediction", input: { accession: "../invalid" } }, "POST", 400); assert.match(invalid.error, /accession/);
     const run = await request(`/api/sessions/${session.id}/runs`, { content: "Retrieve the existing AlphaFold DB prediction for P69905 using its selected connector." }, "POST", 201);
     let terminal; await until(async () => { terminal = (await request(`/api/sessions/${session.id}/runs`)).find(r => r.id === run.id); return terminal && !["queued", "running"].includes(terminal.status); });
@@ -155,6 +191,7 @@ try {
     await until(async () => { terminal = (await request(`/api/sessions/${session.id}/runs`)).find(r => r.id === next.id); return terminal && !["queued", "running"].includes(terminal.status); }); assert.equal(terminal.status, "completed", terminal.error);
     return "Agent completed with actual prediction output; invalid Inspector input rejected; subsequent turn completed";
   });
+  if (failures.length) throw new Error(failures.join("\n"));
   outcome = "PASS";
 } catch (error) { console.error(redact(error.stack)); process.exitCode = outcome === "BLOCKED" ? 2 : 1; }
 finally {

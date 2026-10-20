@@ -1183,7 +1183,7 @@ async def _geo_miniml(accession: str, target: str = "self") -> ET.Element:
         raise ValueError("accession must be a GEO accession")
     xml = await _get_text(
         format_external_url("data_sources.ncbi.geo_accession_template", accession=accession),
-        params={"acc": accession, "targ": target, "form": "xml", "view": "full"}, accept="application/xml",
+        params={"acc": accession, "targ": target, "form": "xml", "view": "quick"}, accept="application/xml",
     )
     if len(xml.encode()) > 4_000_000:
         raise ValueError("GEO metadata exceeds the supported size; retrieve the family SOFT artifact instead")
@@ -1221,11 +1221,21 @@ async def geo_lookup_accession(accession: str) -> dict[str, Any]:
 async def geo_get_samples(accession: str, limit: int = 5, offset: int = 0) -> dict[str, Any]:
     """Retrieve a page of sample conditions, organisms, processing and platform annotations for a Series."""
     _page(limit, offset)
+    if limit > 5:
+        raise ValueError("Sample metadata pages are limited to 5 samples; continue with nextOffset")
     _geo_paths(accession)
-    root = await _geo_miniml(accession, "gsm")
-    samples = [node for node in root.findall("Sample") if node.find("Title") is not None]
-    page = _pagination(len(samples), offset, len(samples[offset:offset + limit]), limit)
-    return _result("geo", "get_samples", [_geo_miniml_record(node) for node in samples[offset:offset + limit]],
+    root = await _geo_miniml(accession)
+    identifiers = list(dict.fromkeys(node.get("iid") for node in root.findall("Sample") if node.get("iid")))
+    selected = identifiers[offset:offset + limit]
+    records = []
+    for identifier in selected:
+        sample_root = await _geo_miniml(identifier)
+        sample = next((node for node in sample_root.findall("Sample") if node.get("iid") == identifier and node.find("Title") is not None), None)
+        if sample is None:
+            raise ValueError(f"GEO did not return metadata for {identifier}")
+        records.append(_geo_miniml_record(sample))
+    page = _pagination(len(identifiers), offset, len(selected), limit)
+    return _result("geo", "get_samples", records,
                    data={"seriesAccession": accession.upper(), "pagination": page},
                    warnings=["Only this page of samples is returned; continue with nextOffset."] if page["hasMore"] else [])
 

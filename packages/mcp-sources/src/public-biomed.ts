@@ -449,10 +449,11 @@ export const PUBLIC_BIOMED_SOURCE_DEFINITIONS: SourceDefinition[] = [
     termsUrl: externalUrl("terms.ncbi"),
     tools: {
       get_samples: {
-        description: "Retrieve a page of GEO Series sample conditions, organisms, processing and platform annotations. Follow pagination.nextOffset; inspect data type before count-based analysis.",
-        inputSchema: objectSchema({ accession: accession("^GSE\\d+$"), limit, offset }, ["accession"]),
+        description: "Retrieve up to five GEO sample metadata records per page without expression tables. Follow pagination.nextOffset; inspect data type before count-based analysis.",
+        inputSchema: objectSchema({ accession: accession("^GSE\\d+$"), limit: { ...limit, maximum: 5 }, offset }, ["accession"]),
         keywords: ["GEO samples", "GSM", "sample conditions", "treatment groups", "GEO platform"],
         priority: 92,
+        timeoutMs: 180_000,
       },
       list_files: {
         description: "Discover actual GEO matrix, SOFT and supplementary files from NCBI listings; follow pagination.nextOffset.",
