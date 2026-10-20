@@ -95,10 +95,10 @@ async function download(source, tool, input, path) {
     if (job && ["failed", "cancelled"].includes(job.state)) throw new Error(JSON.stringify(job.error));
     return job?.state === "completed";
   });
-  assert.match(job.actualChecksum, /^[a-f0-9]{64}$/);
+  assert.match(job.actualChecksum.replace(/^sha256:/, ""), /^[a-f0-9]{64}$/);
   const r = await fetch(`${api}/api/sessions/${session.id}/file?path=${encodeURIComponent(path)}`, { headers: { authorization: `Bearer ${token}` } });
   assert.equal(r.status, 200); const bytes = Buffer.from(await r.arrayBuffer());
-  assert.equal(createHash("sha256").update(bytes).digest("hex"), job.actualChecksum);
+  assert.equal(createHash("sha256").update(bytes).digest("hex"), job.actualChecksum.replace(/^sha256:/, ""));
   assert.equal(job.sourceRecordId, candidate.sourceRecordId);
   evidence[path] = { candidate, plan: created.plan, job };
   await writeFile(resolve(root, path.split("/").at(-1)), bytes);
