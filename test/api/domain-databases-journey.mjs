@@ -85,7 +85,10 @@ async function download(source, tool, input, path) {
   const inspected = await inspect(source, tool, input);
   const candidate = inspected.result.artifacts[0]; assert.ok(candidate, "A real candidate is required");
   const created = await request(`/api/sessions/${session.id}/mcp/artifact-plans`, { candidateId: candidate.id, mcpInvocationId: inspected.invocationId, destination: { type: "workspace", path } }, "POST", 201);
-  if (created.plan.state === "awaiting_approval") await request(`/api/sessions/${session.id}/mcp/artifact-plans/${created.plan.id}/approve`, {});
+  if (created.plan.state === "awaiting_approval") {
+    await request(`/api/permission-requests/${created.plan.permissionRequestId}/decision`, { decision: "allow_once" });
+    await request(`/api/sessions/${session.id}/mcp/artifact-plans/${created.plan.id}/approve`, {});
+  }
   let job;
   await until(async () => {
     job = (await request(`/api/sessions/${session.id}/mcp/artifact-jobs`)).find(j => j.planId === created.plan.id);
