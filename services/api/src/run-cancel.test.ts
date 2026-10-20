@@ -133,36 +133,42 @@ function startHangingGateway(context: TestContext): Promise<{ origin: string; ru
   });
 }
 
-for (const startGateway of [startHangingGateway, startBlockingPermissionGateway]) {
-  test(`${startGateway.name} ignores background model requests`, async (context) => {
-    const gateway = await startGateway(context);
-    const background = await fetch(`${gateway.origin}/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ messages: [{ role: "user", content: "Build the skill index" }] }),
-      signal: AbortSignal.timeout(1_000),
-    }).catch(() => undefined);
-    assert.equal(gateway.runCount(), 0, "a background request is not a Session run turn");
-    assert.ok(background?.ok, "housekeeping receives a response instead of hanging");
+async function assertBackgroundRequestsIgnored(context: TestContext, startGateway: typeof startHangingGateway): Promise<void> {
+  const gateway = await startGateway(context);
+  const background = await fetch(`${gateway.origin}/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ messages: [{ role: "user", content: "Build the skill index" }] }),
+    signal: AbortSignal.timeout(1_000),
+  }).catch(() => undefined);
+  assert.equal(gateway.runCount(), 0, "a background request is not a Session run turn");
+  assert.ok(background?.ok, "housekeeping receives a response instead of hanging");
 
-    const turn = fetch(`${gateway.origin}/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ tools: [{ type: "function", function: { name: "run_shell" } }] }),
-      signal: AbortSignal.timeout(1_000),
-    }).catch(() => undefined);
-    await turn;
-    assert.equal(gateway.runCount(), 1, "a tool-enabled Session turn is still counted");
-    const streamedBackground = await fetch(`${gateway.origin}/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ tools: [], stream: true, messages: [{ role: "user", content: "Rebuild a subtree" }] }),
-      signal: AbortSignal.timeout(1_000),
-    });
-    assert.match(await streamedBackground.text(), /data: \[DONE\]/);
-    assert.equal(gateway.runCount(), 1, "background work after a Session turn is also excluded");
+  const turn = fetch(`${gateway.origin}/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ tools: [{ type: "function", function: { name: "run_shell" } }] }),
+    signal: AbortSignal.timeout(1_000),
+  }).catch(() => undefined);
+  await turn;
+  assert.equal(gateway.runCount(), 1, "a tool-enabled Session turn is still counted");
+  const streamedBackground = await fetch(`${gateway.origin}/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ tools: [], stream: true, messages: [{ role: "user", content: "Rebuild a subtree" }] }),
+    signal: AbortSignal.timeout(1_000),
   });
+  assert.match(await streamedBackground.text(), /data: \[DONE\]/);
+  assert.equal(gateway.runCount(), 1, "background work after a Session turn is also excluded");
 }
+
+test("hanging gateway ignores background model requests", async (context) => {
+  await assertBackgroundRequestsIgnored(context, startHangingGateway);
+});
+
+test("permission gateway ignores background model requests", async (context) => {
+  await assertBackgroundRequestsIgnored(context, startBlockingPermissionGateway);
+});
 
 function writeSseEvent(response: ServerResponse, event: unknown): void {
   response.write(`data: ${JSON.stringify(event)}\n\n`);
