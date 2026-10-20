@@ -110,7 +110,8 @@ try {
     ] });
     const model = await request("/api/models", { name: "Domain validation local stub", baseUrl: stub.baseUrl, apiToken: stub.apiToken, model: stub.model }, "POST", 201);
     const created = await request("/api/projects", { name: "Domain database live journey" }, "POST", 201); project = created.project ?? created; session = created.firstSession;
-    session = await request(`/api/sessions/${session.id}`, { modelId: model.id, enabledConnectorIds: ["geo", "chembl", "clinvar", "pdb", "alphafold"], approvalMode: "always_allow" }, "PATCH");
+    session = await request(`/api/sessions/${session.id}`, { modelId: model.id, enabledConnectorIds: ["geo", "chembl", "clinvar", "pdb", "alphafold"] }, "PATCH");
+    await request(`/api/sessions/${session.id}`, { approvalMode: "always_allow" }, "PATCH");
     await request("/api/mcp/sources/reload", {});
     const sources = await request("/api/mcp/sources");
     for (const id of ["geo", "chembl", "clinvar", "pdb", "alphafold"]) assert.equal(sources.find(s => s.manifest.id === id)?.status.status, "ready", id);
