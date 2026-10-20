@@ -596,7 +596,7 @@ function manifest(definition: SourceDefinition): McpSourceManifest {
       timeoutMs: tool.timeoutMs ?? (tool.kind === "analysis" ? 60_000 : 30_000),
     }])),
     transport: { mcpServerId: "biomed", type: "mcp" },
-    version: "1.0.0",
+    version: ["pdb", "clinvar", "chembl", "geo"].includes(definition.id) ? "2.0.0" : "1.0.0",
   };
 }
 

@@ -4414,3 +4414,21 @@ test("an action JiuwenSwarm's permission engine let through is allowed and recor
   assert.equal(authorization.outcome, "allowed");
   assert.equal(store.getPermissionAuthorization(authorization.id)?.toolCallId, "c1");
 });
+
+test("domain database selections persist across global/project/session settings and restart", async (context) => {
+  const tempRoot = resolve(process.cwd(), ".tmp", `domain-connectors-${Date.now()}-${process.pid}`);
+  await mkdir(tempRoot, { recursive: true });
+  context.after(() => rm(tempRoot, { force: true, recursive: true }));
+  const ids = ["geo", "chembl", "clinvar", "pdb", "alphafold"];
+  const store = new SessionStore(tempRoot);
+  await store.load();
+  await store.replaceGlobalSettings({ enabledConnectorIds: ids });
+  const project = await store.createProject("Domain databases");
+  await store.replaceProjectSettings(project.id, { enabledConnectorIds: ids });
+  const session = await store.createSession(project.id, "Predictions and experimental data", { enabledConnectorIds: ids }, {}, { allowUnconfiguredModel: true });
+  assert.deepEqual(store.getSessionSettings(session.id).effective.enabledConnectorIds, ids);
+  const restored = new SessionStore(tempRoot);
+  await restored.load();
+  assert.deepEqual(restored.getSessionSettings(session.id).effective.enabledConnectorIds, ids);
+  assert.deepEqual(restored.getGlobalSettings().overrides.enabledConnectorIds, ids);
+});
