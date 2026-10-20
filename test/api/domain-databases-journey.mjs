@@ -108,7 +108,7 @@ try {
       { tools: [{ name: "mcp__alphafold__lookup_prediction", arguments: { accession: "P69905" } }] },
       ({ results }) => { assert.match(results.at(-1), /AF-P69905-F1/); assert.match(results.at(-1), /predicted/); return { text: "Retrieved the existing AlphaFold prediction AF-P69905-F1 for P69905; source evidence retained." }; },
     ] });
-    const model = await request("/api/models", { name: "Domain validation local stub", baseUrl: stub.baseUrl, apiToken: stub.apiToken, model: stub.model });
+    const model = await request("/api/models", { name: "Domain validation local stub", baseUrl: stub.baseUrl, apiToken: stub.apiToken, model: stub.model }, "POST", 201);
     const created = await request("/api/projects", { name: "Domain database live journey" }, "POST", 201); project = created.project ?? created; session = created.firstSession;
     session = await request(`/api/sessions/${session.id}`, { modelId: model.id, enabledConnectorIds: ["geo", "chembl", "clinvar", "pdb", "alphafold"], approvalMode: "always_allow" }, "PATCH");
     await request("/api/mcp/sources/reload", {});
@@ -146,11 +146,11 @@ try {
   });
   await step("4. Agent use and recovery", "Selected AlphaFold tool executes through Agent; audit, validation feedback and subsequent Session turn remain usable", async () => {
     const invalid = await request("/api/mcp/sources/alphafold/inspect", { sessionId: session.id, toolName: "alphafold_lookup_prediction", input: { accession: "../invalid" } }, "POST", 400); assert.match(invalid.error, /accession/);
-    const run = await request(`/api/sessions/${session.id}/runs`, { content: "Retrieve the existing AlphaFold DB prediction for P69905 using its selected connector." });
+    const run = await request(`/api/sessions/${session.id}/runs`, { content: "Retrieve the existing AlphaFold DB prediction for P69905 using its selected connector." }, "POST", 201);
     let terminal; await until(async () => { terminal = (await request(`/api/sessions/${session.id}/runs`)).find(r => r.id === run.id); return terminal && !["queued", "running"].includes(terminal.status); });
     assert.equal(terminal.status, "completed", terminal.error); assert.deepEqual(stub.errors, []);
     const audits = await request(`/api/sessions/${session.id}/mcp/invocations`); assert.ok(audits.some(i => i.sourceId === "alphafold" && i.status === "succeeded" && !i.turnId.startsWith("mcp-inspector-")));
-    const next = await request(`/api/sessions/${session.id}/runs`, { content: "Confirm the retrieved prediction remains available." });
+    const next = await request(`/api/sessions/${session.id}/runs`, { content: "Confirm the retrieved prediction remains available." }, "POST", 201);
     await until(async () => { terminal = (await request(`/api/sessions/${session.id}/runs`)).find(r => r.id === next.id); return terminal && !["queued", "running"].includes(terminal.status); }); assert.equal(terminal.status, "completed", terminal.error);
     return "Agent completed with actual prediction output; invalid Inspector input rejected; subsequent turn completed";
   });
