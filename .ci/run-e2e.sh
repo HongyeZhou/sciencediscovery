@@ -81,7 +81,6 @@ fixture_pid=""
 fixture="${CI_E2E_FIXTURE:-standard}"
 case "$fixture" in standard|research|literature) ;; *) echo 'Unknown E2E fixture' >&2; exit 2;; esac
 if [[ "$fixture" != standard && "$group" != mocked ]]; then echo 'Offline fixtures must never reach real E2E' >&2; exit 2; fi
-test_started=0
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 mkdir -p "$results_root" "$runtime_root"
@@ -113,12 +112,8 @@ finish() {
         "$swarm_log" > "$results_root/platform-mcp-transport.log" || true
     fi
   fi
-  # Playwright writes test-results/ into the results itself (E2E_OUTPUT_DIR);
-  # only the HTML report, which it renders once the whole run ends, is copied.
-  if [[ "$test_started" -eq 1 && -d "$repository_root/.e2e/playwright-report" ]]; then
-    mkdir -p "$results_root/playwright-report"
-    cp -a "$repository_root/.e2e/playwright-report/." "$results_root/playwright-report/"
-  fi
+  # Playwright writes both results and HTML directly into this worker's tree;
+  # concurrent local shards must never copy another worker's shared report.
   if [[ "$status" -eq 0 ]]; then
     result_status="passed"
     # A preparation run installed dependencies and ran no journey; calling that
@@ -200,23 +195,20 @@ IFS= read -r auth_token < "$auth_token_path"
 
 export SCIENCE_AGENT_AUTH_TOKEN="$auth_token"
 export SCIENCE_DISCOVERY_DATA_DIR="$runtime_root/data"
-# The product's own defaults — 4310/4311, evolve 4313, memory-graph 17674 — belong
+# The product's API/Runner/memory-graph default ports belong
 # to the instance a person leaves running. A test stack that reuses them competes
 # with that instance for the port and puts its own address in front of whoever the
 # suite then talks to, so the layer keeps a block of its own. An explicit override
 # still wins, which is how two runs share one machine.
 export SCIENCE_AGENT_PORT="${SCIENCE_AGENT_PORT:-4410}"
 export SCIENCE_AGENT_RUNNER_PORT="${SCIENCE_AGENT_RUNNER_PORT:-4411}"
-export SCIENCE_AGENT_EVOLVE_PORT="${SCIENCE_AGENT_EVOLVE_PORT:-4413}"
 export SCIENCE_AGENT_MEMORY_GRAPH_PORT="${SCIENCE_AGENT_MEMORY_GRAPH_PORT:-17774}"
 # Moving a service is only half of it: the API dials each sidecar by URL, and
-# every one of those has its own hardcoded default (see
-# services/api/src/bootstrap/config.ts). Setting only the port starts the
-# service on the new one and leaves the API knocking on the old one, which
-# fails as a connection refused the API reports to the browser as a bare
-# "fetch failed". Derive every URL from the port that was just chosen.
+# Runner and memory-graph still have defaults in API configuration. Derive
+# their URLs from the chosen test ports. Evolve uses private owned control.
 export SCIENCE_AGENT_RUNNER_URL="http://127.0.0.1:${SCIENCE_AGENT_RUNNER_PORT}"
-export SCIENCE_AGENT_EVOLVE_URL="http://127.0.0.1:${SCIENCE_AGENT_EVOLVE_PORT}"
+# Evolve is started by the source launcher on its owned socket. Do not invent
+# an operator URL here: that explicitly opts out of owned service startup.
 export SCIENCE_AGENT_MEMORY_GRAPH_URL="http://127.0.0.1:${SCIENCE_AGENT_MEMORY_GRAPH_PORT}"
 # The default mocked job must not turn J3 into a conda-channel provisioning
 # job. A dedicated CI setup job may opt in after its network policy is reviewed.
@@ -235,6 +227,7 @@ export E2E_JOURNEY_REPORTS="$results_root/journey-reports"
 # ends, rather than being copied when the run exits: a cancelled job is killed
 # within seconds, before any exit trap has finished.
 export E2E_OUTPUT_DIR="$results_root/test-results"
+export E2E_HTML_REPORT="$results_root/playwright-report"
 # This layer started the stack above, on a data directory it owns, and will kill
 # it again on the way out, so a journey may empty it to reach a first-run state.
 # Nothing else grants that: a suite merely pointed at an address — someone's own
@@ -339,13 +332,13 @@ if [[ "$prepared" -eq 1 ]]; then stack_arguments+=(--no-node-build); fi
 # journeys reach whoever already owns the address, and the run reports a wall of
 # 401s that reads like a broken token. Say it here instead, while the port is
 # still the answer.
-busy_ports=("$SCIENCE_AGENT_PORT" "$SCIENCE_AGENT_RUNNER_PORT" "$SCIENCE_AGENT_EVOLVE_PORT" "$SCIENCE_AGENT_MEMORY_GRAPH_PORT")
+busy_ports=("$SCIENCE_AGENT_PORT" "$SCIENCE_AGENT_RUNNER_PORT" "$SCIENCE_AGENT_MEMORY_GRAPH_PORT")
 if [[ "$backend" == jiuwenswarm ]]; then
   busy_ports+=("${SCIENCE_AGENT_LEGACY_PORT:-$((SCIENCE_AGENT_PORT + 100))}")
 fi
 for busy_port in "${busy_ports[@]}"; do
   if ss -ltn "sport = :$busy_port" 2>/dev/null | grep -q LISTEN; then
-    printf 'BLOCKED: port %s is already in use; another stack owns it. Choose free API (including its legacy port +100), runner, evolve and memory-graph ports.\n' \
+    printf 'BLOCKED: port %s is already in use; another stack owns it. Choose free API (including its legacy port +100), runner and memory-graph ports. Evolve uses a launcher-owned ephemeral port.\n' \
       "$busy_port" | tee -a "$test_log" >&2
     exit 2
   fi
@@ -378,8 +371,14 @@ fi
 node test/check-e2e-meta.mjs 2>&1 | tee -a "$test_log"
 metadata_status=${PIPESTATUS[0]}
 if [[ "$metadata_status" -ne 0 ]]; then exit "$metadata_status"; fi
-test_started=1
 playwright_args=()
+if [[ -n "${CI_E2E_REPEAT_EACH:-}" ]]; then
+  if [[ ! "$CI_E2E_REPEAT_EACH" =~ ^[1-9][0-9]*$ ]]; then
+    echo 'CI_E2E_REPEAT_EACH must be a positive integer' >&2
+    exit 2
+  fi
+  playwright_args+=(--repeat-each "$CI_E2E_REPEAT_EACH")
+fi
 if [[ -n "${CI_E2E_SPEC:-}" ]]; then playwright_args+=("$CI_E2E_SPEC"); fi
 if [[ -n "${CI_E2E_GREP:-}" ]]; then playwright_args+=(--grep "$CI_E2E_GREP"); fi
 npm --prefix .e2e run "test:$group" -- "${playwright_args[@]}" 2>&1 | tee -a "$test_log"
@@ -393,10 +392,11 @@ journeys_status=${PIPESTATUS[0]}
 # journeys plan with update_plan), web-search (the internet), compression and
 # history-restart (a small context window, a JiuwenSwarm restart).
 live_status=0
-if [[ "$backend" == "jiuwenswarm" && "$group" == "mocked" && "$fixture" == standard ]]; then
+case "${CI_E2E_SWARM_CHECKS:-run}" in run|off) ;; *) echo 'Invalid CI_E2E_SWARM_CHECKS' >&2; exit 2;; esac
+if [[ "$backend" == "jiuwenswarm" && "$group" == "mocked" && "$fixture" == standard && "${CI_E2E_SWARM_CHECKS:-run}" == run ]]; then
   live_checks="${CI_E2E_JIUWENSWARM_CHECKS:-history history-names run-shell host-tools approvals skills skill-switch trajectory language}"
   # shellcheck disable=SC2086 # the list is words on purpose
-  node test/contract/jw-only/live.mjs $live_checks 2>&1 | tee "$results_root/jiuwenswarm-checks.log" | tee -a "$test_log"
+  CI_SWARM_CHECK_REPORT="$results_root/jiuwenswarm-checks.json" node test/contract/jw-only/live.mjs $live_checks 2>&1 | tee "$results_root/jiuwenswarm-checks.log" | tee -a "$test_log"
   live_status=${PIPESTATUS[0]}
   printf 'jiuwenswarm_checks=%s\n' "$([[ "$live_status" -eq 0 ]] && echo passed || echo failed)" >> "$results_root/jiuwenswarm-checks.log"
 fi

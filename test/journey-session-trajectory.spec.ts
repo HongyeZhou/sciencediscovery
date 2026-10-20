@@ -6,7 +6,7 @@ import { apiBaseUrl, authorizationHeader } from "./e2e-auth.js";
 import { cleanupJourney, createProjectAndSession, openProjectSession, scriptedModel, sendUserMessage, waitForRunTerminal, type JourneyFixture } from "./helpers/journeys.ts";
 
 // Static suite metadata is inherited by each framework-expanded journey.
-test.describe("journey-session-trajectory.spec", { tag: ["@category:e2e", "@os:linux", "@arch:amd64", "@model:mock", "@sandbox:bubblewrap"] }, () => {
+test.describe("journey-session-trajectory.spec", { tag: ["@isolation:session", "@category:e2e", "@os:linux", "@arch:amd64", "@model:mock", "@sandbox:bubblewrap"] }, () => {
 
 /** Ctrl+wheel over the timeline zooms around the pointer; deltaY maps to exp(-deltaY * 0.002). */
 async function ctrlWheelZoom(page: Page, viewer: Locator, deltaY: number): Promise<void> {
@@ -508,12 +508,15 @@ test("查看多 Agent 轨迹、精确上下文并导出", { tag: "@mocked" }, as
       // The sidebar refetches its Session list on load; the trajectory restores from the URL.
       await page.reload();
       await expect(viewer).toBeVisible();
+      const drawerToggle = page.getByRole("button", { name: /^(打开导航|Open navigation)$/ });
+      if (await drawerToggle.isVisible()) await drawerToggle.click();
       const target = page.locator("button.nav-item").filter({ hasText: "切走目标会话" });
       await expect(target).toBeVisible();
       await target.click();
       await expect(page.getByRole("heading", { exact: true, name: "切走目标会话" })).toBeVisible();
       await expect(viewer).toHaveCount(0);
       await expect(page).not.toHaveURL(/\/trajectory/);
+      if (await drawerToggle.isVisible()) await drawerToggle.click();
       const back = page.locator("button.nav-item").filter({ hasText: fixture!.session.title });
       await expect(back).toBeVisible();
       await back.click();

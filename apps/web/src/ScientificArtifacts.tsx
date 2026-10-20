@@ -845,7 +845,7 @@ export function ArtifactModal({
             ? datasetPreview
             : jsonSource
               ? <JsonSourcePreview parsed={jsonSource.parsed} source={jsonSource.source} truncated={jsonSource.truncated} />
-              : <pre className="artifact-source-preview">{source.slice(0, 100_000) || t("artifact.loadingJson")}</pre>
+              : <pre className="artifact-source-preview">{source || t("artifact.loadingJson")}</pre>
           : null}
         {artifact?.kind === "notebook" && preview?.kind === "notebook" && preview.mode === "notebook-cells"
           ? <NotebookCells cells={preview.cells} />
@@ -865,8 +865,7 @@ export function ArtifactModal({
       content={source}
       fileName={artifact.logicalName}
       onClose={() => setCsvWindowOpen(false)}
-      provenance={provenance}
-      version={version}
+      source={{ kind: "artifact", provenance, version }}
     />
   </Suspense> : null;
 

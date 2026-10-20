@@ -13,24 +13,29 @@
 // limitations under the License.
 
 import type {
+  RunnerCheckResult,
   AgentShellExecution,
   Environment,
   KernelMode,
   ResolvedProxy,
 } from "@sciencediscovery/schema";
 import type { WorkspaceAgentOptions } from "@sciencediscovery/workspace";
+import { RunnerUnavailableError } from "@sciencediscovery/workspace";
+import { createHash, randomUUID } from "node:crypto";
+import { createOperationalLogger } from "@sciencediscovery/operational-logging";
 
 import type { ProvenanceRecorder } from "@sciencediscovery/provenance";
 import type { RunnerClient } from "@sciencediscovery/executor";
 import type { SessionStore } from "../store.js";
 import { resolveEnvironmentInstallRequest } from "../environment-sources.js";
 import type { AgentPermissionRuntime } from "@sciencediscovery/governance";
+import { createSandboxNetworkConsent } from "./sandbox-network-consent.js";
 import { syncScientificEnvironmentCatalog } from "../scientific-environment-catalog.js";
 import { readPreparedSkillBundle, readPreparedSkillManifest } from "../skill-sandbox.js";
 
 type ExecutionBindings = Pick<
   WorkspaceAgentOptions,
-  "environmentManagement" | "executePython" | "executeScientific" | "executeShell" | "npuBroker" | "observeNpuJob" | "workspaceTransfers" | "shellExecutions" | "timers"
+  "sandboxNetwork" | "directExecution" | "environmentManagement" | "executePython" | "executeScientific" | "executeShell" | "npuBroker" | "observeNpuJob" | "workspaceTransfers" | "shellExecutions" | "timers" | "runnerReadiness"
 >;
 
 /**
@@ -48,7 +53,10 @@ export interface RemoteExecutionTarget {
 }
 
 export interface WorkspaceExecutionBindingOptions {
+  explicitHandoff?: boolean;
+  beginExternalWait?: () => (() => void);
   agentId: string;
+  rootRunId?: string;
   artifactPathPrefix?: string;
   executionId: string;
   executionTimeoutMs?: number;
@@ -78,6 +86,7 @@ export interface WorkspaceExecutionBindingOptions {
 export function createWorkspaceExecutionBindings(
   options: WorkspaceExecutionBindingOptions,
 ): ExecutionBindings {
+  const executionLogger = () => createOperationalLogger({ category: "api", service: "api", dataDir: options.store.dataDir });
   const requireEnvironmentMutation = async (summary: string, signal?: AbortSignal, runnerId?: string): Promise<void> => {
     options.store.assertSessionWritable(options.sessionId);
     await options.permission.requirePrivilege({
@@ -97,8 +106,8 @@ export function createWorkspaceExecutionBindings(
    * Spread into the recorder options, which keeps the field absent — rather
    * than explicitly undefined — for a sandbox with no network.
    */
-  const sandboxEgressProxy = (): { sandboxEgressProxy?: ResolvedProxy } => {
-    const resolved = options.store.resolveSandboxEgressProxy(options.permission.getEpoch());
+  const sandboxEgressProxy = (epoch = options.permission.getEpoch()): { sandboxEgressProxy?: ResolvedProxy } => {
+    const resolved = options.store.resolveSandboxEgressProxy(epoch);
     return resolved ? { sandboxEgressProxy: resolved } : {};
   };
   /**
@@ -143,7 +152,9 @@ export function createWorkspaceExecutionBindings(
     return {
       runnerId: target.runnerId,
       remoteHostAlias: target.hostAlias,
-      runnerClient: target.runnerClient(),
+      // Resolve connection lazily: an offline remote is a readiness outcome,
+      // not a failure while merely constructing an approval description.
+      get runnerClient() { return target.runnerClient(); },
       runnerWorkspaceKey: target.workspaceKey,
     };
   };
@@ -154,7 +165,52 @@ export function createWorkspaceExecutionBindings(
    * mount path; a failed sync fails the execution rather than running without
    * the Skills the Session selected.
    */
-  const prepareExecutionTarget = async (machine: string | undefined, signal?: AbortSignal) => {
+  // These records describe FAILED calls, not scheduled executions. They only
+  // let this agent explicitly ask the user about an operation it attempted.
+  const blockedOperations = new Map<string, { runner: RunnerCheckResult; toolCallId?: string; summary: string }>();
+  const waitingOperations = new Set<string>();
+  const checkRunner = async (machine?: string, signal?: AbortSignal, refresh = true): Promise<RunnerCheckResult> => {
+    signal?.throwIfAborted();
+    options.store.assertSessionWritable(options.sessionId);
+    const runnerId = machine?.trim() || "local";
+    options.store.assertSessionAllowsRunner(options.sessionId, runnerId);
+    if (runnerId !== "local" && !options.remoteTargets?.some(x => x.runnerId === runnerId)) {
+      throw new Error("Runner is not available to this Agent");
+    }
+    let result: RunnerCheckResult;
+    try {
+      const capability = await resolveExecutionTarget(runnerId).runnerClient.executionCapability(refresh, signal);
+      const ready = capability.ready === true;
+      result = { runnerId, checkedAt: capability.checkedAt ?? new Date().toISOString(), connected: true, ready,
+        reason: ready ? "ready" : capability.detail || capability.reason || "Runner execution readiness is unknown",
+        capability,
+        suggestions: ready ? [] : [capability.reason === "dependency-unavailable"
+          ? "Install or repair the sandbox executable on the target Runner; check its configured path."
+          : "Inspect the target Runner logs and host/container sandbox permissions. Do not disable isolation automatically.",
+          "After repair use check_runner, or explicitly request user help with wait_for_runner."] };
+    } catch (error) {
+      result = { runnerId, checkedAt: new Date().toISOString(), connected: false, ready: false,
+        reason: error instanceof Error ? error.message : String(error),
+        suggestions: ["Check the target Runner service, connection, authentication and version. A healthy API is not proof of Runner readiness.",
+          "Do not replay an already submitted execution if its outcome is unknown."] };
+    }
+    signal?.throwIfAborted();
+    options.store.assertSessionAllowsRunner(options.sessionId, runnerId);
+    return result;
+  };
+  const prepareExecutionTarget = async (machine: string | undefined, signal?: AbortSignal, toolCallId?: string, summary = "Scientific execution") => {
+    const runner = await checkRunner(machine, signal, false);
+    if (!runner.ready) {
+      const operationId = randomUUID();
+      if (blockedOperations.size >= 128) {
+        const removable = [...blockedOperations.keys()].find(id => !waitingOperations.has(id));
+        if (removable) blockedOperations.delete(removable);
+        else throw new Error("Too many pending Runner decisions; resolve existing requests first");
+      }
+      blockedOperations.set(operationId, { runner, toolCallId, summary: summary.slice(0, 500) });
+      throw new RunnerUnavailableError({ code: "RUNNER_UNAVAILABLE", dispatched: false, operationId, runner,
+        instruction: "This call has finished without dispatching code. Decide whether to continue other work, explain the blocker and finish, or wait for user help. If you decide to wait, including when the user requested a pause for their decision, call wait_for_runner(operation_id); text saying 'paused' or 'waiting' does not create a pending operation or interactive card. Showing the card does not repair, install, switch machines or execute code and needs no extra confirmation merely to display the requested choices. Preserve the user's constraints after receiving their decision. check_runner is diagnostic only. Do not repeatedly retry unchanged failures. Nothing will execute automatically." });
+    }
     let target = resolveExecutionTarget(machine);
     if (target.runnerId !== "local" && options.skillPackagesRoot) {
       const root = options.skillPackagesRoot;
@@ -171,13 +227,16 @@ export function createWorkspaceExecutionBindings(
     signal?.throwIfAborted();
     return target;
   };
+  const networkConsent = createSandboxNetworkConsent({ ...options,
+    assertRunner: (runnerId) => { resolveExecutionTarget(runnerId); },
+  });
   const prepareShell = async (
       code: string,
       kernelMode: KernelMode,
       signal?: AbortSignal,
       toolCallId?: string,
       machine?: string,
-      environment?: { environmentId?: string; cwd?: string },
+      environment?: { environmentId?: string; cwd?: string; networkAuthorizationId?: string },
     ) => {
       options.store.assertSessionWritable(options.sessionId);
       let target = resolveExecutionTarget(machine);
@@ -189,7 +248,8 @@ export function createWorkspaceExecutionBindings(
         ...(toolCallId ? { toolCallId } : {}),
         summary: `Run a shell script ${target.remoteHostAlias ? `on ${target.remoteHostAlias} ` : ""}${options.permissionScopeLabel}`,
       });
-      target = await prepareExecutionTarget(machine, signal);
+      target = await prepareExecutionTarget(machine, signal, toolCallId, "Run shell: " + code);
+      const permissionEpoch = await networkConsent.consume(environment?.networkAuthorizationId, target.runnerId, signal);
       return {
         agentId: options.agentId,
         code,
@@ -201,7 +261,7 @@ export function createWorkspaceExecutionBindings(
         kernelMode,
         maxOutputBytes: options.maxOutputBytes,
         maxWorkspaceBytes: options.maxWorkspaceBytes,
-        permissionEpoch: options.permission.getEpoch(),
+        permissionEpoch,
         ...(options.readOnlyWorkspaceRoot ? { readOnlyWorkspaceRoot: options.readOnlyWorkspaceRoot } : {}),
         ...(target.skillPackagesRoot ? { skillPackagesRoot: target.skillPackagesRoot } : {}),
         runnerId: target.runnerId,
@@ -209,13 +269,13 @@ export function createWorkspaceExecutionBindings(
         ...npuDevices(target.runnerId),
         ...(target.remoteHostAlias ? { remoteHostAlias: target.remoteHostAlias } : {}),
         ...(target.runnerWorkspaceKey ? { runnerWorkspaceKey: target.runnerWorkspaceKey } : {}),
-        ...sandboxEgressProxy(),
+        ...sandboxEgressProxy(permissionEpoch),
         sessionId: options.sessionId,
         signal,
         ...(toolCallId ? { toolCallId } : {}),
         turnId: options.executionId,
         workspaceRoot: options.workspaceRoot,
-        parentSubagentId: options.parentSubagentId,
+        parentSubagentId: options.parentSubagentId, explicitHandoff: options.explicitHandoff,
       };
   };
   const executionOwner = { sessionId: options.sessionId, agentId: options.agentId };
@@ -236,7 +296,128 @@ export function createWorkspaceExecutionBindings(
     if (job.sessionId !== options.sessionId) throw new Error("NPU job not found in this Session");
     return job;
   };
+  // Per-binding tickets cannot be inherited by a child or a later Agent run.
+  const directTickets = new Map<string, { command: string; cwd: string; target: string; account: string; workspaceRoot: string; runnerId: string; runnerWorkspaceKey?: string; grantId?: string }>();
+  const directScope = async (runnerId: string, cwdValue: string, signal?: AbortSignal) => {
+    signal?.throwIfAborted();
+    const target = resolveExecutionTarget(runnerId);
+    options.store.assertSessionWritable(options.sessionId);
+    if (!options.rootRunId) throw new Error("Direct execution requires an active owning run");
+    const run = await options.store.getSessionRun(options.sessionId, options.rootRunId);
+    if (!run || !["running", "blocked"].includes(run.status)) throw new Error("Direct execution consent ended with its run");
+    if (options.store.shellExecutions.list(executionOwner).some(record => record.runnerId === runnerId && record.state === "unknown")) {
+      throw new Error("Reconcile the unknown target execution outcome before authorizing more host side effects");
+    }
+    const runner = await checkRunner(runnerId, signal, true);
+    if (!runner.connected) throw new Error("Direct execution requires a reachable Runner. Ask the user or network administrator to check the Runner service, connection and authentication; SSH repair is not provided.");
+    const capability = await target.runnerClient.directExecutionCapability(signal, {
+      ...(target.runnerWorkspaceKey ? { runnerWorkspaceKey: target.runnerWorkspaceKey } : { workspaceRoot: options.workspaceRoot }), cwd: cwdValue,
+    });
+    if (!capability.available || capability.workspaceRoot === undefined || capability.cwd === undefined) throw new Error("Target direct shell workspace capability is unavailable");
+    // Re-resolve after network I/O: removal from the Session must revoke access.
+    resolveExecutionTarget(runnerId);
+    signal?.throwIfAborted();
+    return { cwd: capability.cwd, workspaceRoot: capability.workspaceRoot, target: capability.target, account: capability.account,
+      runnerId, ...(target.runnerWorkspaceKey ? { runnerWorkspaceKey: target.runnerWorkspaceKey } : {}) };
+  };
   const common: ExecutionBindings = {
+    sandboxNetwork: { request: networkConsent.request },
+    directExecution: {
+      request: async (input, signal, toolCallId) => {
+        const blocked = input.operationId === undefined ? undefined : blockedOperations.get(input.operationId);
+        if (input.operationId !== undefined && !blocked) throw new Error("Direct recovery requires this Agent's failed, undispatched operation");
+        const runnerId = input.runnerId?.trim() || blocked?.runner.runnerId || "local";
+        if (blocked && runnerId !== blocked.runner.runnerId) throw new Error("Direct recovery Runner must match the failed operation");
+        if (!input.command.trim() || input.command.length > 20000) throw new Error("Provide a nonempty command of at most 20000 characters");
+        const scope = await directScope(runnerId, input.cwd, signal);
+        const resource = "direct:" + createHash("sha256").update(JSON.stringify({ ...scope,
+          run: options.executionId, agent: options.agentId, session: options.sessionId, command: input.command })).digest("hex");
+        const authorization = await options.permission.requirePrivilege({ action: "direct_code", executionId: options.executionId,
+          toolCallId, resource, signal,
+          summary: `DIRECT HOST EXECUTION: Runner ${scope.runnerId}, ${scope.target}, account ${scope.account}, workspace ${scope.workspaceRoot}, cwd ${scope.cwd || "."}. No sandbox filesystem, process or network isolation; host credentials may be accessible. Host effects cannot all be tracked or rolled back. Matching consent covers only this exact command and scope during this Agent run, with no fixed TTL. Approval does not execute. Command:\n${input.command}` });
+        signal?.throwIfAborted();
+        if (authorization.action !== "direct_code" || authorization.outcome !== "allowed" || authorization.resource !== resource) throw new Error("Direct authorization scope mismatch");
+        const current = await directScope(runnerId, input.cwd, signal);
+        if (JSON.stringify(current) !== JSON.stringify(scope)) throw new Error("Target or workspace changed during consent; request new consent");
+        if (directTickets.size >= 128) throw new Error("Too many unused direct approvals in this run");
+        directTickets.set(authorization.id, { ...scope, command: input.command, grantId: authorization.permissionGrantId });
+        return { authorizationId: authorization.id, ...scope, command: input.command, dispatched: false,
+          instruction: "No code executed. Confirm these values in a NEW run_direct_shell call. Use a new consent request for any changed scope." };
+      },
+      start: async (input, signal, toolCallId) => {
+        signal?.throwIfAborted();
+        const ticket = directTickets.get(input.authorizationId);
+        if (!ticket || ticket.command !== input.command || ticket.cwd !== input.cwd || ticket.target !== input.target || ticket.account !== input.account) {
+          throw new Error("Missing, consumed or mismatched direct execution authorization");
+        }
+        // Consume before the first await: simultaneous calls cannot both dispatch.
+        directTickets.delete(input.authorizationId);
+        const scope = await directScope(ticket.runnerId, input.cwd, signal);
+        if (scope.runnerWorkspaceKey !== ticket.runnerWorkspaceKey || scope.cwd !== ticket.cwd || scope.workspaceRoot !== ticket.workspaceRoot || scope.target !== ticket.target || scope.account !== ticket.account) throw new Error("Direct target/account/workspace changed");
+        if (ticket.grantId && options.store.getPermissionGrant(ticket.grantId)?.state !== "active") throw new Error("Direct execution grant was revoked");
+        signal?.throwIfAborted();
+        const directAuthorization = { authorizationId: input.authorizationId, ...scope, runId: options.executionId, agentId: options.agentId };
+        return delivered(await options.store.shellExecutions.start(executionOwner, {
+          runnerId: ticket.runnerId, turnId: options.executionId, workspaceId: options.store.workspaceIdentity(options.sessionId, options.agentId, ticket.runnerId).id,
+        }, () => resolveExecutionTarget(ticket.runnerId).runnerClient,
+        (id, dispatch, completionStatus) => options.provenanceRecorder.executeShell({
+          agentId: options.agentId, code: ticket.command, cwd: ticket.cwd, directAuthorization,
+          executionId: id, dispatch, completionStatus, executionTimeoutMs: options.executionTimeoutMs,
+          maxOutputBytes: options.maxOutputBytes, maxWorkspaceBytes: options.maxWorkspaceBytes,
+          artifactPathPrefix: options.artifactPathPrefix, parentSubagentId: options.parentSubagentId, explicitHandoff: options.explicitHandoff,
+          permissionEpoch: options.permission.getEpoch(), runnerId: ticket.runnerId, runnerClient: resolveExecutionTarget(ticket.runnerId).runnerClient,
+          ...(ticket.runnerWorkspaceKey ? { runnerWorkspaceKey: ticket.runnerWorkspaceKey } : {}),
+          ...(resolveExecutionTarget(ticket.runnerId).remoteHostAlias ? { remoteHostAlias: resolveExecutionTarget(ticket.runnerId).remoteHostAlias } : {}),
+          sessionId: options.sessionId, toolCallId, turnId: options.executionId, workspaceRoot: ticket.workspaceRoot,
+        })));
+      },
+    },
+    runnerReadiness: {
+      check: (machine, signal) => checkRunner(machine, signal),
+      wait: async (operationId, signal, waitToolCallId) => {
+        signal?.throwIfAborted();
+        const operation = blockedOperations.get(operationId);
+        if (!operation || waitingOperations.has(operationId)) throw new Error("Unknown, expired or already waiting operation for this Agent run");
+        options.store.assertSessionWritable(options.sessionId);
+        options.store.assertSessionAllowsRunner(options.sessionId, operation.runner.runnerId);
+        waitingOperations.add(operationId);
+        let release: (() => void) | undefined;
+        try {
+          release = options.beginExternalWait?.();
+          const alternatives = [];
+          for (const runnerId of options.store.effectiveRunnerIds(options.sessionId)) {
+            if (runnerId === operation.runner.runnerId) continue;
+            try {
+              if ((await checkRunner(runnerId, signal, false)).ready) alternatives.push({ runnerId, label: runnerId });
+            } catch { signal?.throwIfAborted(); }
+          }
+          const blocked = { sessionId: options.sessionId, executionId: options.executionId,
+            agentId: options.agentId, operationId, toolCallId: operation.toolCallId,
+            runnerId: operation.runner.runnerId, reason: operation.runner.reason,
+            suggestions: operation.runner.suggestions, summary: operation.summary, alternatives };
+          executionLogger().info("runner_wait_requested", { ...blocked, waitToolCallId });
+          const decision = await options.store.executionBlocks.wait(blocked, signal);
+          blockedOperations.delete(operationId);
+          signal?.throwIfAborted();
+          options.store.assertSessionWritable(options.sessionId);
+          executionLogger().info("execution_decision", { ...blocked, decision });
+          if (decision.action === "cancel") return { action: "cancel", operationId, dispatched: false,
+            instruction: "This operation was cancelled or the wait expired. Do not resubmit it without a new user request. You may continue unrelated work." };
+          const runner = await checkRunner(decision.action === "switch" ? decision.runnerId : operation.runner.runnerId, signal);
+          operation.runner = runner;
+          if (!runner.ready) blockedOperations.set(operationId, operation);
+          // Never execute here: a completed failed call cannot come back to life.
+          return { action: decision.action, operationId, dispatched: false, runner,
+            instruction: runner.ready
+              ? "Runner is ready. No code was executed. Decide whether to issue a NEW execution call. For a switched Runner prepare its workspace, inputs and environment first; normal permissions still apply."
+              : "Runner is still unavailable. No code was executed. Decide whether to wait again, do other work or finish; do not automatically retry." };
+        } finally {
+          release?.(); waitingOperations.delete(operationId);
+          // Failed rechecks can be discussed and explicitly waited on again.
+          if (signal?.aborted) blockedOperations.delete(operationId);
+        }
+      },
+    },
     timers: {
       create: async (input) => {
         options.store.assertSessionWritable(options.sessionId);
@@ -373,7 +554,7 @@ export function createWorkspaceExecutionBindings(
         ...(toolCallId ? { toolCallId } : {}),
         summary: `Run Python code ${target.remoteHostAlias ? `on ${target.remoteHostAlias} ` : ""}${options.permissionScopeLabel}`,
       });
-      target = await prepareExecutionTarget(machine, signal);
+      target = await prepareExecutionTarget(machine, signal, toolCallId, "Run Python: " + code);
       return options.provenanceRecorder.executePython({
         agentId: options.agentId,
         code,
@@ -396,10 +577,13 @@ export function createWorkspaceExecutionBindings(
         ...(toolCallId ? { toolCallId } : {}),
         turnId: options.executionId,
         workspaceRoot: options.workspaceRoot,
-        parentSubagentId: options.parentSubagentId,
+        parentSubagentId: options.parentSubagentId, explicitHandoff: options.explicitHandoff,
       });
     },
-    executeShell: async (...args) => options.provenanceRecorder.executeShell(await prepareShell(...args)),
+    executeShell: async (...args) => {
+      const prepared = await prepareShell(...args);
+      return networkConsent.observe(await options.provenanceRecorder.executeShell(prepared), prepared.runnerId, args[2]);
+    },
     shellExecutions: {
       start: async (code, environment, signal, toolCallId, runnerId) => {
         const prepared = await prepareShell(code, "ephemeral", signal, toolCallId, runnerId, environment);
@@ -407,7 +591,7 @@ export function createWorkspaceExecutionBindings(
           runnerId: prepared.runnerId!, turnId: options.executionId,
           workspaceId: options.store.workspaceIdentity(options.sessionId, options.agentId, prepared.runnerId).id,
         }, () => resolveExecutionTarget(runnerId).runnerClient,
-        (id, dispatch, completionStatus) => options.provenanceRecorder.executeShell({ ...prepared, signal: undefined, executionId: id, dispatch, completionStatus })));
+        async (id, dispatch, completionStatus) => networkConsent.observe(await options.provenanceRecorder.executeShell({ ...prepared, signal: undefined, executionId: id, dispatch, completionStatus }), prepared.runnerId)));
       },
       wait: async (id, waitMs, signal) => {
         const record = await options.store.shellExecutions.get(id, executionOwner);
@@ -517,7 +701,7 @@ export function createWorkspaceExecutionBindings(
           ...(toolCallId ? { toolCallId } : {}),
           summary: `Run ${language} code ${target.remoteHostAlias ? `on ${target.remoteHostAlias} ` : ""}${options.permissionScopeLabel}`,
         });
-        target = await prepareExecutionTarget(machine, signal);
+        target = await prepareExecutionTarget(machine, signal, toolCallId, "Run scientific code: " + code);
         return options.provenanceRecorder.executeScientific({
           agentId: options.agentId,
           code,
@@ -543,7 +727,7 @@ export function createWorkspaceExecutionBindings(
           ...(toolCallId ? { toolCallId } : {}),
           turnId: options.executionId,
           workspaceRoot: options.workspaceRoot,
-          parentSubagentId: options.parentSubagentId,
+          parentSubagentId: options.parentSubagentId, explicitHandoff: options.explicitHandoff,
         });
       },
     } : {}),

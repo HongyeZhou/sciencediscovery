@@ -221,24 +221,37 @@ test("runner mounts discovered local Python package directory", async (context) 
   assert.match(result.stdout, /^mounted-local-package$/m);
 });
 
-test("runner startup fails closed when the sandbox binary is missing", async () => {
-  await assert.rejects(startRunnerServer({
+test("runner starts but rejects execution when the sandbox binary is missing", async (context) => {
+  const server = await startRunnerServer({
     ...config(resolve(process.cwd(), ".tmp", "missing-sandbox")),
     bwrapPath: resolve(process.cwd(), ".tmp", "does-not-exist", "bwrap"),
-  }), /ENOENT/);
+  });
+  context.after(() => new Promise<void>(done => server.close(() => done())));
+  const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const health = await fetch(`${origin}/health`).then(r => r.json()) as RunnerHealth;
+  assert.equal(health.execution?.ready, false);
+  assert.equal(health.execution?.reason, "dependency-unavailable");
+  const execution = await fetch(`${origin}/execute`, { method: "POST", headers: { authorization: "Bearer runner-test-token" }, body: "{}" });
+  assert.equal(execution.status, 503);
+  assert.equal((await execution.json() as {code:string}).code, "EXECUTION_UNAVAILABLE");
 });
 
-test("runner startup fails closed when bubblewrap lacks required security options", async (context) => {
+test("runner reports incompatible bubblewrap without preventing startup", async (context) => {
   const root = resolve(process.cwd(), ".tmp", `old-bwrap-${process.pid}-${Date.now()}`);
   const fakeBwrap = resolve(root, "bwrap");
   await mkdir(root, { recursive: true });
   await writeFile(fakeBwrap, "#!/bin/sh\necho 'usage: bwrap --unshare-all --unshare-user'\n");
   await chmod(fakeBwrap, 0o755);
   context.after(() => rm(root, { force: true, recursive: true }));
-  await assert.rejects(startRunnerServer({
+  const server = await startRunnerServer({
     ...config(resolve(root, "data")),
     bwrapPath: fakeBwrap,
-  }), /lacks required sandbox options.*--seccomp/);
+  });
+  context.after(() => new Promise<void>(done => server.close(() => done())));
+  const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const health = await fetch(`${origin}/health`).then(r => r.json()) as RunnerHealth;
+  assert.equal(health.execution?.reason, "incompatible");
+  assert.match(health.execution?.detail ?? "", /--seccomp/);
 });
 
 /** Quote for a shell single-quoted string; bubblewrap messages contain apostrophes. */
@@ -1960,16 +1973,15 @@ test("runner aborts a disconnected sandbox and removes cancelled queued work fro
   })).json() as RunnerRuntimeStatus;
   const waitFor = async (predicate: (value: RunnerRuntimeStatus) => boolean) => {
     const startedAt = Date.now();
+    const deadline = startedAt + 5_000;
     let current: RunnerRuntimeStatus | undefined;
-    for (let attempt = 0; attempt < 100; attempt += 1) {
+    while (Date.now() < deadline) {
       current = await status();
       if (predicate(current)) return current;
       await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
     }
-    // The state it did reach and how long it waited for it. This budget counts
-    // polls, so its wall time shrinks as the machine slows: without the
-    // elapsed figure a failure cannot say whether the runner never did the
-    // thing or whether this simply gave up early.
+    // The deadline is wall-clock based so CPU pressure cannot silently shorten
+    // the cancellation grace period by making individual status polls slower.
     throw new Error(`Runner status did not reach the expected state after ${Date.now() - startedAt} ms: `
       + JSON.stringify(current));
   };
@@ -1978,7 +1990,9 @@ test("runner aborts a disconnected sandbox and removes cancelled queued work fro
   const running = fetch(`${origin}/execute`, {
     ...signedExecutionInit("runner-test-token", {
       agentId: "main",
-      code: "import time\ntime.sleep(30)",
+      // Keep the sandbox busy while the disconnect arrives. The runner itself
+      // must still observe the abort and kill the whole sandbox process group.
+      code: "while True:\n    pass",
       executionId: "cancel-running",
       executionTimeoutMs: 0,
       permissionEpoch: epoch(),

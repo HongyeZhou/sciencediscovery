@@ -95,6 +95,7 @@ async function isSessionTurn(request: IncomingMessage, response: ServerResponse)
   if (body.stream) {
     response.writeHead(200, { "content-type": "text/event-stream" });
     writeSseEvent(response, { choices: [{ delta: { content: "{}" } }] });
+    writeSseEvent(response, { choices: [{ delta: {}, finish_reason: "stop" }] });
     response.end("data: [DONE]\n\n");
   } else {
     response.writeHead(200, { "content-type": "application/json" });
@@ -186,6 +187,7 @@ function startBlockingPermissionGateway(context: TestContext): Promise<{ origin:
       writeSseEvent(response, {
         choices: [{ delta: { tool_calls: [{ index: 0, id: `call-shell-${runCount}`, type: "function", function: { name: "run_shell", arguments: JSON.stringify({ command: "printf 1" }) } }] } }],
       });
+      writeSseEvent(response, { choices: [{ delta: {}, finish_reason: "tool_calls" }] });
       response.write("data: [DONE]\n\n");
       response.end();
       return;
@@ -216,6 +218,7 @@ function startBlockingPermissionUsageGateway(context: TestContext): Promise<{ or
           choices: [{ delta: { tool_calls: [{ index: 0, id: `call-shell-${runCount}`, type: "function", function: { name: "run_shell", arguments: JSON.stringify({ command: "printf 1" }) } }] } }],
         });
         writeSseEvent(response, { choices: [], usage: { prompt_tokens: 7, completion_tokens: 3, total_tokens: 10 } });
+        writeSseEvent(response, { choices: [{ delta: {}, finish_reason: "tool_calls" }] });
         response.write("data: [DONE]\n\n");
         response.end();
       });
@@ -245,6 +248,7 @@ function startUsageGateway(context: TestContext): Promise<{ origin: string; runC
         response.writeHead(200, { "content-type": "text/event-stream" });
         writeSseEvent(response, { choices: [{ delta: { content: "Done" } }] });
         writeSseEvent(response, { choices: [], usage: { prompt_tokens: 7, completion_tokens: 3, total_tokens: 10 } });
+        writeSseEvent(response, { choices: [{ delta: {}, finish_reason: "stop" }] });
         response.write("data: [DONE]\n\n");
         response.end();
       });

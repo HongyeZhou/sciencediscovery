@@ -28,6 +28,7 @@ import {
   resolveServeCredentials,
   type ServeCredentials,
 } from "./bootstrap-tokens.js";
+import { startEvolveControl, type EvolveControl } from "./evolve-runtime.js";
 import { runBootstrap } from "./bootstrap.js";
 import { planMemoryGraph, startMemoryGraph } from "./memory-graph.js";
 import { adapterServiceDefinition, ensureInstance, jiuwenswarmServiceDefinition, waitForGateway } from "./jiuwenswarm.js";
@@ -246,7 +247,8 @@ export async function serve(context: ServeContext, log: (message: string) => voi
     seatbeltPath: settings.seatbeltPath,
     dataDir: settings.dataDir,
     env: context.baseEnv,
-    skipSandboxCheck: settings.skipSandboxCheck,
+    // Management/UI availability is independent of compute readiness.
+    skipSandboxCheck: true,
     warn: log,
   });
   await seedProvisioner(context);
@@ -270,23 +272,40 @@ export async function serve(context: ServeContext, log: (message: string) => voi
     context = { ...context, gatewayPythonPath: bootstrap.gatewayPython };
   }
 
+  let evolveControl: EvolveControl | undefined;
+  const evolveAbort = new AbortController();
   const services = planServices({ ...context, credentials });
 
   const supervisor = new Supervisor({ log });
   const memorySupervisor = new Supervisor({ log });
+  const runnerSupervisor = new Supervisor({ log });
   let stopping = false;
   const shutdown = (signal: NodeJS.Signals): void => {
     if (stopping) return;
     stopping = true;
+    evolveAbort.abort();
     log(`\nReceived ${signal}; stopping the ScienceDiscovery stack...`);
-    void supervisor.stop().then(() => memorySupervisor.stop());
+    void supervisor.stop().then(() => Promise.all([memorySupervisor.stop(), runnerSupervisor.stop()]));
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 
   try {
     const [runnerService, apiService, memoryService] = services;
-    await supervisor.start([runnerService!]);
+    if (!context.baseEnv.SCIENCE_AGENT_EVOLVE_URL?.trim()) {
+      evolveControl = await startEvolveControl({ dataDir: settings.dataDir, payloadRoot: context.payloadRoot,
+        manifest, env: context.baseEnv, log, signal: evolveAbort.signal });
+      Object.assign(apiService!.env, evolveControl.env);
+    }
+    try {
+      await runnerSupervisor.start([runnerService!]);
+      void runnerSupervisor.waitForFirstExit().then(() => {
+        if (!stopping) log("Local Runner exited; the workbench remains available. Repair or select another Runner before executing code.");
+      });
+    } catch (error) {
+      await runnerSupervisor.stop();
+      log(`Local compute is unavailable: ${String(error)}. The workbench will continue starting.`);
+    }
 
     if (memoryService && await startMemoryGraph(memorySupervisor, memoryService, apiService!, log)) {
       void memorySupervisor.waitForFirstExit().then(() => {
@@ -336,10 +355,15 @@ export async function serve(context: ServeContext, log: (message: string) => voi
       log(`${first.name} exited (${first.signal ? `signal ${first.signal}` : `status ${String(first.code)}`}); stopping the stack.`);
     }
     return { exitCode: stopping ? 0 : (first.code ?? 1) };
+  } catch (error) {
+    if (stopping) return { exitCode: 0 };
+    throw error;
   } finally {
     stopping = true;
     await supervisor.stop();
     await memorySupervisor.stop();
+    await runnerSupervisor.stop();
+    await evolveControl?.close();
     process.off("SIGINT", shutdown);
     process.off("SIGTERM", shutdown);
   }

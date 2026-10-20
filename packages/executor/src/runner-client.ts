@@ -33,6 +33,7 @@ import type {
   PythonExecutionRequest,
   PythonExecutionResult,
   RunnerHealth,
+  RunnerExecutionCapability,
   RunnerRuntimeStatus,
   RunnerResources,
   RemoteWorkspaceFile,
@@ -165,6 +166,18 @@ export class RunnerClient {
     this.observeClock(response.headers.get("date"), sentAt, Date.now());
     if (!response.ok) throw new Error(`Runner health check failed (${response.status})`);
     return await response.json() as RunnerHealth;
+  }
+
+  /** Authenticated probe in this Runner; POST explicitly invalidates its cache. */
+  async executionCapability(refresh = false, signal?: AbortSignal): Promise<RunnerExecutionCapability> {
+    return this.request("/execution-capability", {
+      method: refresh ? "POST" : "GET", signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(60_000)]) : AbortSignal.timeout(60_000),
+    });
+  }
+
+  async directExecutionCapability(signal?: AbortSignal, workspace?: { workspaceRoot?: string; runnerWorkspaceKey?: string; cwd: string }): Promise<import("@sciencediscovery/schema").DirectExecutionCapability> {
+    const query = workspace ? `?${new URLSearchParams(workspace)}` : "";
+    return this.request(`/direct-execution-capability${query}`, { signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(5_000)]) : AbortSignal.timeout(5_000) });
   }
 
   async status(): Promise<RunnerRuntimeStatus> {
@@ -474,7 +487,7 @@ export class RunnerClient {
   async startShellExecution(request: ShellExecutionRequest, signal?: AbortSignal): Promise<ManagedExecution> {
     const body = JSON.stringify(request);
     const timestamp = this.signingTimestamp();
-    return this.managedExecutionTimes(await this.request<ManagedExecution>("/shell-executions", {
+    return this.managedExecutionTimes(await this.request<ManagedExecution>(request.directAuthorization ? "/direct-shell-executions" : "/shell-executions", {
       method: "POST", body, signal,
       headers: {
         [EXECUTION_SIGNATURE_HEADER]: createExecutionSignature(this.token, timestamp, body),

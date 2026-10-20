@@ -22,11 +22,11 @@ No workflow maintains its own list of case titles.
 
 | Tier | Event / authorization | Cumulative content | Gate / job ceiling |
 | --- | --- | --- | --- |
-| L1 | Every PR opened, synchronized or reopened | Architecture, docs, test catalog and E2E metadata checks; no service or browser startup | Required before L2; 10 minutes |
-| L2 (`pr`) | Every PR after L1; also default-branch push | L1 + reviewed hermetic UT, ST and mock E2E; no external model credentials | Required before enqueue; UT 60, ST 30, mock E2E 90 minutes |
-| L3 (`merge`) | Maintainer reviews the current head and selects **Merge when ready**; `merge_group: checks_requested` | L2 rerun on the group SHA + seven short real API journeys + binary smoke and Docker distribution gates | Required before automatic merge; basic worker 60 minutes including setup, target 10–15 minutes of test time |
-| L4 (`daily`) | Daily at 16:00 UTC, or explicit dispatch | L3 + all ten previously eligible nightly cases: DRB-58/59/62/64/75, research team, PUCT compression, J5 statistics, two provenance/card journeys | Daily failure signal; each research worker 240 minutes including setup |
-| L5 (`release`) | Version tag push | Same current case set and evaluation modes as L4; separate profile retained for future release-only cases; no historical baseline gate | Blocks Release/assets, not the already-created tag; each research worker 240 minutes |
+| L1 | PR opened, synchronized or reopened (including drafts), or marked ready for review | Architecture, docs, test catalog and E2E metadata checks; no service or browser startup | Required before L2; 10 minutes |
+| L2 (`pr`) | Non-draft PR opened, synchronized, reopened or marked ready for review, after L1; also default-branch push | L1 + reviewed hermetic UT, ST and mock E2E; no external model credentials | Required before enqueue; UT 60, ST 30, mock E2E 90 minutes |
+| L3 (`merge`) | Maintainer reviews the current head and selects **Merge when ready**; `merge_group: checks_requested` | L2 rerun on the group SHA + nine short real API journeys (including Runner wait/finish decisions) + binary smoke and Docker distribution gates | Required before automatic merge; basic worker 60 minutes including setup, target 10–15 minutes of test time |
+| L4 (`daily`) | Daily at 16:00 UTC, or explicit dispatch | L3 + twelve nightly cases: DRB-58/59/62/64/75, research team, PUCT compression, J5 statistics, two provenance/card journeys, Biomni DA-13-3/DA-14-1 | Daily failure signal; each research worker 240 minutes including setup |
+| L5 (`release`) | Version tag push | Same current case set and evaluation modes as L4; separate profile retained for future release-only cases; no historical baseline gate | Blocks creating the draft Release and its assets, not the already-created tag; a person publishes the draft from the Releases page; each research worker 240 minutes |
 
 `l1` through `l5` are also explicit local profile names. `pr`, `merge`, `daily`
 and `release` alias L2, L3, L4 and L5. The release policy now includes paid
@@ -53,6 +53,14 @@ it does not add a native E2E run. Adapter live UT is also accounted separately.
 
 ### Backend selection and exact accounting
 
+For a targeted reliability check, set `CI_E2E_SPEC` and optionally
+`CI_E2E_GREP`, then run `.ci/run-e2e.sh real` with `CI_E2E_REPEAT_EACH=10`.
+This repeats each selected case ten times (not ten retries); the browser
+configuration uses one worker and zero retries. Real runs require
+`CI_ALLOW_REAL=1` and the `E2E_LLM_BASE_URL`, `E2E_LLM_MODEL`, and
+`E2E_LLM_TOKEN` credentials, and every repetition incurs model usage.
+Omitting `CI_E2E_REPEAT_EACH` leaves normal gate execution unchanged.
+
 Use `--backend jiuwenswarm|legacy`, `CI_E2E_BACKEND`, or the workflow's `backend`
 input. `legacy` means the native loop; JiuwenSwarm is the default. The backend
 changes execution identity, not selection. Run each backend explicitly if both
@@ -73,6 +81,82 @@ SHA, configuration and exact identities, then requires
 `planned == executed == passed`. Missing, cancelled, skipped, duplicate or
 wrong-backend results fail. Existing quarantined cases are excluded by policy
 before freezing the plan and are never counted as passed.
+
+### Parallel UT processes inside one job
+
+`pnpm ci:ut` runs a bounded pool of two child processes by default. Set
+`CI_UT_WORKERS=1` for serial diagnosis, or `2` through `4` to compare concurrency
+on the same machine. The standard public Linux runner has four vCPUs and
+16 GB RAM; two workers leave capacity for the shared SDK/adapter and for
+subprocesses started by a test. This does not create additional Actions jobs.
+
+Node files remain separate processes, with serial tests inside each file.
+All API files retain their order because they share the wrapper's JiuwenSwarm
+instance. Python projects also retain their order, while their lane overlaps
+Node execution. Other Node files can use free pool slots. Every group has its
+own product-data directory and reports; the SDK instance remains shared.
+Dependency preparation, collection, command checks and coverage aggregation
+remain outside the pool. Other slices retain serial execution.
+
+The frozen plan and exact result/coverage checks are unchanged. A failed
+group does not discard remaining groups; cancellation stops queued groups and
+terminates running worker process groups. `ut/tagged/timing.json` records the
+worker limit, peak active groups, CPU/memory information and each group's
+duration. Worker logs and timing records stay in their original group folders.
+The recorded host memory is capacity, not measured peak usage.
+
+### Parallel mocked browser workers
+
+The mocked matrix is frozen from the same `e2e` slice, with four independent
+jobs (`max-parallel: 4`, `fail-fast: false`). No case list lives in the workflow:
+
+| Worker | Fixture | Existing browser cases | Supplemental checks |
+| --- | --- | ---: | --- |
+| `standard-config` | `standard` | 19 | 9 JiuwenSwarm checks, once |
+| `standard-journeys` | `standard` | 25 | None |
+| `research` | `research` | 20 | None |
+| `literature` | `literature` | 6 | None |
+
+Standard mocked specs declare `isolation:global` for shared configuration,
+`isolation:session` for independent session journeys, or `isolation:fresh` for
+a journey that requires a pristine Skill library. Missing classifications fail
+planning. The fresh-library file stays first among global-state files; the
+reporter rejects a different order or multiple Playwright workers. Every file
+and its steps retain their serial execution order. Each CI job has its own
+checkout, service ports, runtime data, JiuwenSwarm home and reports; both
+standard workers still use the **standard fixture**, not a research fixture.
+Backend selection is independent and does not change the 70 browser identities.
+
+`pnpm ci:e2e -- --shard standard-config` runs one partition; without `--shard`,
+the local entry point retains the full serial suite and one supplemental pass.
+Concurrent local invocations must use prepared dependencies and distinct
+`CI_RESULTS_DIR`, `CI_RUNTIME_DIR`, API/legacy/Runner/evolve/memory-graph ports.
+On one host, let each JiuwenSwarm instance finish binding its automatically
+allocated ports before starting the next stack; separate CI runners do not
+share this port allocator. Browser runs can then overlap.
+The driver writes HTML into the worker's results directory, so reports cannot
+overwrite each other. Leave Playwright `workers: 1` and `retries: 0` unchanged.
+
+The existing `merge-gate` reconciles all four artifacts against the parent
+plan, requires exactly one PASS for every identity and verifies all nine
+supplemental checks, including their order (`skills` before `skill-switch`).
+Missing artifacts, changed identities/backends, skips or failed drivers fail
+the gate. The reusable `real-e2e.yml` owns real planning, workers and accounting.
+Its L3 (`merge`) caller waits for L1/L2 to succeed, then `real-plan` makes the
+same mocked-artifact check before paid calls. Its L4/L5 (`daily`/`release`)
+caller depends only on `policy`: real planning starts alongside L1, and real
+workers start as soon as their own plan is ready, without waiting for UT, ST
+or mocked E2E. They do not download or reconcile mocked results as a prerequisite.
+The two callers are mutually exclusive, so each run executes the real suite once.
+A separate credential-free `policy` job selects the profile/backend before L1,
+so a failed L1 check cannot hide the requested real suite. Real workers still
+require a successfully frozen real plan and respect workflow cancellation.
+This changes execution eligibility, not the final verdict: `merge-gate` still
+requires every selected job and complete mocked/real accounting; any failure
+continues to block creating the draft Release and its assets, which become
+public only after a person publishes the draft from the Releases page.
+No extra accounting job or human approval is added. The combined `e2e-results`
+artifact preserves worker HTML/image links and the suite-level plan/summary.
 
 ### Merge queue and credentials: repository setup
 
@@ -103,7 +187,7 @@ The credential-isolation regression checks every job that references a
 model token: it must declare an Environment and exclude pull-request events.
 The check intentionally does not pin Environment names. To change research
 endpoints, configure an Environment with the same variable/secret names and
-update the research Environment in both real-plan and real-e2e.
+update the research Environment in both real-plan and real-e2e in `real-e2e.yml`.
 
 Environment variables are also used by the credential-free real-plan job so
 its frozen configuration matches its workers. API secrets are injected only
@@ -140,15 +224,35 @@ supported; choose the same root again when stopping or inspecting that run.
 
 ### Real cases, prerequisites and usage
 
-`journey-basic-real-api.spec.ts` has seven backend-independent cases: response
-and stream completion, tool-result consumption, memory across turns, durable
-artifact/version retrieval after follow-up, ordered tool dependency, structured
-numeric arguments/results, and cancel/recover with no active orphan run.
-It drives the product and public APIs; it never imports a native agent directly.
-Each case owns its records and uses a pass-through to the actual provider.
-The basic Project disables optional skill, planning and delegation plugins
-through the public API; workspace and MCP tools remain real. The same setup
-applies to both backends and keeps a research skill catalog out of short calls.
+`journey-basic-real-api.spec.ts` adapts seven short scenarios from
+[DeepSeek Harness's real-provider tests](https://github.com/deepseek-ai/deepseek-harness/tree/d743267388641bc76f17c45ce8b4c231aed1d32c/packages/llm/llm-deepseek/tests)
+and [agent journeys](https://github.com/deepseek-ai/deepseek-harness/tree/d743267388641bc76f17c45ce8b4c231aed1d32c/apps/cli/tests/profiles/headless/tests).
+The implementation drives ScienceDiscovery's running product through the browser
+and public APIs; it does not import either backend's agent internals.
+
+| L3 case | User goal and independently checked result | External calls |
+| --- | --- | --- |
+| `response` | Receive a short answer; observe real content deltas, a provider stop marker and a completed Run | Real LLM |
+| `tool` | Execute `cat command-input.txt`; a marker absent from the prompt must appear in an actual tool result and the final answer | Real LLM + local sandboxed shell |
+| `files` | Read and edit a file; download the exact changed contents and verify a neighbouring file remains byte-identical | Real LLM + workspace tools |
+| `memory` | Reopen the Session, inspect persisted history and ask the model to recall the previous code | Two real-model turns; client reconnection, not a server restart |
+| `artifact` | Deliver an artifact, continue the conversation, reopen the Session and retrieve the same immutable version | Real LLM + workspace/artifact tools |
+| `workspace` | Write a relative filename in one Session; another Session in the same Project keeps its same-named file unchanged | Real LLM + workspace tools |
+| `cancel` | Cancel after actual streamed output begins; reach cancelled state, complete another request and leave no active Run | Real LLM, including a cancelled request |
+
+Every completed Run must have nonzero product-reported input/output token usage and retains
+the provider usage ledger, including on failure. These replace the former MCP
+echo, ordered-addition and numeric-argument probes; there is no external MCP
+server or AI judge. Each case owns its Project, Session, model and files. The
+basic Project disables optional skill, planning and delegation plugins through
+the public API. `--backend jiuwenswarm|legacy` changes execution only; the case
+list and assertions remain identical. L4/L5 inherit these seven basic cases and
+two Runner-recovery cases, then add twelve nightly cases.
+
+`journey-runner-recovery-real.spec.ts` adds two real API cases: the Agent chooses
+to wait after Runner execution is blocked, or explains the failure and finishes
+without waiting, according to the user's request. The waiting case also checks
+card recovery after a browser reload and cancellation returned to the model.
 
 The basic worker has no suite request or token budget and does not override
 per-request model token settings. Its ledger records forwarded requests,
@@ -156,12 +260,14 @@ payload bytes and provider-reported input/output tokens across worker restarts.
 Cancelled calls or responses without usage stay in `unreportedCalls`; measured
 totals are incomplete when that count is nonzero. No token count is inferred
 from payload bytes. A fresh isolated run uses a fresh runtime root.
-Transport buffer guards, request timeouts and the seven three-minute case
-timeouts remain; they are failure bounds, not monetary limits.
+Transport buffer guards and request timeouts remain. The seven basic cases have
+three-minute deadlines; the two Runner-recovery cases have four-minute deadlines.
+These are failure bounds, not monetary limits.
 
 Research cost is separate and has not yet been measured. DRB-58/62/75 allow 90
 minutes generation; DRB-59/64 allow 120 minutes. Nightly judge timeout is 10
-minutes. Team generation allows 55 minutes; PUCT generation 120 minutes.
+minutes. Biomni generation allows 80 minutes, with up to 65 minutes for rubric
+evaluation. Team generation allows 55 minutes; PUCT generation 120 minutes.
 Its optional AI audit allows up to 65 more minutes when explicitly enabled
 locally; both daily and release leave that audit disabled. Job setup counts toward the four-hour worker
 ceiling. `fail-fast: false` retains evidence from independent workers; there
@@ -170,12 +276,12 @@ Monthly usage is the sum of actual provider usage across queue attempts,
 approximately 30 daily runs and version candidates; provider rates and actual
 call counts, not timeout ceilings, determine money spent.
 
-`prepare-real-research.sh` runs only for research workers. It needs `HF_TOKEN`
-even while the Biomni download is disabled. Both daily and release keep
-`CI_PREPARE_BIOMNI=0` while the two existing cases are quarantined. The DRB
-evaluator is pinned to `852f4022d1f98fb707222e395405136e8f0e8d52`; Biomni inputs
-have committed blob checksums for later restoration. Missing prerequisites for
-selected cases fail; they do not filter selection.
+`prepare-real-research.sh` runs only for research workers. Daily and release
+set `CI_PREPARE_BIOMNI=1` only in the two Biomni shards and use
+`HF_TOKEN` to download their pinned inputs. The DRB evaluator is pinned to
+`852f4022d1f98fb707222e395405136e8f0e8d52`; Biomni inputs have
+committed blob checksums. Missing prerequisites for selected cases fail;
+they do not filter selection.
 
 ### Initial release scope and future quality calibration
 
@@ -186,16 +292,12 @@ quality baseline or apply a newly calibrated regression threshold. A green run
 certifies this selected suite, not measured capability non-regression or a
 complete upstream benchmark leaderboard.
 
-The real case counts are L3 **7**, L4 **17**, L5 **17**. L4 retains all ten
-previously eligible nightly cases and inherits the seven new L3 cases. L5
-currently uses the same cases and evaluation modes as L4; its separate profile
-and `tier:l5` extension row remain available for future additions. Two Biomni cases and the seeded literature-review
-journey were already quarantined on main in commit `8bd4560d`; this change
-preserves their status and excludes them from all automatic profiles.
-Biomni needs scientific Python packages in the agent sandbox and citation
-search that completes within the test timeout. Literature review needs saved
-Pro/Flash models, the PubMed connector and the evidence-brief skill provisioned
-in CI. Repair and verify these prerequisites before restoring the cases.
+The real case counts are L3 **9**, L4 **21**, L5 **21**. L4 includes
+twelve nightly cases and inherits the nine L3 cases. L5 currently uses the
+same cases and evaluation modes as L4; its separate profile and `tier:l5`
+extension row remain available for future additions. The two Biomni cases
+return to daily and release; the seeded literature-review journey remains
+quarantined pending its CI prerequisites.
 
 Broader cases and measured quality regression thresholds are follow-up work.
 Stored scores retain generator, backend, judge and evaluator/input fingerprints

@@ -63,13 +63,25 @@ chmod +x ./ScienceDiscovery
 ./ScienceDiscovery serve
 ```
 
-A successful startup prints an `Open to sign in` URL. Open it in your browser.
+Open <http://127.0.0.1:4310> after startup. If prompted, paste the local service access token from `<data-dir>/secrets/auth-token` (default `.sciencediscovery-data/secrets/auth-token`) into Connection and save. If `SCIENCE_AGENT_AUTH_TOKEN` is set, use that configured value. The printed `Open to sign in` URL is an optional shortcut; startup logs are not required.
 
 ### What happens on first launch
 
 The first `serve` prepares some runtime dependencies and therefore needs network access. Later launches reuse the prepared environment.
 
 For offline hosts, prepare the data directory on a connected machine or configure reachable package mirrors. See the [configuration reference](../reference/configuration.md).
+
+### Commands
+
+```text
+ScienceDiscovery serve [options]        Start the Web UI, control API, and sandbox runner
+ScienceDiscovery run [input] [options]  Run an Agent task against a running serve
+ScienceDiscovery extract --to <dir>     Unpack the embedded runtime without starting it
+ScienceDiscovery version                Print the release and bundled runtime versions
+ScienceDiscovery help                   Show every command and option
+```
+
+`run` is the command-line client for scripts and pipelines. It prints text on a terminal and JSONL when piped, and a non-interactive run must pass `--auto-approve`. See the [CLI reference](../reference/cli.md#run) for its options and output modes. In local source mode, the same client is `node services/launcher/dist/main.js run`.
 
 ### Common startup options
 
@@ -149,7 +161,7 @@ After a successful build, later starts can use:
 ./scripts/start-stack.sh --mode local --no-build
 ```
 
-A successful startup prints the same `Open to sign in` URL.
+Open <http://127.0.0.1:4310> after startup and follow the Connection prompt using the token in `.sciencediscovery-data/secrets/auth-token` (or your configured data directory / `SCIENCE_AGENT_AUTH_TOKEN`). This also works for background services without the original terminal output.
 
 ### macOS notes
 
@@ -245,15 +257,7 @@ docker compose logs --tail=200
 
 ### 3. Open the Web UI
 
-View the logs and find the `Open to sign in` URL:
-
-```text
-docker compose logs -f
-```
-
-Open the printed `Open to sign in` URL in your browser.
-
-You can also open <http://127.0.0.1:4310> directly and paste the local service access token when prompted.
+Open <http://127.0.0.1:4310> directly. When Connection asks for a local service access token, read `./data/secrets/auth-token` on the host (container: `/app/data/secrets/auth-token`), paste it and save. If `SCIENCE_AGENT_AUTH_TOKEN` is set, use that configured value. The sign-in URL in the logs is an optional shortcut.
 
 Treat the sign-in URL and token like a password.
 
@@ -284,13 +288,13 @@ Then open <http://127.0.0.1:4310> locally.
 
 ## First-run troubleshooting for binary and local mode
 
-### No `Open to sign in` URL appears
+### The service does not start
 
 Read the earliest startup error first. Later failures are often consequences of the first one.
 
 ### The browser rejects the token
 
-Open the `Open to sign in` URL from the latest startup output again.
+Read the current token from `<data-dir>/secrets/auth-token` (Docker host: `./data/secrets/auth-token`) or your configured `SCIENCE_AGENT_AUTH_TOKEN`, then paste it into Connection and save. Startup logs are not required.
 
 If entering a token manually, use the **local service access token**, not the model provider API key.
 
@@ -435,3 +439,56 @@ Once the service is running, stop reading deployment details and return to the [
 - Sandbox isolation and execution internals: [Developer docs: Sandbox execution](../developer-docs/sandbox-execution.md)
 - Internal processes and module boundaries: [Developer docs: Architecture](../developer-docs/architecture.md)
 - Repository structure and source entry points: [Developer docs: Repository layout](../developer-docs/repository-layout.md)
+
+## Initialize Evolve on demand
+
+The slim binary starts with Evolve and its related Idea Tree research paths
+**not initialized**. Chat remains available. In a Session, open **Tasks → Evolve**
+and select **Init Evolve**, or type `/evolve-design` and use the initialization
+action shown above the composer. Initialization is explicit: starting `serve`
+does not download Evolve or the candidate runtime.
+
+Init downloads the designated `v0.3.0-rc1` application source archive at commit
+`844947da87b27528d9a34d0ee6d0efd591e57749`, verifies SHA-256
+`2cea0ea513eef43c94e697e72a21cf7bb3d4b8883117479240b6c8d3e0cc2e99`,
+and installs `services/evolve` with the frozen candidate dependencies on the
+release's bundled Python (3.12 or later). No Git checkout or host Python is
+required. Allow at least 1 GiB of free disk space and network access to GitHub
+and the configured Python package index. The source package's local `0.0.0`
+version is identified by that release/commit/archive digest, not by a PyPI
+sidecar release. The exact runtime export and its checksum live in
+`services/launcher/src/evolve-lock.ts`.
+
+The launcher starts the installed sidecar on its own dynamically bound loopback
+socket. Its random internal credential is private to the installation and
+persists in `<data-dir>/evolve/secrets/internal-token` with owner-only access;
+it is never a browser/model token. Closing `serve` stops the owned process.
+Restarts reuse the verified installation and token. A failed download, checksum,
+installation or startup leaves Evolve unavailable; select **Init Evolve** to
+retry. Failed attempts clean their staging directory. After an interrupted process,
+explicit Init reclaims private staging marked as owned by this exact pinned runtime,
+under the installation lock. Unknown/unmarked directories are preserved for operator
+inspection rather than deleted automatically.
+
+Operators may explicitly configure `SCIENCE_AGENT_EVOLVE_URL` and
+`SCIENCE_AGENT_EVOLVE_INTERNAL_TOKEN` for an existing service. This mode remains
+operator-owned; the launcher does not install or stop that service. Health and
+authentication must succeed before Evolve tools are offered. Without a launcher
+or explicit service configuration, the UI explains that initialization is
+unavailable. The source/container stack explicitly starts its provisioned
+sidecar through the same launcher socket supervision; it no longer relies on
+an implicit fixed port or public credential.
+
+The managed Evolve runtime uses only its locked packages. A task cannot silently
+install another package from a mutable index; missing additional packages cause
+a refusal. Supporting another managed dependency requires updating the reviewed
+lock. An explicitly provisioned source stack or operator-configured service
+retains its own runtime provisioning policy.
+
+The launcher forwards the documented candidate-directory and log settings to its
+sidecar, so the API and sidecar share `SCIENCE_AGENT_EVOLVE_CANDIDATE_DIR`.
+Only explicitly provisioned source/container runtimes also receive operator proxy,
+package-index and certificate-path settings; managed runtimes retain their locked
+package policy. Model keys, HOME and arbitrary environment variables are not inherited.
+While Evolve is unavailable, its workspace/history routes are disabled together;
+persisted records remain on disk and return when the service becomes ready.
