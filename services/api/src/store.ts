@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import { normalizeSpecialistRuntime } from "./specialist-runtime/config.js";
 import { effectiveRunnerIds } from "@sciencediscovery/schema";
+import { ExecutionBlocks } from "@sciencediscovery/governance";
 import { createHash, randomUUID } from "node:crypto";
 import { appendFile, mkdir, open, readFile, readdir, realpath, rename, rm, stat, truncate, writeFile } from "node:fs/promises";
 import { createReadStream } from "node:fs";
@@ -407,6 +409,13 @@ function savedWorkspaceFileRevision(value: unknown): WorkspaceFileRevision | und
   } as WorkspaceFileRevision;
 }
 
+/** Keep rows inserted on the live catalog while a cloned snapshot is restored. */
+function retainAddedById<T extends { id: string }>(restored: T[], live: T[]): T[] {
+  const ids = new Set(restored.map((item) => item.id));
+  const added = live.filter((item) => !ids.has(item.id));
+  return added.length ? [...restored, ...added] : restored;
+}
+
 export class SessionStoreHttpError extends Error {
   constructor(message: string, readonly statusCode: 400 | 404 | 409) {
     super(message);
@@ -415,7 +424,11 @@ export class SessionStoreHttpError extends Error {
 }
 
 export class SessionStore {
+  readonly executionBlocks = new ExecutionBlocks();
   readonly dataDir: string;
+  // Ephemeral provenance: after a restart, stale rename requests fail closed.
+  // Weak keys avoid retaining deleted sessions solely for title tracking.
+  private readonly refinedSessionTitles = new WeakMap<Session, { previous: string; title: string }>();
   // Catalog mutations replace Subagent objects. Cache by object identity so an
   // unchanged record is serialized once, without retaining superseded revisions.
   private readonly subagentAuthorityRefs = new WeakMap<Subagent, Promise<AgentStateRef>>();
@@ -546,6 +559,10 @@ export class SessionStore {
       CREATE TABLE IF NOT EXISTS catalog_state (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS specialist_runtime_secrets (
+        session_id TEXT PRIMARY KEY,
+        encrypted_value TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS model_secrets (
         model_id TEXT PRIMARY KEY,
@@ -862,7 +879,7 @@ export class SessionStore {
     // (every other field is overwritten by the pinned definition on each load,
     // so pinned upgrades always propagate).
     const specialists = [
-      ...savedSpecialists.filter((specialist) => !specialist.builtIn),
+      ...savedSpecialists.filter((specialist) => !specialist.builtIn).map(specialist => ({ ...specialist, runtime: normalizeSpecialistRuntime(specialist.runtime) })),
       ...BUILTIN_SPECIALISTS.map((builtin) => {
         const existing = savedSpecialists.find((candidate) => candidate.id === builtin.id);
         return existing?.builtIn
@@ -1109,7 +1126,7 @@ export class SessionStore {
       proxyServers,
       quotaSettings,
       sandboxNetworkSettings,
-      reviewerSpecialistEnabled: saved.reviewerSpecialistEnabled === true,
+      reviewerSpecialistEnabled: saved.reviewerSpecialistEnabled ?? true,
       reviewerSpecialistFeedbackPolicy,
       reviewerSpecialistLevel,
       remoteHosts,
@@ -1174,18 +1191,35 @@ export class SessionStore {
   }
 
   close(): void {
+    this.executionBlocks.close();
     this.database?.close();
     this.database = undefined;
     this.secretKey = undefined;
     this.loaded = false;
   }
 
-  private async saveCatalog(): Promise<void> {
-    this.saveQueue = this.saveQueue.then(() => {
-      if (!this.database) throw new Error("Catalog database is not initialized");
-      this.database.prepare("INSERT INTO catalog_state (id, json) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET json = excluded.json").run(JSON.stringify(this.catalog));
-    });
-    await this.saveQueue;
+  /**
+   * Persist the catalog. `mutate` runs in the same synchronous turn as the
+   * sqlite write, so a reader cannot observe a session that has been removed
+   * from memory but not committed. A failed write restores the pre-mutate
+   * catalog, including rows added while this save waited for the queue.
+   */
+  private async saveCatalog(mutate?: () => void): Promise<void> {
+    const apply = () => {
+      const previous = mutate ? structuredClone(this.catalog) : undefined;
+      try {
+        mutate?.();
+        if (!this.database) throw new Error("Catalog database is not initialized");
+        this.database.prepare("INSERT INTO catalog_state (id, json) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET json = excluded.json").run(JSON.stringify(this.catalog));
+      } catch (error) {
+        if (previous) this.catalog = previous;
+        throw error;
+      }
+    };
+    // A rejected save must not drop every later write. `run` still rejects for this caller.
+    const run = this.saveQueue.then(apply, apply);
+    this.saveQueue = run.then(() => undefined, () => undefined);
+    await run;
   }
 
   private async withSubagentMutation<T>(subagentId: string, mutation: () => Promise<T>): Promise<T> {
@@ -1656,6 +1690,7 @@ export class SessionStore {
         else if (field === "enabledConnectorIds") effective.enabledConnectorIds = [...value as ConnectorId[]];
         else if (field === "enabledSkillLibraries") effective.enabledSkillLibraries = structuredClone(value) as EffectiveRuntimeSettings["enabledSkillLibraries"];
         else if (field === "enabledSkillIds") effective.enabledSkillIds = [...value as string[]];
+        else if (field === "defaultApprovalMode") effective.defaultApprovalMode = value as Session["approvalMode"];
         else if (field === "semanticReviewEnabled") effective.semanticReviewEnabled = value as boolean;
         else if (field === "skillSelectionMode") effective.skillSelectionMode = value as SkillSelectionMode;
         else if (field === "thinkingMode") effective.thinkingMode = value as ModelThinkingMode;
@@ -2253,7 +2288,14 @@ export class SessionStore {
         this.database.exec("COMMIT");
       } catch (error) {
         this.database.exec("ROLLBACK");
+        const live = this.catalog;
         this.catalog = previous;
+        // The clone predates anything inserted while the transaction ran.
+        // Put those rows back; the failed settings edit itself stays rolled back.
+        this.catalog.sessions = retainAddedById(previous.sessions, live.sessions);
+        this.catalog.subagents = retainAddedById(previous.subagents, live.subagents);
+        this.catalog.projects = retainAddedById(previous.projects, live.projects);
+        this.catalog.permissionEpochs = retainAddedById(previous.permissionEpochs, live.permissionEpochs);
         throw error;
       }
       this.pluginControl?.changed(projectId);
@@ -2265,6 +2307,7 @@ export class SessionStore {
       assertCurrent?.();
       const session = this.assertSessionWritable(sessionId);
       const normalized = this.normalizeSettings(value);
+      if (normalized.defaultApprovalMode !== undefined) throw new SessionStoreHttpError("Approval defaults are only supported at Global and Project scope", 400);
       session.settingsOverrides = normalized;
       session.updatedAt = new Date().toISOString();
       this.syncSessionCompatibility(session);
@@ -2607,12 +2650,16 @@ export class SessionStore {
     input: RuntimeSettingsOverrides = {},
     remoteRunnerHostIds: string[] = [],
     runnerIds?: string[],
+    description?: string,
   ): Promise<Project> {
     const settingsOverrides = this.normalizeSettings(withDefaultProjectSkillSettings(input));
     const allowedRunners = runnerIds === undefined ? undefined : this.validateRunnerIds(runnerIds);
     const allowedHosts = this.validateProjectRemoteRunnerHosts(allowedRunners?.filter((id) => id !== "local") ?? remoteRunnerHostIds);
+    const trimmedDescription = description?.trim() ?? "";
+    if (trimmedDescription.length > 2_000) throw new Error("Project description must be at most 2000 characters");
     const project: Project = {
       createdAt: new Date().toISOString(),
+      ...(trimmedDescription ? { description: trimmedDescription } : {}),
       id: randomUUID(),
       name: cleanLabel(name, "Untitled project"),
       remoteRunnerHostIds: allowedHosts,
@@ -2748,6 +2795,7 @@ export class SessionStore {
     const settingsOverrides = this.normalizeSettings(typeof input === "string"
       ? { modelId: input, reviewModelId: input }
       : input);
+    if (settingsOverrides.defaultApprovalMode !== undefined) throw new SessionStoreHttpError("Approval defaults are only supported at Global and Project scope", 400);
     const resolved = this.resolveSettingsLayers([
       ...this.projectSettingsLayers(project),
       { overrides: settingsOverrides, source: "session" },
@@ -2768,13 +2816,13 @@ export class SessionStore {
     const sessionId = randomUUID();
     const permissionEpoch = createPermissionEpoch(
       sessionId,
-      "Session created",
+      `Session created; approval mode from ${governance.approvalMode !== undefined ? "explicit Session choice" : resolved.sources.defaultApprovalMode === "unset" ? "built-in Ask" : `${resolved.sources.defaultApprovalMode} default`}`,
       undefined,
       undefined,
       this.currentSandboxNetworkAccess(),
     );
     const session: Session = {
-      approvalMode: governance.approvalMode ?? "ask_for_dangerous",
+      approvalMode: governance.approvalMode ?? resolved.effective.defaultApprovalMode ?? "ask_for_dangerous",
       createdAt: now,
       enabledConnectorIds: [...resolved.effective.enabledConnectorIds],
       enabledSkillIds: [...resolved.effective.enabledSkillIds],
@@ -2813,6 +2861,38 @@ export class SessionStore {
     return this.catalog.sessions.find((session) => session.id === sessionId);
   }
 
+  /** Session-scoped Codex credential uses the platform encrypted secret channel. */
+  codexApiKey(sessionId: string): string | undefined { return this.runtimeApiKey(sessionId, "codex"); }
+
+  runtimeApiKey(sessionId: string, kind: "codex" | "claude-code" | "acp"): string | undefined {
+    const secretId = kind === "codex" ? sessionId : `${kind}:${sessionId}`;
+    const row = this.database?.prepare("SELECT encrypted_value FROM specialist_runtime_secrets WHERE session_id = ?")
+      .get(secretId) as { encrypted_value: string } | undefined;
+    return row && this.secretKey ? decryptSecretValue(this.secretKey, `${kind}:${sessionId}`, row.encrypted_value) : undefined;
+  }
+
+  configureCodex(subagentId: string, inputId: string, apiKey: string, fallback?: boolean): void {
+    return this.configureRuntime(subagentId, inputId, apiKey, fallback);
+  }
+
+  configureRuntime(subagentId: string, inputId: string, apiKey: string, fallback?: boolean): void {
+    const child = this.catalog.subagents.find(candidate => candidate.id === subagentId);
+    if (!child || child.status !== "running" || child.runtimeInput?.state !== "pending" || child.runtimeInput.id !== inputId) {
+      throw new SessionStoreHttpError("Codex configuration request is no longer pending", 409);
+    }
+    this.assertSessionWritable(child.sessionId);
+    const kind = child.runtimeInput!.runtime;
+    const secretId = kind === "codex" ? child.sessionId : `${kind}:${child.sessionId}`;
+    if (fallback !== undefined && typeof fallback !== "boolean") throw new SessionStoreHttpError("Invalid Codex fallback option", 400);
+    const key = typeof apiKey === "string" ? apiKey.trim() : "";
+    if (!key || key.length > 16384) throw new SessionStoreHttpError("Codex API key must be 1-16384 characters", 400);
+    if (!this.database || !this.secretKey) throw new Error("Secret storage is unavailable");
+    this.database.prepare("INSERT INTO specialist_runtime_secrets (session_id, encrypted_value) VALUES (?, ?) ON CONFLICT(session_id) DO UPDATE SET encrypted_value = excluded.encrypted_value")
+      .run(secretId, encryptSecretValue(this.secretKey, `${kind}:${child.sessionId}`, key));
+    if (fallback !== undefined) child.runtimeOptions = { kind, ...this.getSpecialist(child.specialistId)?.runtime, ...child.runtimeOptions, fallback } as NonNullable<Subagent["runtimeOptions"]>;
+    child.runtimeInput.state = "configured";
+  }
+
   listSpecialists(): Specialist[] {
     return structuredClone(this.catalog.specialists).toSorted((left, right) => left.name.localeCompare(right.name));
   }
@@ -2834,7 +2914,7 @@ export class SessionStore {
     const connectorIds = [...new Set(input.connectorIds ?? [])];
     const unavailableConnectors = connectorIds.filter((id) => !this.connectorIds.has(id));
     if (unavailableConnectors.length) throw new Error(`Specialist connectors are unavailable: ${unavailableConnectors.join(", ")}`);
-    return { connectorIds, description, enabledSkillIds, instructions, name };
+    return { connectorIds, description, enabledSkillIds, instructions, name, runtime: normalizeSpecialistRuntime(input.runtime) };
   }
 
   async createSpecialist(input: CreateSpecialistRequest): Promise<Specialist> {
@@ -2855,7 +2935,7 @@ export class SessionStore {
     if (specialist.builtIn) {
       // Built-in specialists are read-only except for the on/off `enabled` toggle.
       const touchedCoreField = "name" in input || "description" in input || "instructions" in input
-        || "connectorIds" in input || "enabledSkillIds" in input;
+        || "connectorIds" in input || "enabledSkillIds" in input || "runtime" in input;
       if (touchedCoreField) {
         throw new Error("Built-in specialists are read-only; only their enabled flag can be toggled");
       }
@@ -2868,7 +2948,7 @@ export class SessionStore {
       await this.saveCatalog();
       return structuredClone(specialist);
     }
-    const normalized = this.normalizeSpecialistInput(input);
+    const normalized = this.normalizeSpecialistInput({ ...specialist, ...input });
     if (this.catalog.specialists.some((candidate) => candidate.id !== specialistId
       && candidate.name.toLocaleLowerCase() === normalized.name.toLocaleLowerCase())) {
       throw new Error("Specialist name already exists");
@@ -4187,41 +4267,31 @@ export class SessionStore {
     return this.withDeletionBoundary(() => this.knownSessionDataPaths(session), () => [session.id],
       [resolve(this.dataDir, "projects", session.projectId, "sessions", session.id)], async (operation) => {
     await this.stageDeletion(operation);
-    const previousSessions = this.catalog.sessions;
-    const previousPermissionEpochs = this.catalog.permissionEpochs;
-    const previousPermissionGrants = this.catalog.permissionGrants;
-    const previousPermissionRequests = this.catalog.permissionRequests;
-    const previousSubagents = this.catalog.subagents;
-    const previousRemoteJobs = this.catalog.remoteJobs;
-    const previousWorkspaceFileRecords = this.catalog.workspaceFileRecords;
-    const previousRemoteWorkspaceSyncs = this.catalog.remoteWorkspaceSyncs;
-    const remoteJobIds = new Set(this.catalog.remoteJobs.filter((job) => job.sessionId === session.id).map((job) => job.id));
     try {
-      this.catalog.sessions = this.catalog.sessions.filter((item) => item.id !== session.id);
-      this.catalog.permissionEpochs = this.catalog.permissionEpochs.filter((epoch) => epoch.sessionId !== session.id);
-      this.catalog.permissionRequests = this.catalog.permissionRequests.filter((request) => request.sessionId !== session.id);
-      this.catalog.permissionGrants = this.catalog.permissionGrants.filter((grant) => grant.sessionId !== session.id
-        && !(grant.action === "remote_job" && remoteJobIds.has(grant.resource)));
-      this.catalog.subagents = this.catalog.subagents.filter((subagent) => subagent.sessionId !== session.id);
-      this.catalog.remoteJobs = this.catalog.remoteJobs.filter((job) => job.sessionId !== session.id);
-      this.catalog.workspaceFileRecords = this.catalog.workspaceFileRecords.map((record) =>
-        record.sessionId === session.id ? { ...record, sessionTitle: session.title } : record);
-      this.catalog.remoteWorkspaceSyncs = this.catalog.remoteWorkspaceSyncs.filter((record) => record.sessionId !== session.id);
-      await this.saveCatalog();
+      // Unpublish only inside the catalog write. Until that callback runs, the
+      // open Session page can still read the session it is showing.
+      await this.saveCatalog(() => {
+        const current = this.getSession(session.id);
+        if (!current) throw new Error("Session not found");
+        const remoteJobIds = new Set(this.catalog.remoteJobs.filter((job) => job.sessionId === current.id).map((job) => job.id));
+        this.catalog.sessions = this.catalog.sessions.filter((item) => item.id !== current.id);
+        this.catalog.permissionEpochs = this.catalog.permissionEpochs.filter((epoch) => epoch.sessionId !== current.id);
+        this.catalog.permissionRequests = this.catalog.permissionRequests.filter((request) => request.sessionId !== current.id);
+        this.catalog.permissionGrants = this.catalog.permissionGrants.filter((grant) => grant.sessionId !== current.id
+          && !(grant.action === "remote_job" && remoteJobIds.has(grant.resource)));
+        this.catalog.subagents = this.catalog.subagents.filter((subagent) => subagent.sessionId !== current.id);
+        this.catalog.remoteJobs = this.catalog.remoteJobs.filter((job) => job.sessionId !== current.id);
+        this.catalog.workspaceFileRecords = this.catalog.workspaceFileRecords.map((record) =>
+          record.sessionId === current.id ? { ...record, sessionTitle: current.title } : record);
+        this.catalog.remoteWorkspaceSyncs = this.catalog.remoteWorkspaceSyncs.filter((record) => record.sessionId !== current.id);
+      });
       operation.committed = true;
     } catch (error) {
-      this.catalog.sessions = previousSessions;
-      this.catalog.permissionEpochs = previousPermissionEpochs;
-      this.catalog.permissionGrants = previousPermissionGrants;
-      this.catalog.permissionRequests = previousPermissionRequests;
-      this.catalog.subagents = previousSubagents;
-      this.catalog.remoteJobs = previousRemoteJobs;
-      this.catalog.workspaceFileRecords = previousWorkspaceFileRecords;
-      this.catalog.remoteWorkspaceSyncs = previousRemoteWorkspaceSyncs;
       await this.rollbackStagedDeletion(operation);
       throw error;
     }
     this.database?.prepare("DELETE FROM permission_authorizations WHERE session_id = ?").run(session.id);
+    this.database?.prepare("DELETE FROM specialist_runtime_secrets WHERE session_id IN (?, ?, ?)").run(session.id, `claude-code:${session.id}`, `acp:${session.id}`);
     this.notifications.deleteSession(session.id);
     await this.finishStagedDeletion(operation);
     });
@@ -4238,63 +4308,45 @@ export class SessionStore {
     }, () => sessions.map((session) => session.id),
       [resolve(this.dataDir, "projects", projectId)], async (operation) => {
     await this.stageDeletion(operation);
-    const sessionIds = new Set(sessions.map((session) => session.id));
-    const previousProjects = this.catalog.projects;
-    const previousSessions = this.catalog.sessions;
-    const previousPermissionEpochs = this.catalog.permissionEpochs;
-    const previousPermissionGrants = this.catalog.permissionGrants;
-    const previousPermissionRequests = this.catalog.permissionRequests;
-    const previousSubagents = this.catalog.subagents;
-    const previousRemoteJobs = this.catalog.remoteJobs;
-    const previousRemoteWorkspaceSyncs = this.catalog.remoteWorkspaceSyncs;
-    const previousArtifacts = this.catalog.artifacts;
-    const previousArtifactVersions = this.catalog.artifactVersions;
-    const previousArtifactAnnotations = this.catalog.artifactAnnotations;
-    const previousWorkspaceFileRecords = this.catalog.workspaceFileRecords;
-    const previousWorkspaceFileRevisions = this.catalog.workspaceFileRevisions;
-    const remoteJobIds = new Set(this.catalog.remoteJobs.filter((job) => sessionIds.has(job.sessionId)).map((job) => job.id));
-    const projectArtifactIds = new Set(this.catalog.artifacts.filter((artifact) => artifact.projectId === projectId).map((artifact) => artifact.id));
-    const projectArtifactVersionIds = new Set(this.catalog.artifactVersions
-      .filter((version) => projectArtifactIds.has(version.artifactId))
-      .map((version) => version.id));
     try {
-      this.catalog.projects = this.catalog.projects.filter((item) => item.id !== projectId);
-      this.catalog.sessions = this.catalog.sessions.filter((session) => !sessionIds.has(session.id));
-      this.catalog.permissionEpochs = this.catalog.permissionEpochs.filter((epoch) => !sessionIds.has(epoch.sessionId));
-      this.catalog.permissionRequests = this.catalog.permissionRequests.filter((request) => request.projectId !== projectId
-        && (!request.sessionId || !sessionIds.has(request.sessionId)));
-      this.catalog.permissionGrants = this.catalog.permissionGrants.filter((grant) => grant.projectId !== projectId
-        && (!grant.sessionId || !sessionIds.has(grant.sessionId))
-        && !(grant.action === "remote_job" && remoteJobIds.has(grant.resource)));
-      this.catalog.subagents = this.catalog.subagents.filter((subagent) => !sessionIds.has(subagent.sessionId));
-      this.catalog.remoteJobs = this.catalog.remoteJobs.filter((job) => !sessionIds.has(job.sessionId));
-      this.catalog.remoteWorkspaceSyncs = this.catalog.remoteWorkspaceSyncs.filter((record) => !sessionIds.has(record.sessionId));
-      this.catalog.artifacts = this.catalog.artifacts.filter((artifact) => artifact.projectId !== projectId);
-      this.catalog.artifactVersions = this.catalog.artifactVersions.filter((version) => !projectArtifactIds.has(version.artifactId));
-      this.catalog.artifactAnnotations = this.catalog.artifactAnnotations.filter((annotation) => !projectArtifactVersionIds.has(annotation.artifactVersionId));
-      this.catalog.workspaceFileRecords = this.catalog.workspaceFileRecords.filter((record) => record.projectId !== projectId);
-      this.catalog.workspaceFileRevisions = this.catalog.workspaceFileRevisions.filter((revision) => revision.projectId !== projectId);
-      await this.saveCatalog();
+      await this.saveCatalog(() => {
+        if (!this.getProject(projectId)) throw new Error("Project not found");
+        // Include a Session inserted while this delete waited: it belongs to
+        // the project that is about to disappear.
+        sessions = this.listSessions(projectId, "all");
+        const sessionIds = new Set(sessions.map((session) => session.id));
+        const remoteJobIds = new Set(this.catalog.remoteJobs.filter((job) => sessionIds.has(job.sessionId)).map((job) => job.id));
+        const projectArtifactIds = new Set(this.catalog.artifacts.filter((artifact) => artifact.projectId === projectId).map((artifact) => artifact.id));
+        const projectArtifactVersionIds = new Set(this.catalog.artifactVersions
+          .filter((version) => projectArtifactIds.has(version.artifactId))
+          .map((version) => version.id));
+        this.catalog.projects = this.catalog.projects.filter((item) => item.id !== projectId);
+        this.catalog.sessions = this.catalog.sessions.filter((session) => !sessionIds.has(session.id));
+        this.catalog.permissionEpochs = this.catalog.permissionEpochs.filter((epoch) => !sessionIds.has(epoch.sessionId));
+        this.catalog.permissionRequests = this.catalog.permissionRequests.filter((request) => request.projectId !== projectId
+          && (!request.sessionId || !sessionIds.has(request.sessionId)));
+        this.catalog.permissionGrants = this.catalog.permissionGrants.filter((grant) => grant.projectId !== projectId
+          && (!grant.sessionId || !sessionIds.has(grant.sessionId))
+          && !(grant.action === "remote_job" && remoteJobIds.has(grant.resource)));
+        this.catalog.subagents = this.catalog.subagents.filter((subagent) => !sessionIds.has(subagent.sessionId));
+        this.catalog.remoteJobs = this.catalog.remoteJobs.filter((job) => !sessionIds.has(job.sessionId));
+        this.catalog.remoteWorkspaceSyncs = this.catalog.remoteWorkspaceSyncs.filter((record) => !sessionIds.has(record.sessionId));
+        this.catalog.artifacts = this.catalog.artifacts.filter((artifact) => artifact.projectId !== projectId);
+        this.catalog.artifactVersions = this.catalog.artifactVersions.filter((version) => !projectArtifactIds.has(version.artifactId));
+        this.catalog.artifactAnnotations = this.catalog.artifactAnnotations.filter((annotation) => !projectArtifactVersionIds.has(annotation.artifactVersionId));
+        this.catalog.workspaceFileRecords = this.catalog.workspaceFileRecords.filter((record) => record.projectId !== projectId);
+        this.catalog.workspaceFileRevisions = this.catalog.workspaceFileRevisions.filter((revision) => revision.projectId !== projectId);
+      });
       operation.committed = true;
     } catch (error) {
-      this.catalog.projects = previousProjects;
-      this.catalog.sessions = previousSessions;
-      this.catalog.permissionEpochs = previousPermissionEpochs;
-      this.catalog.permissionGrants = previousPermissionGrants;
-      this.catalog.permissionRequests = previousPermissionRequests;
-      this.catalog.subagents = previousSubagents;
-      this.catalog.remoteJobs = previousRemoteJobs;
-      this.catalog.remoteWorkspaceSyncs = previousRemoteWorkspaceSyncs;
-      this.catalog.artifacts = previousArtifacts;
-      this.catalog.artifactVersions = previousArtifactVersions;
-      this.catalog.artifactAnnotations = previousArtifactAnnotations;
-      this.catalog.workspaceFileRecords = previousWorkspaceFileRecords;
-      this.catalog.workspaceFileRevisions = previousWorkspaceFileRevisions;
       await this.rollbackStagedDeletion(operation);
       throw error;
     }
     this.database?.prepare("DELETE FROM permission_authorizations WHERE project_id = ?").run(projectId);
-    for (const session of sessions) this.notifications.deleteSession(session.id);
+    for (const session of sessions) {
+      this.database?.prepare("DELETE FROM specialist_runtime_secrets WHERE session_id IN (?, ?, ?)").run(session.id, `claude-code:${session.id}`, `acp:${session.id}`);
+      this.notifications.deleteSession(session.id);
+    }
     await this.finishStagedDeletion(operation);
     }, projectId);
   }
@@ -4308,6 +4360,7 @@ export class SessionStore {
       const { approvalMode, remoteRunnerHostIds, runnerIds, reviewCriteria, reviewMode, specialistId, title, ...settingsChanges } = changes;
       const nextTitle = hasOwn(changes, "title") ? requiredLabel(title, "Session title") : session.title;
       const nextSettings = this.normalizeSettings({ ...session.settingsOverrides, ...settingsChanges });
+      if (nextSettings.defaultApprovalMode !== undefined) throw new SessionStoreHttpError("Approval defaults are only supported at Global and Project scope", 400);
       const nextModel = this.getModel(nextSettings.modelId);
       if (nextModel && (nextSettings.thinkingMode !== undefined || nextSettings.thinkingEffort !== undefined)) {
         const constrained = constrainCatalogThinking(
@@ -4327,6 +4380,7 @@ export class SessionStore {
         ? undefined
         : this.validateSessionRemoteRunnerHosts(session.projectId, remoteRunnerHostIds);
       session.settingsOverrides = nextSettings;
+      if (hasOwn(changes, "title")) this.refinedSessionTitles.delete(session);
       session.title = nextTitle;
       if (reviewMode) session.reviewMode = reviewMode;
       if (reviewCriteria !== undefined) session.reviewCriteria = this.normalizeReviewCriteria(reviewCriteria);
@@ -4357,11 +4411,20 @@ export class SessionStore {
     sessionId: string,
     expectedTitle: string,
     nextTitle: string,
+    source?: "refinement" | "user_request",
   ): Promise<Session | undefined> {
     const session = this.assertSessionWritable(sessionId);
-    if (session.title !== expectedTitle) return undefined;
+    const refinement = this.refinedSessionTitles.get(session);
+    const replacesRefinement = source === "user_request"
+      && refinement?.previous === expectedTitle && refinement.title === session.title;
+    if (session.title !== expectedTitle && !replacesRefinement) return undefined;
     const normalizedTitle = nextTitle.trim().replace(/\s+/gu, " ");
     if (!normalizedTitle) throw new Error("Session title is required");
+    if (source === "refinement") {
+      this.refinedSessionTitles.set(session, { previous: expectedTitle, title: normalizedTitle });
+    } else {
+      this.refinedSessionTitles.delete(session);
+    }
     session.title = normalizedTitle;
     session.updatedAt = new Date().toISOString();
     await this.saveCatalog();
@@ -4561,11 +4624,11 @@ export class SessionStore {
     | { allowed: false; request: PermissionRequest }
   > {
     const session = this.assertSessionWritable(sessionId);
-    if (!new Set<PermissionAction>(["artifact_download", "code", "connector", "directory", "host", "remote_job"]).has(action)) {
+    if (!new Set<PermissionAction>(["sandbox_network", "direct_code", "artifact_download", "code", "connector", "directory", "host", "remote_job"]).has(action)) {
       throw new Error("Unsupported permission action");
     }
     const resource = resourceValue.trim().slice(0, 500);
-    const summary = summaryValue.trim().replace(/\s+/g, " ").slice(0, 500);
+    const summary = action === "direct_code" ? summaryValue.trim() : summaryValue.trim().replace(/\s+/g, " ").slice(0, action === "sandbox_network" ? 6000 : 500);
     if (!resource || !summary) throw new Error("Permission resource and summary are required");
     if (!context.executionId) {
       const approvedPreflight = this.catalog.permissionRequests.findLast((request) =>
@@ -4586,7 +4649,7 @@ export class SessionStore {
         }
       }
     }
-    if (session.approvalMode === "always_allow") {
+    if (session.approvalMode === "always_allow" && action !== "direct_code") {
       const authorization = this.createPermissionAuthorization({
         action,
         ...context,
@@ -4801,7 +4864,7 @@ export class SessionStore {
     this.catalog.permissionEpochs.push(permissionEpoch);
     const resolvedPendingRequests = approvalMode === "always_allow"
       ? this.catalog.permissionRequests.filter((request) =>
-          request.sessionId === session.id && request.state === "pending")
+          request.sessionId === session.id && request.state === "pending" && request.action !== "direct_code")
       : [];
     const authorizations = resolvedPendingRequests.map((request) => {
       request.decidedAt = permissionEpoch.createdAt;

@@ -17,7 +17,7 @@ const { test } = createTest(import.meta.url, { tags: ["category:ut", "os:linux",
 import assert from "node:assert/strict";
 import type { TestContext } from "node:test";
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -32,7 +32,119 @@ import { ProvenanceRecorder } from "@sciencediscovery/provenance";
 import type { RunnerClient } from "@sciencediscovery/executor";
 import { SessionStore } from "../store.js";
 import type { AgentPermissionRuntime } from "@sciencediscovery/governance";
+import { ExecutionBlocks } from "@sciencediscovery/governance";
 import { createWorkspaceExecutionBindings } from "./workspace-bindings.js";
+
+for (const action of ["retry", "cancel", "switch"] as const) {
+  test(`execution readiness ${action} is pre-dispatch and releases the external wait`, async t => {
+    const dataDir = await mkdtemp(resolve(tmpdir(), "binding-readiness-"));
+    t.after(() => rm(dataDir, { force: true, recursive: true }));
+    const queue = new ExecutionBlocks(); t.after(() => queue.close());
+    let repaired = false, dispatched = 0, waits = 0;
+    const refreshes: boolean[] = [];
+    const runnerClient = { executionCapability: async (refresh = false) => {
+      refreshes.push(refresh); return { ready: repaired, reason: "sandbox-unusable" };
+    } } as RunnerClient;
+    const bindings = createWorkspaceExecutionBindings({
+      agentId: "main", executionId: "run", sessionId: "session", workspaceRoot: dataDir, permissionScopeLabel: "test",
+      runnerClient,
+      remoteTargets: [{ runnerId: "remote", hostAlias: "Lab", workspaceKey: "remote-workspace",
+        runnerClient: () => ({ executionCapability: async () => ({ ready: true }) } as RunnerClient) }],
+      beginExternalWait: () => { waits++; return () => { waits--; }; },
+      store: { dataDir, executionBlocks: queue, assertSessionWritable() {}, assertSessionAllowsRunner() {},
+        effectiveRunnerIds: () => ["local", "remote"], npuDeviceSelection: () => [], resolveSandboxEgressProxy: () => undefined,
+      } as unknown as SessionStore,
+      permission: { requirePrivilege: async () => undefined, getEpoch: () => ({ id: "epoch" }) } as unknown as AgentPermissionRuntime,
+      provenanceRecorder: { executePython: async () => { dispatched++; return { exitCode: 0 }; } } as unknown as ProvenanceRecorder,
+    });
+    let operationId = "";
+    await assert.rejects(bindings.executePython("print('run once')"), (error: Error) => {
+      const result = JSON.parse(error.message);
+      assert.equal(result.code, "RUNNER_UNAVAILABLE"); assert.equal(result.dispatched, false);
+      assert.match(result.instruction, /call wait_for_runner\(operation_id\)/);
+      assert.match(result.instruction, /text saying.*does not create a pending operation/);
+      assert.match(result.instruction, /does not repair, install, switch machines or execute code/);
+      assert.match(result.instruction, /explain the blocker and finish/);
+      operationId = result.operationId; return true;
+    });
+    assert.equal(waits, 0); assert.deepEqual(queue.list("session"), []);
+    assert.equal(dispatched, 0);
+    await assert.rejects(bindings.runnerReadiness!.wait("foreign-operation"), /Unknown/);
+    const pending = bindings.runnerReadiness!.wait(operationId);
+    for (let attempt = 0; attempt < 50 && !queue.list("session").length; attempt++) await new Promise(resolve => setImmediate(resolve));
+    const block = queue.list("session")[0]; assert.ok(block);
+    assert.equal(dispatched, 0); assert.equal(waits, 1);
+    repaired = true;
+    queue.decide("session", block.id, action === "switch" ? { action, runnerId: "remote" } : { action });
+    const result = await pending as { action: string; dispatched: boolean };
+    assert.equal(result.action, action); assert.equal(result.dispatched, false);
+    assert.equal(dispatched, 0, "a decision never replays the failed execution");
+    await assert.rejects(bindings.runnerReadiness!.wait(operationId), /Unknown/);
+    if (action === "retry") {
+      assert.deepEqual(refreshes, [false, true]);
+      await bindings.executePython("print('a NEW call')"); assert.equal(dispatched, 1);
+    }
+    assert.equal(waits, 0); assert.deepEqual(queue.list("session"), []);
+  });
+}
+
+test("failed recheck returns to the Agent; a second explicit wait is cancellable and checks authorization", async t => {
+  const dataDir = await mkdtemp(resolve(tmpdir(), "runner-recheck-"));
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  const queue = new ExecutionBlocks(); t.after(() => queue.close());
+  let allowed = true, waits = 0;
+  const bindings = createWorkspaceExecutionBindings({
+    agentId: "subagent:one", executionId: "child-run", sessionId: "s", workspaceRoot: dataDir, permissionScopeLabel: "test",
+    runnerClient: { executionCapability: async () => ({ ready: false, reason: "sandbox-unusable" }) } as RunnerClient,
+    beginExternalWait: () => { waits++; return () => { waits--; }; },
+    permission: { requirePrivilege: async () => undefined } as unknown as AgentPermissionRuntime,
+    provenanceRecorder: { executePython: async () => { throw new Error("must not execute"); } } as unknown as ProvenanceRecorder,
+    store: { dataDir, executionBlocks: queue, assertSessionWritable() {}, effectiveRunnerIds: () => ["local"],
+      assertSessionAllowsRunner(_s: string, id: string) { if (!allowed || id !== "local") throw new Error("Runner not allowed"); },
+    } as unknown as SessionStore,
+  });
+  let operationId = "";
+  await assert.rejects(bindings.executePython("print('test')"), (error: Error) => { operationId = JSON.parse(error.message).operationId; return true; });
+  const first = bindings.runnerReadiness!.wait(operationId);
+  for (let i = 0; i < 50 && !queue.list("s").length; i++) await new Promise(resolve => setImmediate(resolve));
+  const block = queue.list("s")[0]!;
+  assert.equal(block.agentId, "subagent:one");
+  await assert.rejects(bindings.runnerReadiness!.wait(operationId), /already waiting/);
+  queue.decide("s", block.id, { action: "retry" });
+  const result = await first as { runner: { ready: boolean } };
+  assert.equal(result.runner.ready, false); assert.equal(waits, 0); assert.deepEqual(queue.list("s"), []);
+  allowed = false;
+  await assert.rejects(bindings.runnerReadiness!.wait(operationId), /not allowed/);
+  await assert.rejects(bindings.runnerReadiness!.check("local"), /not allowed/);
+  allowed = true;
+  const controller = new AbortController();
+  const again = bindings.runnerReadiness!.wait(operationId, controller.signal);
+  const rejected = assert.rejects(again, /abort/i);
+  for (let i = 0; i < 50 && !queue.list("s").length; i++) await new Promise(resolve => setImmediate(resolve));
+  controller.abort(); await rejected;
+  assert.equal(waits, 0); assert.deepEqual(queue.list("s"), []);
+  await assert.rejects(bindings.runnerReadiness!.wait(operationId), /Unknown/);
+});
+
+test("an offline remote returns a structured failure without touching the local Runner or opening a card", async () => {
+  const queue = new ExecutionBlocks();
+  const bindings = createWorkspaceExecutionBindings({
+    agentId: "main", executionId: "run", sessionId: "s", workspaceRoot: "/workspace", permissionScopeLabel: "test",
+    runnerClient: new Proxy({} as RunnerClient, { get() { throw new Error("must not probe local Runner"); } }),
+    remoteTargets: [{ runnerId: "lab", hostAlias: "Lab", workspaceKey: "s", runnerClient() { throw new Error("remote offline"); } }],
+    permission: { requirePrivilege: async () => undefined } as unknown as AgentPermissionRuntime,
+    provenanceRecorder: {} as ProvenanceRecorder,
+    store: { executionBlocks: queue, assertSessionWritable() {}, assertSessionAllowsRunner() {} } as unknown as SessionStore,
+  });
+  const diagnostic = await bindings.runnerReadiness!.check("lab");
+  assert.equal(diagnostic.connected, false); assert.match(diagnostic.reason, /remote offline/);
+  await assert.rejects(bindings.executePython("print('remote')", undefined, "tool-remote", "lab"), (error: Error) => {
+    const result = JSON.parse(error.message);
+    assert.equal(result.dispatched, false); assert.equal(result.runner.runnerId, "lab");
+    return true;
+  });
+  assert.deepEqual(queue.list("s"), []);
+});
 
 test("one-time timer binding validates time and execution ownership without execution or a write lease", async (t) => {
   const db = new DatabaseSync(":memory:"); t.after(() => db.close());
@@ -76,6 +188,7 @@ async function inboxBindings(t: TestContext, agentId: string) {
   const finished = new Set<string>();
   const waiters = new Map<string, () => void>();
   const runnerClient = {
+    executionCapability: async () => ({ ready: true }),
     startShellExecution: async (request: { executionId: string; sessionId: string; agentId: string }) => (
       { sessionId: request.sessionId, agentId: request.agentId, id: request.executionId, state: "running", queuedAt: "now" }),
     getShellExecution: async (id: string, owner: { sessionId: string; agentId: string }) => {
@@ -198,7 +311,7 @@ test("main and child execution bindings route by Runner ID and record isolated w
   let failSync = false;
   // Stands in for a Runner that does not hold this set yet, so every remote
   // execution here also exercises shipping the frozen bytes.
-  const remoteClient = { prepareSkillPackages: async (
+  const remoteClient = { executionCapability: async () => ({ ready: true }), prepareSkillPackages: async (
     manifest: { skills: { hash: string; id: string }[] },
     loadBundle: () => Promise<{ skills: { files: { content: string; path: string }[] }[] }>,
   ) => {
@@ -252,7 +365,7 @@ test("main and child execution bindings route by Runner ID and record isolated w
         return { createdFiles: [], exitCode: 0, stderr: "", stdout: "" };
       },
     } as unknown as ProvenanceRecorder,
-    runnerClient: {} as RunnerClient,
+    runnerClient: { executionCapability: async () => ({ ready: true }) } as RunnerClient,
     sessionId: "session-1",
     skillPackagesRoot: skillRoot,
     store: {
@@ -394,7 +507,7 @@ test("scientific executions forward the current outbound route and omit it for n
         return { createdFiles: [], exitCode: 0, stderr: "", stdout: "" };
       },
     } as unknown as ProvenanceRecorder,
-    runnerClient: {} as RunnerClient,
+    runnerClient: { executionCapability: async () => ({ ready: true }) } as RunnerClient,
     scientificEnvironments: [],
     sessionId: "session-1",
     store: {
@@ -586,6 +699,7 @@ async function npuChain(selection: number[] | undefined) {
     startedAt: new Date().toISOString(), stderr: "", stdout: "", workingDirectory: "/workspace",
   };
   const runnerClient = {
+    executionCapability: async () => ({ ready: true }),
     execute: async (request: Record<string, unknown>) => { payloads.push(request); return { ...result, executionId: String(request.executionId) }; },
     executeShell: async (request: Record<string, unknown>) => { payloads.push(request); return { ...result, executionId: String(request.executionId) }; },
     // The managed shell tool submits through this call instead, so it needs its
@@ -774,3 +888,191 @@ test("NPU broker bindings omit observeNpuJob when the broker is disabled", () =>
   assert.equal(bindings.observeNpuJob, undefined);
   assert.equal(bindings.npuBroker, undefined);
 });
+
+async function directBindingFixture(t: TestContext, machine = "local", initiallyReady = false) {
+  const root = await mkdtemp(resolve(tmpdir(), "direct-binding-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  let allowed = true, connected = true, active = true, unknown = false, revoked = false, selected = true, ready = initiallyReady;
+  let target = "machine:instance", account = "user:1000:1000", submissions = 0, grants = 0;
+  const resources: string[] = [];
+  const dispatches: Array<Record<string, unknown>> = [];
+  let workspaceKey = "session/main";
+  let capabilityOverride: Record<string, unknown> = {};
+  let onProbe = () => {};
+  let onConsent = () => {};
+  const runnerClient = {
+    executionCapability: async () => { if (!connected) throw new Error("Disconnected"); return { ready }; },
+    directExecutionCapability: async (_signal: unknown, scope: { runnerWorkspaceKey?: string; cwd: string }) => {
+      onProbe();
+      return { available: true, target, account,
+        workspaceRoot: scope.runnerWorkspaceKey ? `/remote/${scope.runnerWorkspaceKey}` : root, cwd: scope.cwd, ...capabilityOverride };
+    },
+  } as unknown as RunnerClient;
+  const store = {
+    assertSessionWritable() {}, assertSessionAllowsRunner() { if (!selected) throw new Error("Runner removed"); },
+    getSessionRun: async () => ({ status: active ? "running" : "completed" }),
+    getPermissionGrant: () => ({ state: revoked ? "revoked" : "active" }),
+    workspaceIdentity: () => ({ id: "workspace" }),
+    notifications: { markRead() {} },
+    shellExecutions: { list: () => unknown ? [{ runnerId: machine, state: "unknown" }] : [],
+      start: async (_owner: unknown, identity: Record<string, unknown>, _runner: unknown, record: (id: string) => Promise<unknown>) => {
+        submissions++; dispatches.push(identity); await record("execution"); return { id: "execution", state: "running" }; } },
+  } as unknown as SessionStore;
+  const permission = { getEpoch: () => ({ id: "epoch" }), requirePrivilege: async (request: { action: string; resource: string }) => {
+    if (request.action === "direct_code") {
+      resources.push(request.resource);
+      if (!allowed) throw new Error("Permission denied");
+      onConsent();
+    }
+    return { id: `authorization-${++grants}-${randomUUID()}`, action: request.action, outcome: "allowed", resource: request.resource, permissionGrantId: "grant" };
+  } } as unknown as AgentPermissionRuntime;
+  const make = (agentId = "main", executionId = "run") => createWorkspaceExecutionBindings({
+    rootRunId: "run", agentId, executionId, sessionId: "session", workspaceRoot: root,
+    store, runnerClient: machine === "local" ? runnerClient : {} as RunnerClient,
+    remoteTargets: machine === "local" ? [] : [{ runnerId: machine, hostAlias: "remote alias", runnerClient: () => runnerClient, get workspaceKey() { return workspaceKey; } }],
+    permission, permissionScopeLabel: "test", provenanceRecorder: { executeShell: async (input: Record<string, unknown>) => { dispatches.push(input); } } as unknown as ProvenanceRecorder,
+  });
+  const binding = make();
+  let operationId = "";
+  if (!initiallyReady) await assert.rejects(binding.executeShell!("printf hello", "ephemeral", undefined, undefined, machine), (error: Error) => {
+    operationId = JSON.parse(error.message).operationId; return Boolean(operationId);
+  });
+  const consent = async () => binding.directExecution!.request({ ...(initiallyReady ? { runnerId: machine } : { operationId }), command: "printf hello", cwd: "" }) as Promise<{
+    authorizationId: string; command: string; cwd: string; target: string; account: string; dispatched: boolean;
+  }>;
+  return { binding, make, consent, operationId, resources, dispatches, submissions: () => submissions,
+    capability: (value: Record<string, unknown>) => { capabilityOverride = value; },
+    duringProbe: (callback: () => void) => { onProbe = callback; },
+    duringConsent: (callback: () => void) => { onConsent = callback; },
+    deny: () => { allowed = false; }, disconnect: () => { connected = false; }, end: () => { active = false; },
+    uncertain: () => { unknown = true; }, revoke: () => { revoked = true; },
+    remove: () => { selected = false; }, recover: () => { ready = true; }, changeWorkspace: () => { workspaceKey = "other/main"; },
+    changeTarget: () => { target = "replacement"; }, changeAccount: () => { account = "other"; } };
+}
+
+for (const machine of ["local", "remote-1"]) {
+test(`${machine}: ready sandbox permits agent-first consent without any failed operation`, async t => {
+  const f = await directBindingFixture(t, machine, true);
+  const consent = await f.consent();
+  assert.equal(consent.dispatched, false);
+  assert.equal(f.submissions(), 0);
+  assert.equal(f.resources.length, 1);
+  await f.binding.directExecution!.start(consent);
+  assert.equal(f.submissions(), 1);
+});
+
+test(`${machine}: sandbox recovery after approval does not invalidate direct consent`, async t => {
+  const f = await directBindingFixture(t, machine);
+  const consent = await f.consent(); f.recover();
+  await f.binding.directExecution!.start(consent);
+  assert.equal(f.submissions(), 1);
+});
+
+test(`${machine}: agent-first unreachable Runner fails before requesting consent`, async t => {
+  const f = await directBindingFixture(t, machine, true); f.disconnect();
+  await assert.rejects(f.consent(), /reachable Runner.*network administrator/);
+  assert.equal(f.resources.length, 0); assert.equal(f.submissions(), 0);
+});
+
+test(`${machine}: recovery cannot switch the failed operation's Runner`, async t => {
+  const f = await directBindingFixture(t, machine);
+  await assert.rejects(f.binding.directExecution!.request({ operationId: f.operationId, runnerId: "other", command: "printf hello", cwd: "" }), /must match/);
+  assert.equal(f.resources.length, 0);
+});
+
+test(`${machine}: direct approval never dispatches; a new confirmed submission consumes it atomically`, async t => {
+  const f = await directBindingFixture(t, machine);
+  const consent = await f.consent();
+  assert.equal(consent.dispatched, false); assert.equal(f.submissions(), 0);
+  const results = await Promise.allSettled([f.binding.directExecution!.start(consent), f.binding.directExecution!.start(consent)]);
+  assert.equal(results.filter(result => result.status === "fulfilled").length, 1);
+  assert.equal(f.submissions(), 1);
+  await assert.rejects(f.binding.directExecution!.start(consent), /consumed/);
+});
+
+for (const failure of ["deny", "disconnect", "end", "uncertain"] as const) {
+  test(`${machine}: direct consent ${failure} produces no dispatch`, async t => {
+    const f = await directBindingFixture(t, machine); f[failure]();
+    await assert.rejects(f.consent()); assert.equal(f.submissions(), 0);
+  });
+}
+for (const failure of ["changeTarget", "changeAccount", "end", "uncertain", "revoke", "disconnect", "remove"] as const) {
+  test(`${machine}: direct approved operation rejects ${failure} before dispatch`, async t => {
+    const f = await directBindingFixture(t, machine); const consent = await f.consent(); f[failure]();
+    await assert.rejects(f.binding.directExecution!.start(consent)); assert.equal(f.submissions(), 0);
+  });
+}
+
+test(`${machine}: direct authorization cannot cross command, child agent or later run`, async t => {
+  const f = await directBindingFixture(t, machine); const consent = await f.consent();
+  await assert.rejects(f.binding.directExecution!.start({ ...consent, command: "echo changed" }), /mismatched/);
+  await assert.rejects(f.make("child").directExecution!.start(consent), /Missing/);
+  await assert.rejects(f.make("main", "next-run").directExecution!.start(consent), /Missing/);
+  await assert.rejects(f.make("child").directExecution!.request({ operationId: f.operationId, command: "printf hello", cwd: "" }), /failed/);
+  assert.equal(f.submissions(), 0);
+});
+
+test(`${machine}: direct authorization cancelled after consent does not dispatch`, async t => {
+  const f = await directBindingFixture(t, machine); const consent = await f.consent();
+  const controller = new AbortController(); controller.abort();
+  await assert.rejects(f.binding.directExecution!.start(consent, controller.signal));
+  assert.equal(f.submissions(), 0);
+});
+
+}
+
+test("remote direct dispatch pins workspace, client and provenance to consent target", async t => {
+  const f = await directBindingFixture(t, "remote-1");
+  const consent = await f.consent();
+  await f.binding.directExecution!.start(consent);
+  assert.equal(f.dispatches[0]!.runnerId, "remote-1");
+  const recorded = f.dispatches[1]!;
+  assert.equal(recorded.runnerId, "remote-1");
+  assert.equal(recorded.remoteHostAlias, "remote alias");
+  assert.equal(recorded.runnerWorkspaceKey, "session/main");
+  assert.equal(recorded.workspaceRoot, "/remote/session/main");
+  assert.equal((recorded.directAuthorization as { runnerWorkspaceKey: string }).runnerWorkspaceKey, "session/main");
+});
+
+test("remote workspace changes consume consent without dispatch", async t => {
+  const f = await directBindingFixture(t, "remote-1"); const consent = await f.consent(); f.changeWorkspace();
+  await assert.rejects(f.binding.directExecution!.start(consent), /changed/);
+  assert.equal(f.submissions(), 0);
+});
+
+test("matching direct consent resources differ between local and remote targets", async t => {
+  const local = await directBindingFixture(t), remote = await directBindingFixture(t, "remote-1");
+  const consent = await local.consent(); await remote.consent();
+  assert.notEqual(local.resources[0], remote.resources[0]);
+  await assert.rejects(remote.binding.directExecution!.start(consent), /Missing|mismatched/);
+  assert.equal(remote.submissions(), 0);
+});
+
+for (const machine of ["local", "remote-1"]) {
+  for (const response of [{ available: false }, { workspaceRoot: undefined }, { cwd: undefined }]) {
+    test(`${machine}: incomplete direct capability ${Object.keys(response)[0]} fails before consent`, async t => {
+      const f = await directBindingFixture(t, machine); f.capability(response);
+      await assert.rejects(f.consent(), /workspace capability is unavailable/);
+      assert.equal(f.resources.length, 0); assert.equal(f.submissions(), 0);
+    });
+  }
+  test(`${machine}: removal while probing revokes access before consent`, async t => {
+    const f = await directBindingFixture(t, machine); f.duringProbe(f.remove);
+    await assert.rejects(f.consent(), /Runner removed/);
+    assert.equal(f.resources.length, 0); assert.equal(f.submissions(), 0);
+  });
+  test(`${machine}: target replacement during consent invalidates the approval`, async t => {
+    const f = await directBindingFixture(t, machine); f.duringConsent(f.changeTarget);
+    await assert.rejects(f.consent(), /changed during consent/);
+    assert.equal(f.resources.length, 1); assert.equal(f.submissions(), 0);
+  });
+  for (const field of ["cwd", "workspaceRoot"]) {
+  test(`${machine}: target ${field} changes consume approval before dispatch`, async t => {
+    const f = await directBindingFixture(t, machine); const consent = await f.consent();
+    f.capability({ [field]: "redirected" });
+    await assert.rejects(f.binding.directExecution!.start(consent), /changed/);
+    await assert.rejects(f.binding.directExecution!.start(consent), /consumed/);
+    assert.equal(f.submissions(), 0);
+  });
+  }
+}

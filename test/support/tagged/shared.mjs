@@ -22,8 +22,11 @@ import { createPlan, verifyResults, fileDigest, subplan } from './plan.mjs';
 import { schema } from './tags.mjs';
 import { profiles, slices, nodeSources, nodeExtraSources, pythonProjects, pythonSources, pythonPlugins } from './profiles.mjs';
 import { preflight } from './environment.mjs';
-import { executionConfig, realShards } from './execution.mjs';
+import { executionConfig, realShards, mockedShards } from './execution.mjs';
 import { checks } from './checks.mjs';
+import { planGroups, schedule, utWorkers, SWARM, SWARM_TAG } from './scheduler.mjs';
+import { startSwarm, withoutSwarm } from './swarm.mjs';
+import { availableParallelism, totalmem } from 'node:os';
 
 const root=fileURLToPath(new URL('../../../',import.meta.url));
 const json=(path,value)=>writeFileSync(path,JSON.stringify(value,null,2)+'\n');
@@ -185,6 +188,7 @@ export async function main(args=process.argv.slice(2)) {
   // asked: a query for `--category e2e` needs Chromium and not the Python
   // virtualenvs, exactly as `--slice e2e` does.
   const light=slice==='l1'||profileName==='l1';
+  const workers=slice==='ut'?utWorkers(process.env.CI_UT_WORKERS):1;
   const categories=query.category??(light?['ut']:slice==='shared'?['ut','st','e2e']:[slice === 'e2e-real' ? 'e2e' : slice]);
   const needUT=!light&&categories.includes('ut'), needPW=categories.includes('e2e');
   env.CI_E2E_BACKEND=execution.backend;
@@ -248,10 +252,13 @@ export async function main(args=process.argv.slice(2)) {
     const evaluatorRevision=fileDigest(sources.map(p=>p+'\n'+fileDigest(readFileSync(join(root,p)))).join('\n'));
     plan=subplan({...plan,evaluatorRevision},plan.entries);
   }
+  let selectedShard;
+  if (slice === 'e2e') mockedShards(plan); // Reject unclassified cases even in a serial local run.
   if(shard){
-    if(slice!=='e2e-real')throw new Error('--shard is only valid with --slice e2e-real');
-    const selected=realShards(plan).find(s=>s.name===shard);
-    if(!selected)throw new Error(`Unknown real shard: ${shard}`);
+    if(!['e2e','e2e-real'].includes(slice))throw new Error('--shard requires --slice e2e or e2e-real');
+    const selected=(slice==='e2e' ? mockedShards(plan) : realShards(plan)).find(s=>s.name===shard);
+    if(!selected)throw new Error(`Unknown ${slice} shard: ${shard}`);
+    selectedShard=selected;
     plan=subplan(plan,plan.entries.filter(e=>selected.keys.includes(e.key)));
   }
   json(join(outputDir,'catalog.json'),catalog);json(join(outputDir,'plan.json'),plan);
@@ -271,29 +278,67 @@ export async function main(args=process.argv.slice(2)) {
   // Instrumentation reaches execution only: collection above, and the command
   // checks below, run exactly as they do without `--coverage`.
   const recording=coverage?coverageSetup(outputDir,coverageDir):null;
-  // What this run owes the artifact: one lcov per Node test file it executed.
+  // What this run owes the artifact: one lcov per Node worker process it ran,
+  // which is two for a file whose `swarm:required` tests run apart from the rest.
   const owed={node:0};
   if(checked.ok){
-    const groups=new Map();
-    for(const e of plan.entries.filter(e=>['node','python'].includes(e.runner))){
-      const group=e.runner==='python'?e.source.split('/').slice(0,2).join('/'):e.source;
-      const entries=groups.get(group)??[];entries.push(e);groups.set(group,entries);
+    const groups=planGroups(plan.entries);
+    let peakWorkers=0;
+    const timings=[],controller=new AbortController();
+    const abort=()=>controller.abort();
+    const aborted=new Promise((_,reject)=>controller.signal.addEventListener('abort',()=>reject(new Error('UT scheduling aborted')),{once:true}));
+    aborted.catch(()=>{});
+    process.once('SIGINT',abort);process.once('SIGTERM',abort);
+    console.log(`Worker pool: ${workers}; available CPUs: ${availableParallelism()}; host memory GiB: ${(totalmem()/2**30).toFixed(1)}`);
+    // JiuwenSwarm starts only for a plan that holds a test declaring it, and
+    // beside the other groups rather than ahead of them: only a declaring
+    // group waits for it. Every other group runs without its variables.
+    const declaring=groups.filter(group=>group.resource===SWARM);
+    const swarmLog=join(outputDir,'swarm.log');
+    const swarm=declaring.length?startSwarm({root,env,log:swarmLog}):null;
+    const swarmTiming=swarm&&{tests:declaring.reduce((n,group)=>n+group.entries.length,0),groups:declaring.length,readyMs:null,exitCode:null};
+    if(swarm){
+      const requested=Date.now();
+      swarm.ready.then(()=>{swarmTiming.readyMs=Date.now()-requested;},()=>{});
+      console.log(`JiuwenSwarm: ${swarmTiming.tests} test(s) declare ${SWARM_TAG}; starting one instance for them (log: ${swarmLog})`);
     }
-    let index=0;
-    for(const [group,entries] of groups){
-      const project=entries[0].runner==='python'?group.split('/')[1]:null;
-      const parts=group.split('/');const cwd=['packages','services','apps'].includes(parts[0])?join(root,...parts.slice(0,2)):root;
-      const directory=join(outputDir,`group-${++index}`);
-      console.log(`Run ${index}/${groups.size}: ${group} (${entries.length})`);
+    const isolated=withoutSwarm(env);
+    const tasks=groups.map((group,index)=>({resource:group.resource,run:async()=>{
+      const {entries,source}=group;
+      const project=group.runner==='python'?source.split('/')[1]:null;
+      const parts=source.split('/');const cwd=['packages','services','apps'].includes(parts[0])?join(root,...parts.slice(0,2)):root;
+      const label=group.resource===SWARM?`${source} [${SWARM_TAG}]`:source;
+      const directory=join(outputDir,`group-${index+1}`);
+      const instance=group.resource===SWARM?await Promise.race([swarm.ready,aborted]):{};
+      const startedAt=new Date();
+      console.log(`Run ${index+1}/${groups.length}: ${label} (${entries.length})`);
       if(coverage&&!project)owed.node++;
-      const base=project?projectEnv(env,project):env;
-      const summary=await execute({root,cwd,plan:subplan(plan,entries),outputDir:directory,
-        python:project?python(project):undefined,pytestPlugins:project?pythonPlugins[project]??[]:[],coverageDir:!project&&coverage?join(coverageDir,'node'):undefined,
-        nodeImports:['tsx'],env:recording?recording.env(base):base,timeoutMs:600_000});
-      results.push(...summary.results);errors.push(...summary.problems);
+      const workerEnv={...isolated,...instance,SCIENCE_DISCOVERY_DATA_DIR:join(directory,'runtime'),SCIENCE_AGENT_DATA_DIR:join(directory,'runtime')};
+      const base=project?projectEnv(workerEnv,project):workerEnv;
+      try {
+        return await execute({root,cwd,plan:subplan(plan,entries),outputDir:directory,
+          python:project?python(project):undefined,pytestPlugins:project?pythonPlugins[project]??[]:[],coverageDir:!project&&coverage?join(coverageDir,'node'):undefined,coverageName:group.name,
+          nodeImports:['tsx'],env:recording?recording.env(base):base,timeoutMs:600_000,signal:controller.signal});
+      } finally {
+        const durationMs=Date.now()-startedAt.getTime();
+        timings.push({group:label,index:index+1,runner:group.runner,resource:group.resource,startedAt,durationMs});
+        console.log(`Done ${index+1}/${groups.length}: ${label} (${durationMs}ms)`);
+      }
+    }}));
+    let completed;
+    try {completed=await schedule(tasks,{workers,signal:controller.signal,onChange:active=>{peakWorkers=Math.max(peakWorkers,active);}});}
+    finally {
+      process.removeListener('SIGINT',abort);process.removeListener('SIGTERM',abort);
+      if(swarm)swarmTiming.exitCode=await swarm.stop();
     }
-    for(const entry of plan.entries.filter(e=>e.runner==='command')){
-      const [command,...argv]=entry.command;const code=await run(command,argv,env,join(outputDir,entry.id.replaceAll(':','-')+'.log'));
+    json(join(outputDir,'timing.json'),{workers,peakWorkers,availableCpus:availableParallelism(),hostMemoryBytes:totalmem(),swarm:swarmTiming,groups:timings.sort((a,b)=>a.index-b.index)});
+    for(const item of completed){
+      if(item.status==='fulfilled'){results.push(...item.value.results);errors.push(...item.value.problems);}
+      else errors.push(`GROUP_EXECUTION_FAILED: ${item.reason?.message??item.reason}`);
+    }
+    if(controller.signal.aborted)errors.push('EXECUTION_ABORTED');
+    for(const entry of plan.entries.filter(e=>e.runner==='command'&&!controller.signal.aborted)){
+      const [command,...argv]=entry.command;const code=await run(command,argv,isolated,join(outputDir,entry.id.replaceAll(':','-')+'.log'));
       results.push({key:entry.key,outcome:code?'FAIL':'PASS',actualTarget:entry.target});
     }
     const batches=new Map();
@@ -314,6 +359,7 @@ export async function main(args=process.argv.slice(2)) {
         CI_RESULTS_DIR:join(process.env.CI_RESULTS_DIR?resolve(process.env.CI_RESULTS_DIR):outputDir,key),
         CI_RUNTIME_DIR:resolve(root,process.env.CI_RUNTIME_DIR??join(outputDir,'e2e-runtime'),key),
         CI_E2E_FIXTURE:batch.fixture,JIUWENSWARM_INSTANCE:`sd-e2e-${key}`,
+        ...(slice==='e2e'&&shard?{CI_E2E_SWARM_CHECKS:selectedShard.checks.length?'run':'off'}:{}),
         SCIENCE_TAG_PLAN:batchPlan,SCIENCE_TAG_PW_REPORT:report,
         E2E_SCIENTIFIC_ENVS:'1'},join(outputDir,`e2e-${key}-driver.log`),root,{echo:true});
       if(code)errors.push(`PLAYWRIGHT_WORKER_FAILED: ${code}`);

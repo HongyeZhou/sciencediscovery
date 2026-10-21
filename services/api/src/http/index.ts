@@ -13,6 +13,7 @@
 // limitations under the License.
 
 import { randomUUID } from "node:crypto";
+import { handleExecutionReadiness } from "./execution-readiness.js";
 import { setTimeout as delay } from "node:timers/promises";
 import { filterEnabledMcpSources } from "@sciencediscovery/mcp-sources";
 import { handlePluginRequest } from "../plugins/http.js";
@@ -347,6 +348,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
   const {
     artifactManager,
     evolutionStore,
+    evolveAvailability,
     evolveCandidates,
     evolveOrchestrator,
     evolveRunTokens,
@@ -814,7 +816,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
           },
           runner: runner ?? { status: "unavailable" },
           service: "sciencediscovery-api",
-          status: runner ? "ok" : "degraded",
+          status: runner && runner.execution?.ready !== false ? "ok" : "degraded",
           workspace,
         });
         return;
@@ -839,7 +841,18 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         sendError(response, 401, "Unauthorized");
         return;
       }
+      if (url.pathname === "/api/evolve/status" && request.method === "GET") {
+        return sendJson(response, 200, await evolveAvailability.refresh());
+      }
+      if (url.pathname === "/api/evolve/init" && request.method === "POST") {
+        return sendJson(response, 200, await evolveAvailability.refresh(true));
+      }
+      if ((url.pathname.startsWith("/api/evolve/") || /^\/api\/sessions\/[^/]+\/idea-tree(?:\/|$)/.test(url.pathname))
+          && (await evolveAvailability.refresh()).state !== "ready") {
+        return sendError(response, 503, "Evolve is not initialized or unavailable. Select Init Evolve or check the configured service.");
+      }
 
+      if (await handleExecutionReadiness(request, response, url, store, runnerClient, remoteCompute, () => readJson(request))) return;
       if (request.method === "GET" && url.pathname === "/api/projects") {
         sendJson(response, 200, store.listProjects());
         return;
@@ -1672,6 +1685,15 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         sendJson(response, 200, { discarded: draftId });
         return;
       }
+      const codexConfigMatch = url.pathname.match(/^\/api\/subagents\/([^/]+)\/(?:codex-config|runtime-config)$/);
+      if (codexConfigMatch && request.method === "POST") {
+        const input = await readJson<{ inputId: string; apiKey: string; fallback?: boolean }>(request).catch(() => {
+          throw new ApiStatusError(400, "Invalid Codex configuration request");
+        });
+        store.configureCodex(codexConfigMatch[1]!, input.inputId, input.apiKey, input.fallback);
+        sendJson(response, 200, { configured: true });
+        return;
+      }
       if (request.method === "GET" && url.pathname === "/api/specialists") {
         sendJson(response, 200, store.listSpecialists());
         return;
@@ -1952,7 +1974,10 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         const modelId = decodeURIComponent(modelConnectivityMatch[1]!);
         const profile = store.getModel(modelId);
         if (!profile) return sendError(response, 404, "Model not found");
-        const tested = await modelConnectivityTests.run(modelId, () => testModelConnectivity({
+        const consent = await readJson<{ consent?: boolean; compatibility?: boolean }>(request);
+        if (consent.consent !== true) return sendError(response, 400, "Explicit consent is required: model checks may consume paid tokens");
+        const tested = await modelConnectivityTests.run(`${modelId}:${profile.updatedAt}:${consent.compatibility === true}`, () => testModelConnectivity({
+          compatibility: consent.compatibility === true,
           apiToken: store.getModelApiToken(modelId),
           profile,
           resolveProxy: () => resolveProxyForUrl(store.resolveProxy(profile.proxyPolicy), profile.baseUrl),
@@ -2099,7 +2124,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       }
       if (request.method === "POST" && url.pathname === "/api/projects") {
         const body = await readJson<CreateProjectRequest>(request);
-        const project = await store.createProject(body.name ?? "", body.settingsOverrides, body.remoteRunnerHostIds, body.runnerIds);
+        const project = await store.createProject(body.name ?? "", body.settingsOverrides, body.remoteRunnerHostIds, body.runnerIds, body.description);
         try {
           const firstSession = await store.createSession(
             project.id,
@@ -2258,7 +2283,8 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       if (stopSubagentMatch && request.method === "POST") {
         const sessionId = decodeURIComponent(stopSubagentMatch[1]!);
         const subagentId = decodeURIComponent(stopSubagentMatch[2]!);
-        if (!stopSessionSubagent(store, sessionId, subagentId)) sendError(response, 404, "Subagent not found in this Session");
+        if (!store.getSession(sessionId)) return sendError(response, 404, `Session not found: ${sessionId}`);
+        if (!stopSessionSubagent(store, sessionId, subagentId)) sendError(response, 404, `Subagent not found: ${subagentId}`);
         else sendJson(response, 200, { stopped: true, sessionId, subagentId });
         return;
       }
@@ -3381,7 +3407,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       const activityMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/agent-activity(?:\/(executions|transfers|timers)\/([^/]+)\/(logs|cancel))?$/);
       if (activityMatch) {
         const sessionId = decodeURIComponent(activityMatch[1]!);
-        if (!store.getSession(sessionId)) return sendError(response, 404, "Session not found");
+        if (!store.getSession(sessionId)) return sendError(response, 404, `Session not found: ${sessionId}`);
         const owners = [{ sessionId, agentId: "main" }, ...store.listSubagents(sessionId).map((child) => ({ sessionId, agentId: `subagent:${child.id}` }))];
         const executions = owners.flatMap((owner) => store.shellExecutions.list(owner));
         const transfers = owners.flatMap((owner) => store.transfers.list(owner));
@@ -3392,7 +3418,10 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         }
         const kind = activityMatch[2]; const id = decodeURIComponent(activityMatch[3] ?? ""); const operation = activityMatch[4];
         const item = (kind === "executions" ? executions : kind === "transfers" ? transfers : timers).find((entry) => entry.id === id);
-        if (!item) return sendError(response, 404, "Record not found in this Session");
+        if (!item) {
+          const noun = kind === "executions" ? "Execution" : kind === "transfers" ? "Transfer" : "Timer";
+          return sendError(response, 404, `${noun} not found: ${id}`);
+        }
         const owner = { sessionId, agentId: item.agentId };
         const runner = (runnerId: string) => {
           if (runnerId === "local") return runnerClient;
@@ -3416,8 +3445,9 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       const resumeChildMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/subagents\/([^/]+)\/resume$/);
       if (resumeChildMatch && request.method === "POST") {
         const sessionId = decodeURIComponent(resumeChildMatch[1]!); const subagentId = decodeURIComponent(resumeChildMatch[2]!);
+        if (!store.getSession(sessionId)) return sendError(response, 404, `Session not found: ${sessionId}`);
         store.assertSessionWritable(sessionId);
-        if (!store.listSubagents(sessionId).some((child) => child.id === subagentId)) return sendError(response, 404, "Subagent not found in this Session");
+        if (!store.listSubagents(sessionId).some((child) => child.id === subagentId)) return sendError(response, 404, `Subagent not found: ${subagentId}`);
         store.notifications.resumeAgent({ sessionId, agentId: `subagent:${subagentId}` });
         sendJson(response, 200, { resumed: true }); return;
       }
@@ -3593,6 +3623,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
           message,
         );
       }
+      else if (code === "EVOLVE_UNAVAILABLE") sendError(response, 503, message);
       else if (code === "ENOENT") sendError(response, 404, "File not found");
       else if (code === "PAYLOAD_TOO_LARGE" || code === "QUOTA_EXCEEDED") {
         sendError(response, 413, error instanceof Error ? error.message : "Payload too large");
@@ -3604,9 +3635,11 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       else if (code === "SKILL_LIBRARY_NOT_FOUND") sendError(response, 404, message);
       else if (code === "SKILL_LIBRARY_CONFLICT") sendError(response, 409, message);
       else if (code === "SKILL_LIBRARY_VALIDATION") sendError(response, 400, message);
-      else if (/^(Project|Session|Proxy server|Provider|Model) not found$/.test(message)) sendError(response, 404, message);
+      else if (/^(Project|Session|Proxy server|Provider|Model) not found(?:: .+)?$/.test(message)) sendError(response, 404, message);
+      else if (/^(Execution|Transfer|Timer|Subagent) not found: .+$/.test(message)) sendError(response, 404, message);
       else if (message === "Session is archived and read-only") sendError(response, 409, message);
       else if (message.startsWith("Proxy server is referenced by ")) sendError(response, 409, message);
+      else if (code === "SPECIALIST_RUNTIME_INVALID") sendError(response, 400, message);
       else if (isKnownClientInputError(error)) sendError(response, 400, message);
       else {
         apiLog.error("unclassified_request_error", {

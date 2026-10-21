@@ -66,6 +66,7 @@ export function knownConnectorIdSet(): ReadonlySet<string> {
 }
 
 export const RUNTIME_SETTINGS_FIELDS = [
+  "defaultApprovalMode",
   "plugins",
   "enabledConnectorIds",
   "enabledSkillLibraries",
@@ -167,6 +168,13 @@ export function normalizeRuntimeSettings(
   }
 
   const normalized: RuntimeSettingsOverrides = {};
+  if (hasOwn(value, "defaultApprovalMode")) {
+    if (value.defaultApprovalMode === "ask_for_dangerous" || value.defaultApprovalMode === "always_allow") {
+      normalized.defaultApprovalMode = value.defaultApprovalMode;
+    } else if (strict) {
+      throw new Error("defaultApprovalMode must be ask_for_dangerous or always_allow");
+    }
+  }
   if (hasOwn(value, "plugins")) {
     // Persist the validated namespaced object in the existing settings catalog.
     // Invalid persisted overrides fail closed, rather than enabling a disabled feature.
@@ -335,8 +343,9 @@ export function normalizeMemoryGraphSettings(value: unknown): MemoryGraphSetting
   return { enabled, backend, neo4jHttp, neo4jUser };
 }
 
-const WEB_FETCH_PROVIDERS = new Set<WebFetchProvider>(["jina", "tavily", "exa"]);
+const WEB_FETCH_PROVIDERS = new Set<WebFetchProvider>(["jina", "tavily", "exa", "deepseek"]);
 const WEB_SETTING_FIELDS = new Set([
+  "deepseekEnabled",
   "fetchCacheTtlSeconds",
   "fetchProvider",
   "freeSearchEngines",
@@ -352,6 +361,8 @@ export function normalizeWebSettings(value: unknown): WebSettings {
   const migrated = migrateLegacyWebSettings(value);
   const unknown = Object.keys(migrated).find((key) => !WEB_SETTING_FIELDS.has(key));
   if (unknown) throw new Error(`Unknown web setting: ${unknown}`);
+  const deepseekEnabled = migrated.deepseekEnabled ?? false;
+  if (typeof deepseekEnabled !== "boolean") throw new Error("deepseekEnabled must be a boolean");
   const fetchProvider = migrated.fetchProvider;
   const proxyPolicy = normalizeProxyPolicy(migrated.proxyPolicy ?? "inherit", "proxyPolicy");
   if (!WEB_FETCH_PROVIDERS.has(fetchProvider as WebFetchProvider)) {
@@ -384,6 +395,7 @@ export function normalizeWebSettings(value: unknown): WebSettings {
     }
   }
   return {
+    deepseekEnabled,
     fetchCacheTtlSeconds: migrated.fetchCacheTtlSeconds as number,
     fetchProvider: fetchProvider as WebFetchProvider,
     freeSearchEngines,

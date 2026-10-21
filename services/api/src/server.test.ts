@@ -116,6 +116,9 @@ import {
   type ServerConfig,
 } from "./server.js";
 import { offlineMcpTransport } from "./mcp/offline-transport.fixture.js";
+import { createJiuwenSwarmAgentFactory } from "./agent-run/jiuwenswarm-agent.js";
+import type { NativeAgentOptions } from "./native-agent/index.js";
+import { createPublicBiomedSources } from "@sciencediscovery/mcp-sources";
 import { SessionStore } from "./store.js";
 import type { McpCatalog, McpInvokeResponse } from "@sciencediscovery/schema";
 import type { McpTransportClient } from "@sciencediscovery/data-source";
@@ -124,8 +127,10 @@ const authorization = { authorization: "Bearer test-token" };
 const execFileAsync = promisify(execFile);
 
 /**
- * Agent turns run on JiuwenSwarm (behind a real adapter) when this suite is invoked under
- * scripts/with-jiuwenswarm.sh (which `pnpm ci:ut` wraps around the shared runner). Some assertions are true only
+ * Agent turns run on JiuwenSwarm (behind a real adapter) in the tests that declare `swarm:required`: the shared
+ * runner starts one instance for them and gives only their process SCIENCE_AGENT_EXECUTOR=jiuwenswarm, one test
+ * at a time; every other test here runs on the built-in loop. A test that starts a gateway turn declares it.
+ * Some assertions are true only
  * of one backend and are branched on this: JiuwenSwarm has one set of skills for every session
  * (Settings > Skills, not per-Project/Session selection),
  * and it runs behind extra process hops (Node API -> Python adapter -> JiuwenSwarm gateway), which
@@ -291,7 +296,7 @@ function testConfig(dataDir: string, runnerUrl = "http://127.0.0.1:1"): ServerCo
       maxWorkspaceBytes: 10_737_418_240,
     },
     memoryGraph: { url: "http://127.0.0.1:17674", internalToken: "test" },
-    evolve: { url: "http://127.0.0.1:4313", internalToken: "test" },
+    evolve: { url: "", internalToken: "" },
   };
 }
 
@@ -583,6 +588,10 @@ async function startScientificTestApi(
       });
       return;
     }
+    if (url.pathname === "/execution-capability") {
+      send(200, { instanceId: "test-runner", checkedAt: new Date().toISOString(), sandbox: "bubblewrap", dependencyAvailable: true, sandboxUsable: true, ready: true, reason: "ready" });
+      return;
+    }
     if (url.pathname === "/environment-setup") {
       const setup: ScientificEnvironmentSetup = {
         allowedChannels: ["conda-forge"],
@@ -682,6 +691,82 @@ async function startScientificTestApi(
 async function jsonRequest<T>(url: string, init?: RequestInit): Promise<{ body: T; response: Response }> {
   const response = await fetch(url, init);
   return { body: (await response.json()) as T, response };
+}
+
+// Metadata-only requests never start a specialist or contact a model provider.
+for (const kind of ["codex", "claude-code", "acp"] as const) {
+  test(`specialist runtime HTTP contract retains ${kind} metadata after an unrelated update`, async (context) => {
+    const root = resolve(process.cwd(), ".tmp", `api-specialist-runtime-${kind}-${randomUUID()}`);
+    await mkdir(root, { recursive: true });
+    const { origin } = await startTestApi(context, root);
+    const headers = { ...authorization, "content-type": "application/json" };
+    const runtime = {
+      kind,
+      model: "test-model",
+      execution: "sandbox",
+      fallback: false,
+      timeoutSeconds: 120,
+      reasoningEffort: "high",
+    };
+    const created = await jsonRequest<Specialist>(`${origin}/api/specialists`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ name: `${kind} contract`, description: "Original", instructions: "Test only", runtime }),
+    });
+    assert.equal(created.response.status, 201);
+    assert.deepEqual(created.body.runtime, runtime);
+
+    // PUT is the specialist API's partial-update route; omit runtime entirely.
+    const updated = await jsonRequest<Specialist>(`${origin}/api/specialists/${created.body.id}`, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({ description: "Updated description" }),
+    });
+    assert.equal(updated.response.status, 200);
+    assert.equal(updated.body.description, "Updated description");
+    assert.deepEqual(updated.body.runtime, runtime);
+
+    const listed = await jsonRequest<Specialist[]>(`${origin}/api/specialists`, { headers });
+    assert.equal(listed.response.status, 200);
+    assert.deepEqual(listed.body.find(({ id }) => id === created.body.id)?.runtime, runtime);
+  });
+}
+
+for (const method of ["POST", "PUT"] as const) {
+  for (const invalid of [
+    { name: "credential fields", runtime: { kind: "codex", apiKey: "synthetic-not-a-secret" }, error: /Unknown runtime option/ },
+    { name: "unsupported kinds", runtime: { kind: "unsupported-runtime" }, error: /Unsupported Specialist runtime/ },
+  ]) {
+    test(`specialist runtime HTTP contract rejects ${invalid.name} on ${method}`, async (context) => {
+      const root = resolve(process.cwd(), ".tmp", `api-specialist-runtime-invalid-${randomUUID()}`);
+      await mkdir(root, { recursive: true });
+      const { origin } = await startTestApi(context, root);
+      const headers = { ...authorization, "content-type": "application/json" };
+      const created = await jsonRequest<Specialist>(`${origin}/api/specialists`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ name: "Valid specialist", description: "Original", instructions: "Test only", runtime: { kind: "codex" } }),
+      });
+      assert.equal(created.response.status, 201);
+      const before = await jsonRequest<Specialist[]>(`${origin}/api/specialists`, { headers });
+      assert.equal(before.response.status, 200);
+
+      const rejected = await jsonRequest<ApiError>(
+        `${origin}/api/specialists${method === "PUT" ? `/${created.body.id}` : ""}`,
+        {
+          method,
+          headers,
+          body: JSON.stringify({ name: "Rejected specialist", description: "Must not persist", instructions: "Test only", runtime: invalid.runtime }),
+        },
+      );
+      assert.equal(rejected.response.status, 400);
+      // HTTP exposes the runtime validation message rather than its internal code.
+      assert.match(rejected.body.error, invalid.error);
+      const after = await jsonRequest<Specialist[]>(`${origin}/api/specialists`, { headers });
+      assert.equal(after.response.status, 200);
+      assert.deepEqual(after.body, before.body);
+    });
+  }
 }
 
 test("global Runner management routes remotely, requires authentication and never falls back locally", async (context) => {
@@ -1335,14 +1420,18 @@ async function startSubagentModel(
 
 async function startTextModel(context: TestContext, delayed = false): Promise<{
   baseUrl: string;
+  requested: Promise<void>;
   release: () => void;
 }> {
+  let signalRequested: () => void = () => undefined;
+  const requested = new Promise<void>((resolveRequested) => { signalRequested = resolveRequested; });
   let release: () => void = () => undefined;
   const gate = delayed ? new Promise<void>((resolveGate) => { release = resolveGate; }) : Promise.resolve();
   const modelServer = createHttpServer(async (request, response) => {
     for await (const _chunk of request) {
       // Consume the OpenAI-compatible request before streaming the fixture response.
     }
+    signalRequested();
     await gate;
     response.writeHead(200, { "content-type": "text/event-stream" });
     response.write(`data: ${JSON.stringify({
@@ -1362,9 +1451,14 @@ async function startTextModel(context: TestContext, delayed = false): Promise<{
     response.end("data: [DONE]\n\n");
   });
   await new Promise<void>((resolveListen) => modelServer.listen(0, "127.0.0.1", resolveListen));
-  context.after(() => new Promise<void>((resolveClose) => modelServer.close(() => resolveClose())));
+  context.after(() => new Promise<void>((resolveClose) => {
+    release();
+    modelServer.close(() => resolveClose());
+    modelServer.closeAllConnections();
+  }));
   return {
     baseUrl: `http://127.0.0.1:${(modelServer.address() as AddressInfo).port}/v1`,
+    requested,
     release,
   };
 }
@@ -1660,7 +1754,7 @@ test("loadServerConfig validates gateway timeout bounds", () => {
   );
 });
 
-test("creating a Project opens an implicit Session and refines its first-message title", async (context) => {
+test("creating a Project opens an implicit Session and refines its first-message title", { tags: ["swarm:required"] }, async (context) => {
   const tempRoot = resolve(process.cwd(), ".tmp", `session-auto-name-${Date.now()}-${process.pid}`);
   await mkdir(tempRoot, { recursive: true });
   context.after(() => removeTestRoot(tempRoot));
@@ -1731,7 +1825,7 @@ test("creating a Project opens an implicit Session and refines its first-message
   assert.equal(namingModel.namingRequests.length, 1);
 });
 
-test("every later unnamed Session independently reuses first-message automatic naming", async (context) => {
+test("every later unnamed Session independently reuses first-message automatic naming", { tags: ["swarm:required"] }, async (context) => {
   const tempRoot = resolve(process.cwd(), ".tmp", `later-session-auto-name-${Date.now()}-${process.pid}`);
   await mkdir(tempRoot, { recursive: true });
   context.after(() => removeTestRoot(tempRoot));
@@ -1807,7 +1901,7 @@ test("every later unnamed Session independently reuses first-message automatic n
   assert.equal(namingModel.namingRequests.length, firstMessages.length);
 });
 
-test("Session title refinement completes while the first task is still running", async (context) => {
+test("Session title refinement completes while the first task is still running", { tags: ["swarm:required"] }, async (context) => {
   const tempRoot = resolve(process.cwd(), ".tmp", `session-auto-name-concurrent-${Date.now()}-${process.pid}`);
   await mkdir(tempRoot, { recursive: true });
   context.after(() => removeTestRoot(tempRoot));
@@ -1860,7 +1954,7 @@ test("Session title refinement completes while the first task is still running",
   assert.match(await run.text(), /"status":"completed"/);
 });
 
-test("Session title refinement persists when the naming model finishes after the run stream closes", async (context) => {
+test("Session title refinement persists when the naming model finishes after the run stream closes", { tags: ["swarm:required"] }, async (context) => {
   const tempRoot = resolve(process.cwd(), ".tmp", `session-auto-name-after-terminal-${Date.now()}-${process.pid}`);
   await mkdir(tempRoot, { recursive: true });
   context.after(() => removeTestRoot(tempRoot));
@@ -1931,7 +2025,7 @@ test("Session title refinement persists when the naming model finishes after the
   assert.ok(refinedEvent.sequence > terminalEvent.sequence);
 });
 
-test("concurrent first messages keep every run and auto-name only once from queue order one", async (context) => {
+test("concurrent first messages keep every run and auto-name only once from queue order one", { tags: ["swarm:required"] }, async (context) => {
   const tempRoot = resolve(process.cwd(), ".tmp", `session-first-message-concurrency-${Date.now()}-${process.pid}`);
   await mkdir(tempRoot, { recursive: true });
   context.after(() => removeTestRoot(tempRoot));
@@ -1993,7 +2087,7 @@ test("concurrent first messages keep every run and auto-name only once from queu
   assert.equal(namingModel.namingRequests.length, 1);
 });
 
-test("an asynchronous title refinement never overwrites a manual rename", async (context) => {
+test("an asynchronous title refinement never overwrites a manual rename", { tags: ["swarm:required"] }, async (context) => {
   const tempRoot = resolve(process.cwd(), ".tmp", `session-auto-name-manual-${Date.now()}-${process.pid}`);
   await mkdir(tempRoot, { recursive: true });
   context.after(() => removeTestRoot(tempRoot));
@@ -2045,7 +2139,7 @@ test("an asynchronous title refinement never overwrites a manual rename", async 
   assert.equal(namingModel.namingRequests.length, 1);
 });
 
-test("a second message never triggers another naming request", async (context) => {
+test("a second message never triggers another naming request", { tags: ["swarm:required"] }, async (context) => {
   const tempRoot = resolve(process.cwd(), ".tmp", `session-auto-name-dedupe-${Date.now()}-${process.pid}`);
   await mkdir(tempRoot, { recursive: true });
   context.after(() => removeTestRoot(tempRoot));
@@ -2092,7 +2186,7 @@ test("a second message never triggers another naming request", async (context) =
   assert.equal(namingModel.namingRequests.length, 1);
 });
 
-test("an explicitly named Session is never auto-renamed", async (context) => {
+test("an explicitly named Session is never auto-renamed", { tags: ["swarm:required"] }, async (context) => {
   const tempRoot = resolve(process.cwd(), ".tmp", `session-explicit-name-${Date.now()}-${process.pid}`);
   await mkdir(tempRoot, { recursive: true });
   context.after(() => removeTestRoot(tempRoot));
@@ -2244,7 +2338,7 @@ test("runtime-status Kernel teardown is authenticated and proxied to the Runner"
   });
 });
 
-test("timeout settings drive live runs, runtime status, and persistent explainable timeout messages", async (context) => {
+test("timeout settings drive live runs, runtime status, and persistent explainable timeout messages", { tags: ["swarm:required"] }, async (context) => {
   const tempRoot = resolve(process.cwd(), ".tmp", `timeout-runtime-status-${Date.now()}-${process.pid}`);
   await mkdir(tempRoot, { recursive: true });
   context.after(() => removeTestRoot(tempRoot));
@@ -2317,6 +2411,7 @@ test("timeout settings drive live runs, runtime status, and persistent explainab
           : "print('A paper title says: Python execution timed out after 25 ms')";
         send({ choices: [{ delta: { tool_calls: [{ index: 0, id: `call-${gatewayMode}`, type: "function", function: { name: "run_shell", arguments: JSON.stringify({ command: pythonCommand(code), wait_ms: gatewayMode === "tool-timeout" ? 25 : 10000 }) } }] } }] });
       }
+      send({ choices: [{ delta: {}, finish_reason: !notification && lastRole !== "tool" && !body.messages.some(message => message.role === "tool") ? "tool_calls" : "stop" }] });
       response.write("data: [DONE]\n\n");
       response.end();
     });
@@ -2532,7 +2627,7 @@ test("timeout settings drive live runs, runtime status, and persistent explainab
   assert.deepEqual(afterCancellation.body.sessions, []);
 });
 
-test("native MCP literature flow produces an audited cited summary", async (context) => {
+test("native MCP literature flow produces an audited cited summary", { tags: ["swarm:required"] }, async (context) => {
   const tempRoot = resolve(process.cwd(), ".tmp", `literature-review-${Date.now()}-${process.pid}`);
   await mkdir(tempRoot, { recursive: true });
   context.after(() => removeTestRoot(tempRoot));
@@ -2767,7 +2862,7 @@ test("native MCP literature flow produces an audited cited summary", async (cont
   assert.match(systemPrompt, /never invent a paper or identifier/i);
 });
 
-test("workbench search and Composer references use authenticated authoritative identities", async (context) => {
+test("workbench search and Composer references use authenticated authoritative identities", { tags: ["swarm:required"] }, async (context) => {
   const tempRoot = resolve(process.cwd(), ".tmp", `workbench-search-${Date.now()}-${process.pid}`);
   await mkdir(tempRoot, { recursive: true });
   context.after(() => removeTestRoot(tempRoot));
@@ -2860,7 +2955,7 @@ test("workbench search and Composer references use authenticated authoritative i
   assert.match(await invalid.text(), /Referenced Project artifact is unavailable/);
 });
 
-test("running sessions accept queued runs and start them after the active run completes", async (context) => {
+test("running sessions accept queued runs and start them after the active run completes", { tags: ["swarm:required"] }, async (context) => {
   const tempRoot = resolve(process.cwd(), ".tmp", `queued-runs-${Date.now()}-${process.pid}`);
   await mkdir(tempRoot, { recursive: true });
   context.after(() => removeTestRoot(tempRoot));
@@ -2916,7 +3011,7 @@ test("running sessions accept queued runs and start them after the active run co
   ]);
 });
 
-test("completed runs persist the assistant message identity used by hydrated timeline deduplication", async (context) => {
+test("completed runs persist the assistant message identity used by hydrated timeline deduplication", { tags: ["swarm:required"] }, async (context) => {
   const tempRoot = resolve(process.cwd(), ".tmp", `completed-run-message-${Date.now()}-${process.pid}`);
   await mkdir(tempRoot, { recursive: true });
   context.after(() => removeTestRoot(tempRoot));
@@ -3218,7 +3313,7 @@ test("the built-in Runner answers setup queries before its scientific environmen
   assert.deepEqual(mirrored.body.map((item) => item.id), ["starter-python"]);
 });
 
-test("an active run keeps its effective settings snapshot while later runs use updates", async (context) => {
+test("an active run keeps its effective settings snapshot while later runs use updates", { timeout: 60_000, tags: ["swarm:required"] }, async (context) => {
   const tempRoot = resolve(process.cwd(), ".tmp", `settings-snapshot-${Date.now()}-${process.pid}`);
   await mkdir(tempRoot, { recursive: true });
   context.after(() => removeTestRoot(tempRoot));
@@ -3266,6 +3361,10 @@ test("an active run keeps its effective settings snapshot while later runs use u
     if (done) throw new Error(`run ended before reporting a running status:\n${firstStream}`);
     firstStream += firstDecoder.decode(value, { stream: true });
   }
+  // `running` includes asynchronous preparation (Runner health, skills, etc.).
+  // Wait for the model request to prove revision one is already in use before
+  // editing it; otherwise this test races context construction, not snapshots.
+  await delayedModel.requested;
   const archiveDuringRun = await fetch(`${origin}/api/sessions/${session.body.id}/archive`, {
     headers: authorization,
     method: "POST",
@@ -3558,7 +3657,7 @@ test("skill lifecycle APIs author, import, edit, select, audit impact, and delet
   assert.ok(diff.body.lines.some((line) => line.kind === "added" && line.text === "Corrected value with units."));
 });
 
-test("Agent-created Skill stays in draft until review publishes it to a Skill Library", async (context) => {
+test("Agent-created Skill stays in draft until review publishes it to a Skill Library", { tags: ["swarm:required"] }, async (context) => {
   const tempRoot = resolve(process.cwd(), ".tmp", `agent-skill-creator-${Date.now()}-${process.pid}`);
   await mkdir(tempRoot, { recursive: true });
   context.after(() => removeTestRoot(tempRoot));
@@ -3739,7 +3838,7 @@ test("PDF upload extracts full text and tables into the session workspace", asyn
   assert.doesNotMatch(await readFile(resolve(tempRoot, "catalog.sqlite"), "utf8"), /ephemeral-vision-token/);
 });
 
-test("legacy Reviewer does not inject findings or block the main agent", async (context) => {
+test("legacy Reviewer does not inject findings or block the main agent", { tags: ["swarm:required"] }, async (context) => {
   const tempRoot = resolve(process.cwd(), ".tmp", `review-loop-${Date.now()}-${process.pid}`);
   await mkdir(tempRoot, { recursive: true });
   context.after(() => removeTestRoot(tempRoot));
@@ -3783,7 +3882,7 @@ test("legacy Reviewer does not inject findings or block the main agent", async (
   assert.equal((await fetch(`${origin}/api/sessions/${session.body.id}/reviews`, { headers: authorization })).status, 404);
 });
 
-test("API runs a configured OpenAI-compatible model through the gateway and Python", async (context) => {
+test("API runs a configured OpenAI-compatible model through the gateway and Python", { tags: ["swarm:required"] }, async (context) => {
   const tempRoot = resolve(process.cwd(), ".tmp", `api-${Date.now()}-${process.pid}`);
   await mkdir(tempRoot, { recursive: true });
   context.after(() => removeTestRoot(tempRoot));
@@ -4267,7 +4366,7 @@ test("API runs one observable subagent through task and keeps nested task denied
   assert.doesNotMatch(taskResultContent, /"steps"|"prompt"/);
 });
 
-test("task timeout_seconds is a hard wall-clock budget while a subagent waits on its model", async (context) => {
+test("task timeout_seconds is a hard wall-clock budget while a subagent waits on its model", { tags: ["swarm:required"] }, async (context) => {
   const tempRoot = resolve(process.cwd(), ".tmp", `api-subagent-wall-clock-${Date.now()}-${process.pid}`);
   await mkdir(tempRoot, { recursive: true });
   context.after(() => removeTestRoot(tempRoot));
@@ -5180,7 +5279,7 @@ async function startTwoPythonCallModel(
   };
 }
 
-test("switching to always-allow during a run stops asking for the tool calls that follow", async (context) => {
+test("switching to always-allow during a run stops asking for the tool calls that follow", { tags: ["swarm:required"] }, async (context) => {
   const tempRoot = resolve(process.cwd(), ".tmp", `api-toggle-to-always-allow-${Date.now()}-${process.pid}`);
   await mkdir(tempRoot, { recursive: true });
   context.after(() => removeTestRoot(tempRoot));
@@ -5321,7 +5420,7 @@ test("switching to always-allow during a run stops asking for the tool calls tha
   );
 });
 
-test("switching to ask during a run stops the tool calls that follow for approval", async (context) => {
+test("switching to ask during a run stops the tool calls that follow for approval", { tags: ["swarm:required"] }, async (context) => {
   const tempRoot = resolve(process.cwd(), ".tmp", `api-toggle-to-ask-${Date.now()}-${process.pid}`);
   await mkdir(tempRoot, { recursive: true });
   context.after(() => removeTestRoot(tempRoot));
@@ -6327,8 +6426,11 @@ test("model connectivity endpoint uses the encrypted saved credential", async (c
   });
   assert.equal(created.response.status, 201);
   assert.equal((await fetch(`${origin}/api/models/${created.body.id}/test`, { method: "POST" })).status, 401);
+  assert.equal((await fetch(`${origin}/api/models/${created.body.id}/test`, { method: "POST", headers: authorization, body: "{}" })).status, 400);
+  assert.equal(providerAuthorization, "");
   const tested = await jsonRequest<ModelConnectivityTestResult>(`${origin}/api/models/${created.body.id}/test`, {
     headers: authorization,
+    body: JSON.stringify({ consent: true }),
     method: "POST",
   });
   assert.equal(tested.response.status, 200);
@@ -7803,4 +7905,267 @@ test("WPC-005 a reachable sidecar whose graph is down returns 502, not 404", asy
   const response = await fetch(`${origin}/api/sessions/${sessionId}/web-pages/wp-anything/content`, { headers: authorization });
   assert.equal(response.status, 502);
   assert.match((await response.json() as { error?: string }).error ?? "", /memory graph unreachable/);
+});
+
+test("deep checkpoint forwards selected MCP readiness without duplicating main notices", async (context) => {
+  const tempRoot = resolve(process.cwd(), ".tmp", `reviewer-mcp-${Date.now()}-${process.pid}`);
+  await mkdir(tempRoot, {recursive: true});
+  context.after(() => removeTestRoot(tempRoot));
+  const pubmed = createPublicBiomedSources(["pubmed"])[0]!;
+  const catalog: McpCatalog = {revision: "reviewer", loadedAt: "now", servers: [{id: "biomed", enabled: true, transport: "stdio",
+    tools: Object.values(pubmed.manifest.tools).map(tool => ({name: tool.mcpToolName!, inputSchema: tool.inputSchema, description: tool.description, schemaHash: "fixture"})),
+  }]};
+  let sourceCalls = 0;
+  const transport: McpTransportClient = {catalog: async () => catalog, reload: async () => catalog, invoke: async () => {
+    sourceCalls++;
+    return {requestId: "search", serverId: "biomed", toolName: "pubmed_search", isError: false, attempts: [], durationMs: 1,
+      content: [{type: "json", value: {sourceId: "pubmed", toolId: "search", retrievedAt: "now", untrusted: true, attribution: "NLM", license: "NCBI", warnings: [],
+        records: [{identifier: "12524540", citations: [], primaryCitation: {source: "pubmed", identifier: "12524540", url: "https://pubmed.ncbi.nlm.nih.gov/12524540/"}, title: "Fixture study", url: "https://pubmed.ncbi.nlm.nih.gov/12524540/", abstract: "Observed result", source: "pubmed", warnings: []}],
+      }}]} as unknown as McpInvokeResponse;
+  }};
+  const {origin} = await startTestApi(context, tempRoot, transport);
+  const model = await createTestModel(origin);
+  const project = await jsonRequest<CreateProjectResponse>(`${origin}/api/projects`, {headers: authorization, method: "POST", body: JSON.stringify({name: "Review MCP"})});
+  const session = await jsonRequest<Session>(`${origin}/api/projects/${project.body.id}/sessions`, {headers: authorization, method: "POST",
+    body: JSON.stringify({title: "Review", modelId: model.id, settingsOverrides: {enabledConnectorIds: ["arxiv", "pubmed"]}, approvalMode: "always_allow"})});
+  await jsonRequest(`${origin}/api/reviewer-specialist/settings`, {headers: authorization, method: "PUT", body: JSON.stringify({enabled: true})});
+  await jsonRequest(`${origin}/api/sessions/${session.body.id}/reviewer-specialist/settings`, {headers: authorization, method: "PUT", body: JSON.stringify({automaticReviewEnabled: false, level: "deep"})});
+  const form = new FormData();
+  form.append("files", new Blob(["Observed result [1].\n[1] Fixture study. PMID: 12524540"], {type: "text/markdown"}), "report.md");
+  const upload = await fetch(`${origin}/api/sessions/${session.body.id}/workspace/upload`, {headers: authorization, method: "POST", body: form});
+  assert.equal(upload.status, 201);
+  const artifacts = await jsonRequest<ScientificArtifact[]>(`${origin}/api/sessions/${session.body.id}/artifacts`, {headers: authorization});
+  const versions = await jsonRequest<ScientificArtifactVersion[]>(`${origin}/api/sessions/${session.body.id}/artifacts/${artifacts.body[0]!.id}/versions`, {headers: authorization});
+  const versionId = versions.body[0]!.id;
+  const previousExecutor = process.env.SCIENCE_AGENT_EXECUTOR, previousAdapter = process.env.SCIENCE_AGENT_ADAPTER_URL;
+  process.env.SCIENCE_AGENT_EXECUTOR = "jiuwenswarm";
+  process.env.SCIENCE_AGENT_ADAPTER_URL = "http://unused.test";
+  context.after(() => {
+    if (previousExecutor === undefined) delete process.env.SCIENCE_AGENT_EXECUTOR; else process.env.SCIENCE_AGENT_EXECUTOR = previousExecutor;
+    if (previousAdapter === undefined) delete process.env.SCIENCE_AGENT_ADAPTER_URL; else process.env.SCIENCE_AGENT_ADAPTER_URL = previousAdapter;
+  });
+  // Replace only model execution at the existing AgentHandle boundary; run setup,
+  // checkpoint construction, catalog, broker and semantic review stay production.
+  const prototype = Object.getPrototypeOf(createJiuwenSwarmAgentFactory({adapterUrl: "http://unused.test"})({} as NativeAgentOptions));
+  let checkpoints = 0;
+  const deepOptions: NativeAgentOptions[] = [];
+  context.mock.method(prototype, "execute", async function(this: {options: NativeAgentOptions}) {
+    const options = this.options;
+    assert.ok(options.mcpReadiness, "the real run setup must forward unhealthy selection diagnostics");
+    assert.match(options.mcpReadiness.summary, /arxiv.*degraded/);
+    const decision = await options.mcpReadiness.decide("continue", "PubMed is sufficient for this review", []);
+    assert.match(JSON.stringify(decision), /arxiv.*search/);
+    if (options.contextScope === "reviewer") {
+      deepOptions.push(options);
+      return {finalMessages: [{role: "assistant", content: JSON.stringify({citation: {status: "INCONCLUSIVE", findings: [], assessment: "INCONCLUSIVE", locatorIds: [], rationale: "Fixture"}})}]};
+    }
+    assert.ok(options.mcpTools?.some(tool => tool.sourceId === "pubmed"));
+    for (let i = 0; i < 2; i++) {
+      await options.reviewCheckpoint!({artifactVersionIds: [versionId], reason: "Validate evidence"}, undefined, `checkpoint-${i}`);
+      checkpoints++;
+    }
+    return {finalMessages: [{role: "assistant", content: "Reviewed"}]};
+  });
+  const response = await fetch(`${origin}/api/sessions/${session.body.id}/messages`, {headers: authorization, method: "POST", body: JSON.stringify({content: "Ask Reviewer Specialist to review the report"})});
+  const stream = await response.text();
+  assert.equal(response.status, 200);
+  assert.equal(checkpoints, 2, stream);
+  assert.ok(deepOptions.length > 0, "checkpoint must enter the real semantic Reviewer composition");
+  for (const options of deepOptions) {
+    assert.ok(options.mcpReadiness);
+    assert.match(options.mcpReadiness.summary, /arxiv.*degraded/);
+    assert.deepEqual(options.toolPolicy?.allowed, [], "Deep reviewer remains read-only despite receiving readiness metadata");
+  }
+  assert.ok(sourceCalls > 0, "Reviewer uses the healthy selected source through the broker");
+  assert.equal((stream.match(/"type":"mcp.readiness"/g) ?? []).length, 1, "repeated checkpoints do not duplicate main diagnostics");
+});
+
+
+test("approval defaults API covers implicit first Sessions and explicit Session overrides", async (context) => {
+  const root = resolve(process.cwd(), ".tmp", `approval-defaults-api-${Date.now()}-${process.pid}`);
+  await mkdir(root, { recursive: true });
+  context.after(() => removeTestRoot(root));
+  const { origin } = await startTestApi(context, root);
+  const model = await createTestModel(origin, { model: "approval-fixture", name: "Approval fixture" });
+  const request = <T>(path: string, body: unknown, method = "PUT") => jsonRequest<T>(origin + path, {
+    method, headers: { ...authorization, "content-type": "application/json" }, body: JSON.stringify(body),
+  });
+  const global = await request<RuntimeSettingsDetails>("/api/settings", { modelId: model.id, defaultApprovalMode: "always_allow" });
+  assert.equal(global.response.status, 200);
+  const project = await request<CreateProjectResponse>("/api/projects", { name: "Inherits global" }, "POST");
+  assert.equal(project.response.status, 201);
+  assert.equal(project.body.firstSession.approvalMode, "always_allow");
+  const projectId = project.body.project.id;
+  const updated = await request<RuntimeSettingsDetails>(`/api/projects/${projectId}/settings`, { defaultApprovalMode: "ask_for_dangerous" });
+  assert.equal(updated.response.status, 200);
+  const inherited = await request<Session>(`/api/projects/${projectId}/sessions`, {title:"Project default"}, "POST");
+  assert.equal(inherited.response.status, 201);
+  assert.equal(inherited.body.approvalMode, "ask_for_dangerous");
+  const explicit = await request<Session>(`/api/projects/${projectId}/sessions`, {title:"Explicit override", approvalMode:"always_allow"}, "POST");
+  assert.equal(explicit.body.approvalMode, "always_allow");
+  await request(`/api/sessions/${explicit.body.id}`, {approvalMode:"ask_for_dangerous"}, "PATCH");
+  const current = await jsonRequest<RuntimeSettingsDetails>(`${origin}/api/projects/${projectId}/settings`, {headers:authorization});
+  assert.equal(current.body.overrides.defaultApprovalMode, "ask_for_dangerous");
+  const first = await jsonRequest<Session>(`${origin}/api/sessions/${project.body.firstSession.id}`, {headers:authorization});
+  assert.equal(first.body.approvalMode, "always_allow");
+  const invalid = await request("/api/settings", {defaultApprovalMode:"invalid"});
+  assert.equal(invalid.response.status, 400);
+  const invalidSessionDefault = await request(`/api/sessions/${explicit.body.id}`, {defaultApprovalMode:"always_allow"}, "PATCH");
+  assert.equal(invalidSessionDefault.response.status, 400);
+  const sessionSettings = await jsonRequest<RuntimeSettingsDetails>(`${origin}/api/sessions/${explicit.body.id}/settings`, {headers:authorization});
+  assert.equal(sessionSettings.body.overrides.defaultApprovalMode, undefined);
+  const stillEditable = await request(`/api/sessions/${explicit.body.id}`, {title:"Still editable"}, "PATCH");
+  assert.equal(stillEditable.response.status, 200);
+});
+
+test("Session-only approval defaults are HTTP client errors without mutations", async (context) => {
+  const root = resolve(process.cwd(), ".tmp", `approval-scope-http-${Date.now()}-${process.pid}`);
+  await mkdir(root, { recursive: true });
+  context.after(() => removeTestRoot(root));
+  const { origin } = await startTestApi(context, root);
+  const request = <T>(path: string, body: unknown, method = "PUT") => jsonRequest<T>(origin + path, {
+    method, headers: { ...authorization, "content-type": "application/json" }, body: JSON.stringify(body),
+  });
+  const project = await request<CreateProjectResponse>("/api/projects", { name: "Approval scope fixture" }, "POST");
+  const projectId = project.body.project.id;
+  const sessionId = project.body.firstSession.id;
+  const before = await jsonRequest<RuntimeSettingsDetails>(`${origin}/api/sessions/${sessionId}/settings`, {headers:authorization});
+  const invalidPut = await request(`/api/sessions/${sessionId}/settings`, {defaultApprovalMode:"always_allow"});
+  const invalidPost = await request(`/api/projects/${projectId}/sessions`, {title:"Denied creation", settingsOverrides:{defaultApprovalMode:"always_allow"}}, "POST");
+  console.log("Approval-scope HTTP probe", JSON.stringify({put:{status:invalidPut.response.status, body:invalidPut.body}, post:{status:invalidPost.response.status, body:invalidPost.body}}));
+  assert.deepEqual([invalidPut.response.status, invalidPost.response.status], [400, 400]);
+  for (const result of [invalidPut, invalidPost]) {
+    assert.match((result.body as {error:string}).error, /only supported at Global and Project scope/);
+  }
+  const after = await jsonRequest<RuntimeSettingsDetails>(`${origin}/api/sessions/${sessionId}/settings`, {headers:authorization});
+  assert.deepEqual(after.body.overrides, before.body.overrides);
+  const sessions = await jsonRequest<Session[]>(`${origin}/api/projects/${projectId}/sessions`, {headers:authorization});
+  assert.deepEqual(sessions.body.map(session => session.id), [sessionId]);
+  const validPut = await request<RuntimeSettingsDetails>(`/api/sessions/${sessionId}/settings`, {semanticReviewEnabled:false});
+  assert.equal(validPut.response.status, 200);
+  assert.equal(validPut.body.overrides.semanticReviewEnabled, false);
+  const validPost = await request<Session>(`/api/projects/${projectId}/sessions`, {title:"Valid creation"}, "POST");
+  assert.equal(validPost.response.status, 201);
+  assert.equal(validPost.body.approvalMode, "ask_for_dangerous");
+  assert.equal(validPost.body.settingsOverrides.defaultApprovalMode, undefined);
+
+});
+
+test("CLI auto-created first Session honors explicit Ask despite global Always allow", async (context) => {
+  const root = resolve(process.cwd(), ".tmp", `cli-approval-intent-${Date.now()}-${process.pid}`);
+  await mkdir(root, {recursive:true});
+  context.after(() => removeTestRoot(root));
+  const { origin } = await startTestApi(context, root);
+  const { parseInvocation } = await import("@sciencediscovery/launcher/cli-options");
+  const { runCommand } = await import("@sciencediscovery/launcher/run");
+  const global = await jsonRequest<RuntimeSettingsDetails>(`${origin}/api/settings`, {
+    method:"PUT", headers:{...authorization,"content-type":"application/json"}, body:JSON.stringify({defaultApprovalMode:"always_allow"}),
+  });
+  assert.equal(global.response.status, 200);
+  const invocation = parseInvocation(["run", "--port", new URL(origin).port, "--host", "127.0.0.1", "--data-dir", root, "--token", "test-token", "--output", "text", "Synthetic CLI boundary probe"], {}, root);
+  const printed: string[] = [];
+  const requests: Array<{method:string; path:string; body?:unknown}> = [];
+  const originalFetch = globalThis.fetch;
+  const trackedFetch = context.mock.method(globalThis, "fetch", async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+    const target = new URL(String(input));
+    if (target.origin === origin) requests.push({method:init?.method ?? "GET", path:target.pathname, ...(typeof init?.body === "string" ? {body:JSON.parse(init.body)} : {})});
+    return originalFetch(input, init);
+  });
+  const originalTty = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+  Object.defineProperty(process.stdout, "isTTY", {value:true, configurable:true});
+  try {
+    // Actual Run creation/streaming fails at the missing-model boundary, before any paid/model/tool call.
+    const result = await runCommand({settings:invocation.settings, runSettings:invocation.runSettings!, baseEnv:{}}, line => printed.push(line));
+    assert.equal(result.exitCode, 1);
+  } finally {
+    trackedFetch.mock.restore();
+    if (originalTty) Object.defineProperty(process.stdout, "isTTY", originalTty);
+    else delete (process.stdout as {isTTY?:boolean}).isTTY;
+  }
+  const projects = await jsonRequest<Project[]>(`${origin}/api/projects`, {headers:authorization});
+  assert.equal(projects.body.length, 1);
+  const sessions = await jsonRequest<Session[]>(`${origin}/api/projects/${projects.body[0]!.id}/sessions`, {headers:authorization});
+  assert.equal(sessions.body.length, 1);
+  console.log("CLI actual HTTP/store probe", JSON.stringify({tty:true, global:global.body.overrides.defaultApprovalMode, printed, requests, storedMode:sessions.body[0]!.approvalMode, expectedMode:"ask_for_dangerous", stoppedAt:"unconfigured-model Run failure"}));
+  assert.equal(sessions.body[0]!.approvalMode, "ask_for_dangerous");
+  assert.match(printed.join("\n"), /approval=ask_for_dangerous interactive=true/);
+});
+
+test("CLI approval flags, explicit Projects and existing Sessions preserve intentional modes", async (context) => {
+  const root = resolve(process.cwd(), ".tmp", `cli-approval-cases-${Date.now()}-${process.pid}`);
+  await mkdir(root, {recursive:true});
+  context.after(() => removeTestRoot(root));
+  const { origin } = await startTestApi(context, root);
+  const { parseInvocation } = await import("@sciencediscovery/launcher/cli-options");
+  const { runCommand } = await import("@sciencediscovery/launcher/run");
+  const request = <T>(path:string, body:unknown, method = "PUT") => jsonRequest<T>(origin+path, {method, headers:{...authorization,"content-type":"application/json"}, body:JSON.stringify(body)});
+  await request("/api/settings", {defaultApprovalMode:"always_allow"});
+  const fixture = await request<CreateProjectResponse>("/api/projects", {name:"Existing CLI target"}, "POST");
+  const projectId = fixture.body.project.id;
+  const sessionId = fixture.body.firstSession.id;
+  const cases: Array<{name:string; flags:string[]; tty:boolean; output:"text"|"jsonl"; expected:"always_allow"|"ask_for_dangerous"|"refused"; input?:string; summary?:"preserve_session"}> = [
+    {name:"auto-approve new Project", flags:["--auto-approve"], tty:false, output:"jsonl", expected:"always_allow"},
+    {name:"explicit Always allow new Project", flags:["--approval","always_allow"], tty:true, output:"text", expected:"always_allow"},
+    {name:"explicit Ask new Project", flags:["--approval","ask_for_dangerous"], tty:true, output:"text", expected:"ask_for_dangerous"},
+    {name:"JSON explicit mode", flags:[], input:JSON.stringify({content:"Synthetic input mode",approvalMode:"always_allow"}), tty:false, output:"jsonl", expected:"always_allow"},
+    {name:"explicit Project creates Ask", flags:["--project",projectId], tty:true, output:"text", expected:"ask_for_dangerous"},
+    {name:"existing Session no flag", flags:["--session",sessionId], tty:true, output:"text", expected:"always_allow", summary:"preserve_session"},
+    {name:"JSON existing Session no flag", flags:[], input:JSON.stringify({content:"Synthetic existing input",sessionId}), tty:true, output:"jsonl", expected:"always_allow", summary:"preserve_session"},
+    {name:"existing Session explicit Ask", flags:["--session",sessionId,"--approval","ask_for_dangerous"], tty:true, output:"text", expected:"ask_for_dangerous"},
+    {name:"existing Session explicit auto-approve", flags:["--session",sessionId,"--auto-approve"], tty:false, output:"jsonl", expected:"always_allow"},
+    {name:"noninteractive refusal", flags:[], tty:false, output:"jsonl", expected:"refused"},
+  ];
+  for (const scenario of cases) {
+    const invocation = parseInvocation(["run","--host","127.0.0.1","--port",new URL(origin).port,"--data-dir",root,"--token","test-token","--output",scenario.output,"--content",scenario.input ?? "Synthetic CLI case",...scenario.flags], {}, root);
+    const printed: string[] = [];
+    const requests: Array<{method:string; path:string; body?:Record<string,unknown>}> = [];
+    const originalFetch = globalThis.fetch;
+    const tracked = context.mock.method(globalThis, "fetch", async (input: Parameters<typeof fetch>[0], init?:RequestInit) => {
+      const target = new URL(String(input));
+      if (target.origin === origin) requests.push({method:init?.method ?? "GET",path:target.pathname,...(typeof init?.body === "string" ? {body:JSON.parse(init.body)} : {})});
+      return originalFetch(input, init);
+    });
+    const originalTty = Object.getOwnPropertyDescriptor(process.stdout,"isTTY");
+    const originalWrite = process.stdout.write;
+    Object.defineProperty(process.stdout,"isTTY",{value:scenario.tty,configurable:true});
+    if (scenario.output === "jsonl") process.stdout.write = ((chunk:string|Uint8Array) => { printed.push(String(chunk)); return true; }) as typeof process.stdout.write;
+    try {
+      const result = await runCommand({settings:invocation.settings, runSettings:invocation.runSettings!, baseEnv:{}}, line => printed.push(line));
+      assert.equal(result.exitCode,1, scenario.name+": synthetic Run stops at the missing-model boundary");
+    } finally {
+      tracked.mock.restore();
+      process.stdout.write = originalWrite;
+      if (originalTty) Object.defineProperty(process.stdout,"isTTY",originalTty);
+      else delete (process.stdout as {isTTY?:boolean}).isTTY;
+    }
+    if (scenario.expected === "refused") {
+      assert.deepEqual(requests, [], "guard must refuse before contacting HTTP or creating data");
+      assert.match(printed.join(""), /NON_INTERACTIVE_NO_AUTO_APPROVE/);
+      continue;
+    }
+    const runRequest = requests.find(row => row.method === "POST" && /^\/api\/sessions\/[^/]+\/runs$/.test(row.path));
+    assert.ok(runRequest, scenario.name+": actual Run request reached HTTP");
+    const targetId = runRequest.path.split("/")[3]!;
+    const saved = await jsonRequest<Session>(`${origin}/api/sessions/${targetId}`,{headers:authorization});
+    assert.equal(saved.body.approvalMode,scenario.expected,scenario.name);
+    const summary = scenario.summary ?? scenario.expected;
+    if (scenario.output === "jsonl") {
+      const meta = printed.flatMap(line => line.split("\n")).filter(Boolean).map(line => JSON.parse(line)).find(row => row.type === "meta");
+      assert.equal(meta.approvalMode,summary,scenario.name+": JSON metadata matches approval intent");
+    } else assert.match(printed.join("\n"),new RegExp(`approval=${summary} interactive=${scenario.expected !== "always_allow" || scenario.summary === "preserve_session"}`),scenario.name);
+    if (scenario.summary === "preserve_session") {
+      assert.ok(!requests.some(row => row.method === "PATCH"),scenario.name+": no implicit policy reset");
+    } else if (scenario.flags.includes("--project")) {
+      const created = requests.find(row => row.method === "POST" && row.path.endsWith("/sessions"));
+      assert.equal(created?.body?.approvalMode,scenario.expected,"explicit Project creation sends the CLI mode");
+    } else {
+      const patched = requests.find(row => row.method === "PATCH");
+      assert.deepEqual(patched?.body,{approvalMode:scenario.expected},scenario.name+": separate intentional mode PATCH before Run");
+    }
+    console.log("CLI real HTTP matrix", JSON.stringify({scenario:scenario.name,tty:scenario.tty,storedMode:saved.body.approvalMode,reportedIntent:summary}));
+  }
+  const global = await jsonRequest<RuntimeSettingsDetails>(`${origin}/api/settings`,{headers:authorization});
+  const project = await jsonRequest<RuntimeSettingsDetails>(`${origin}/api/projects/${projectId}/settings`,{headers:authorization});
+  assert.equal(global.body.overrides.defaultApprovalMode,"always_allow");
+  assert.equal(project.body.overrides.defaultApprovalMode,undefined);
 });

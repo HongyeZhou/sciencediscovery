@@ -166,12 +166,15 @@ wait_healthy() { # <name> <url>
   # here does not just skip one sidecar: the failure trips `set -e` and cleanup
   # takes the whole stack down, so the caller only ever sees "never healthy".
   local attempts="$health_attempts"
-  if [[ -n "${SCIENCE_DISCOVERY_HEALTH_TIMEOUT_SECONDS:-}" ]]; then
+  if [[ "${SCIENCE_DISCOVERY_HEALTH_TIMEOUT_SECONDS:-}" =~ [^[:space:]] ]]; then
     attempts=$((SCIENCE_DISCOVERY_HEALTH_TIMEOUT_SECONDS * 5))
   fi
   local attempt
   for ((attempt = 1; attempt <= attempts; attempt++)); do
-    if curl --silent --fail "$2" >/dev/null 2>&1; then return 0; fi
+    # curl does not interpret NO_PROXY=127.* as a loopback wildcard. Keep
+    # existing exclusions for remote runners and explicitly bypass local probes.
+    if curl --noproxy "${no_proxy:-${NO_PROXY:-}},localhost,localhost.,127.0.0.1,::1" \
+      --silent --fail "$2" >/dev/null 2>&1; then return 0; fi
     sleep 0.2
   done
   echo "$1 did not become healthy at $2 after $((attempts / 5))s." >&2
@@ -213,7 +216,7 @@ report_dependency_problems() {
       echo
     done
     echo "  Requirements table: README.md#requirements"
-    echo "  Local source mode:  docs/en/how-to/deployment.md#local-mode-host-processes"
+    echo "  Local source mode:  docs/en/getting-started/deployment.md#local-source-mode-linux--macos"
   } >&2
   exit 1
 }
@@ -331,34 +334,14 @@ prepare_local() {
       *) echo "Native sandbox execution is unsupported on $(uname -s)." >&2; exit 1 ;;
     esac
   fi
+  # Installation/build do not require a working execution sandbox, so neither
+  # bubblewrap nor sandbox-exec is a preflight dependency here. The Runner
+  # probes in its own process, prints how to install a missing executable, and
+  # exposes the same text in its capability report.
   case "$sandbox_provider" in
-    bubblewrap)
-      # The package is called bubblewrap; the executable it installs is bwrap.
-      # Naming only one of the two sends people searching for the wrong thing.
-      require_command "${SCIENCE_AGENT_BWRAP_PATH:-bwrap}" \
-        "bubblewrap is required for isolated Linux execution, but its 'bwrap' executable is not on PATH." \
-        "Install the bubblewrap package — the binary it provides is named bwrap:" \
-        "  Debian / Ubuntu   sudo apt-get install -y bubblewrap" \
-        "  Fedora / RHEL     sudo dnf install -y bubblewrap" \
-        "  openEuler         sudo dnf install -y bubblewrap" \
-        "  Arch              sudo pacman -S bubblewrap" \
-        "  Alpine            sudo apk add bubblewrap" \
-        "Already installed elsewhere? Point SCIENCE_AGENT_BWRAP_PATH at it."
-      ;;
-    seatbelt)
-      if [[ "$(uname -s)" != "Darwin" ]]; then
-        echo "Seatbelt sandbox is available only on macOS." >&2
-        exit 1
-      fi
-      require_command "${SCIENCE_AGENT_SEATBELT_PATH:-/usr/bin/sandbox-exec}" \
-        "macOS Seatbelt is required for isolated execution, but sandbox-exec was not found." \
-        "sandbox-exec ships with macOS, so this usually means the current terminal or a" \
-        "parent sandbox is blocking it rather than something to install." \
-        "See docs/en/how-to/deployment.md#local-mode-host-processes"
-      ;;
+    bubblewrap|seatbelt) ;;
     *) echo "SCIENCE_AGENT_SANDBOX_PROVIDER must be auto, bubblewrap, or seatbelt." >&2; exit 1 ;;
   esac
-
   report_dependency_problems
 
   data_dir="$(absolute_from_repository "${SCIENCE_DISCOVERY_DATA_DIR:-.sciencediscovery-data}")"
@@ -620,7 +603,10 @@ start_stack() {
   echo "Starting the sandbox runner daemon..." >&2
   "${runner_command[@]}" &
   pids+=("$!")
-  wait_healthy "runner" "$runner_url/health"
+  local runner_pid="$!"
+  if ! wait_healthy "runner" "$runner_url/health"; then
+    echo "WARNING: local compute is unavailable; the workbench will remain accessible. Configure a remote Runner or repair local execution." >&2
+  fi
 
   # Start the memory-graph sidecar when the feature is available. An explicit
   # SCIENCE_AGENT_MEMORY_GRAPH_AVAILABLE=0 keeps isolated test stacks from
@@ -646,13 +632,26 @@ start_stack() {
   # never sees a model key: model calls go back through the API's loopback
   # proxy with a one-shot run token, and everything needed to replay or resume
   # a run lives in the API's data/evolution/runs/<runId>/events.ndjson.
-  if [[ -x "$evolve_python" ]]; then
+  if [[ -x "$evolve_python" && -z "${SCIENCE_AGENT_EVOLVE_URL:-}" ]]; then
     echo "Starting the evolve service..." >&2
-    SCIENCE_AGENT_DATA_DIR="$data_dir" \
-    SCIENCE_AGENT_EVOLVE_INTERNAL_TOKEN="${SCIENCE_AGENT_EVOLVE_INTERNAL_TOKEN:-sciencediscovery-evolve-local}" \
-    "$evolve_python" -m sciencediscovery_evolve.server &
-    pids+=("$!")
-    wait_healthy "evolve" "http://127.0.0.1:${SCIENCE_AGENT_EVOLVE_PORT:-4313}/health"
+    local evolve_state evolve_pid evolve_attempts=300
+    evolve_state="$(mktemp "$data_dir/.evolve-control.XXXXXX")"
+    node services/launcher/dist/source-evolve.js "$evolve_python" "$data_dir" "$evolve_state" &
+    evolve_pid="$!"
+    pids+=("$evolve_pid")
+    if [[ "${SCIENCE_DISCOVERY_HEALTH_TIMEOUT_SECONDS:-}" =~ [^[:space:]] ]]; then
+      evolve_attempts=$((SCIENCE_DISCOVERY_HEALTH_TIMEOUT_SECONDS * 5))
+    fi
+    for ((attempt=0; attempt<evolve_attempts; attempt++)); do
+      [[ -s "$evolve_state" ]] && break
+      kill -0 "$evolve_pid" 2>/dev/null || { echo "Evolve exited before readiness." >&2; return 1; }
+      sleep 0.2
+    done
+    [[ -s "$evolve_state" ]] || { echo "Evolve did not become ready." >&2; return 1; }
+    # Private control coordinates availability and credentials; no model token is sent to a guessed port.
+    SCIENCE_AGENT_EVOLVE_CONTROL_URL="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).SCIENCE_AGENT_EVOLVE_CONTROL_URL)' "$evolve_state")"
+    SCIENCE_AGENT_EVOLVE_CONTROL_TOKEN="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).SCIENCE_AGENT_EVOLVE_CONTROL_TOKEN)' "$evolve_state")"
+    export SCIENCE_AGENT_EVOLVE_CONTROL_URL SCIENCE_AGENT_EVOLVE_CONTROL_TOKEN
   fi
 
   if [[ "${SCIENCE_AGENT_EXECUTOR:-}" == "jiuwenswarm" ]]; then
@@ -715,7 +714,12 @@ start_stack() {
 
   # Any Docker process exiting means the single-container stack is broken.
   set +e
-  wait -n
+  # The optional local Runner exiting must not tear down the workbench.
+  local essential_pids=()
+  for pid in "${pids[@]}"; do
+    if [[ "$pid" != "$runner_pid" ]]; then essential_pids+=("$pid"); fi
+  done
+  wait -n "${essential_pids[@]}"
   local status=$?
   set -e
   echo "A ScienceDiscovery process exited with status $status; stopping the stack." >&2

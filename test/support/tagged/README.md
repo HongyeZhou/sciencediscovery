@@ -53,6 +53,7 @@ pytest phases cannot be collapsed into an apparently clean pass.
 | `judge` | `none`, `llm` | `none` | Whether the test uses an LLM assertion. |
 | `status` | `reviewed`, `external`, `quarantined`, `legacy`, `unreviewed` | `reviewed` | Only `reviewed` is in the shared PR suite. `external` needs a live third-party service, `quarantined` is a reviewed case temporarily excluded from scheduled gates while a failure is investigated, `legacy` is the unaudited quarantine, and `unreviewed` is not yet fit to run. |
 | `sandbox` | `none`, `bubblewrap`, `seatbelt` | `none` | The execution sandbox the test itself drives. A plan holding `sandbox:bubblewrap` fails preflight on a host where `bwrap` cannot start. |
+| `swarm` | `none`, `required` | `none` | Whether a Node or Python test needs a real JiuwenSwarm instance behind the adapter, declared on the test that starts a gateway turn. The shared runner starts one instance for the plan's `swarm:required` tests and runs them on it one at a time; no other test gets its variables. A browser journey or command check cannot declare it. |
 
 **A group with a default is declared only where a test deviates from it.** A
 declaration therefore names `category`, `os`, `arch`, and then whatever is
@@ -78,7 +79,9 @@ matrix — a repeated target does not produce a second instance.
 Backend is deliberately not a tag. `--backend jiuwenswarm|legacy` or
 `CI_E2E_BACKEND` selects execution without changing the cases. `legacy` is the
 native loop. A missing backend capability is a preflight failure, never a
-selection filter or implicit fallback.
+selection filter or implicit fallback. `swarm:required` is not a backend choice
+either: like `npu:required`, it names something the test needs, and the runner
+provides it rather than selecting on it.
 
 ## Node declarations
 
@@ -199,8 +202,9 @@ why each of the rest is outside it.
 Policies are cumulative rows in [profiles.mjs](profiles.mjs). `l1` through `l5`
 contain each preceding tier and may add new cases. The aliases `pr`, `merge`, `daily`
 and `release` mean L2, L3, L4 and L5. `pnpm test:policy` prints the exact rules.
-The default `pr` plan is credential-free. L3 adds seven simple real API cases;
-L4 adds all ten previously eligible nightly cases, for 17 real cases in total.
+The default `pr` plan is credential-free. L3 adds nine real API cases: seven
+basic journeys and two Runner-recovery journeys. L4 adds twelve nightly cases,
+including Biomni DA-13-3 and DA-14-1, for 21 real cases in total.
 L5 currently selects the same cases and evaluation modes as L4, retaining its
 separate extension row for future release-only coverage. Both record existing
 AI scores without a historical baseline gate. Existing
