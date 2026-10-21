@@ -559,6 +559,74 @@ test("governed download fails when the transfer ends shorter than the declared s
   );
 });
 
+test("a denied download is reported as terminal, leaves no artifact, and does not block a later download", async (context) => {
+  const bytes = Buffer.from("%PDF-1.4\nrecovered artifact\n");
+  const fixture = await setupDownloadFixture("deny-recover", [{
+    attribution: "NCBI",
+    checksum: { algorithm: "sha256", value: createHash("sha256").update(bytes).digest("hex") },
+    expectedBytes: bytes.length,
+    format: "pdf",
+    id: "candidate-deny-recover",
+    kind: "paper",
+    license: "public-domain",
+    logicalName: "record.pdf",
+    mimeType: "application/pdf",
+    sourceId: "pubmed",
+    sourceRecordId: "12524540",
+    sourceUrl: "https://eutils.ncbi.nlm.nih.gov/artifacts/record.pdf",
+  }], async () => new Response(bytes, {
+    headers: { "content-length": String(bytes.length), "content-type": "application/pdf" },
+    status: 200,
+  }));
+  context.after(() => rm(fixture.dataDir, { force: true, recursive: true }));
+
+  const destination = { path: "downloads/record.pdf", type: "workspace" } as const;
+  const first = await fixture.manager.prepare(fixture.session.id, {
+    candidateId: "candidate-deny-recover",
+    destination,
+    mcpInvocationId: fixture.invocationId,
+  });
+  const deniedRequest = first.permissionRequest;
+  if (!deniedRequest) throw new Error("Expected a permission request for the prepared download");
+  const deniedTerminal = fixture.manager.waitForPlanTerminal(fixture.session.id, first.plan.id);
+  await fixture.store.decidePermissionRequest(deniedRequest.id, "deny");
+  const denied = await deniedTerminal;
+
+  // The refusal reaches the caller as a terminal state, and no job or file was produced.
+  assert.equal(denied.status, "denied");
+  assert.equal(denied.job, undefined);
+  await assert.rejects(
+    readFile(resolve(fixture.store.workspacePath(fixture.session.id), "downloads/record.pdf")),
+    { code: "ENOENT" },
+  );
+
+  // A refusal is terminal for that request: re-preparing the identical download
+  // returns the same plan, which carries no pending permission request and no job.
+  const repeated = await fixture.manager.prepare(fixture.session.id, {
+    candidateId: "candidate-deny-recover",
+    destination,
+    mcpInvocationId: fixture.invocationId,
+  });
+  assert.equal(repeated.plan.id, first.plan.id);
+  assert.equal(repeated.permissionRequest, undefined);
+  assert.equal(repeated.job, undefined);
+
+  // The session is not poisoned: a download the operator does approve still completes.
+  const second = await fixture.manager.prepare(fixture.session.id, {
+    candidateId: "candidate-deny-recover",
+    destination: { path: "downloads/record-retry.pdf", type: "workspace" },
+    mcpInvocationId: fixture.invocationId,
+  });
+  const { job, terminal } = await approveAndAwait(fixture.store, fixture.session.id, fixture.manager, second);
+
+  assert.equal(terminal.status, "completed");
+  assert.equal(job.state, "completed");
+  assert.deepEqual(
+    await readFile(resolve(fixture.store.workspacePath(fixture.session.id), "downloads/record-retry.pdf")),
+    bytes,
+  );
+});
+
 test("an interrupted download resumes with a Range request and publishes the complete artifact", async (context) => {
   const full = Buffer.from("%PDF-1.4\nresumed artifact payload\n");
   const prefix = full.subarray(0, 12);
