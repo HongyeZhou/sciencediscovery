@@ -17,11 +17,25 @@ from __future__ import annotations
 import pytest
 pytestmark = pytest.mark.science_tags(category='ut', os='linux', arch=('amd64', 'arm64'))
 
+import httpx
 import unittest
 from unittest.mock import AsyncMock, patch
 from sciencediscovery_gateway import public_biomed_mcp as m
 
 PATCH = "sciencediscovery_gateway.public_biomed_mcp."
+
+
+def _transport_client(handler):
+    """Serve a real AsyncClient over a mock transport so status handling runs for real.
+
+    ``httpx.AsyncClient`` is what the patch replaces, so the real class is captured
+    here — before the patch is entered — instead of being looked up inside the closure.
+    """
+    real_client = httpx.AsyncClient
+
+    def make_client(**kwargs):
+        return real_client(transport=httpx.MockTransport(handler), **kwargs)
+    return make_client
 
 class DomainDatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def test_alphafold_keeps_versions_prediction_type_and_provider_file(self):
@@ -165,6 +179,110 @@ class DomainDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record['structuredData']['structureType'], 'experimental')
         self.assertEqual(record['primaryCitation']['sourceVersion'], '2026-01-01')
         self.assertEqual(result['artifacts'][0]['sourceRecordId'], '1CRN')
+
+    async def test_provider_rate_limit_is_visible_and_the_next_call_recovers(self):
+        attempts = []
+
+        def handler(request):
+            attempts.append(str(request.url))
+            if len(attempts) == 1:
+                return httpx.Response(429, headers={"retry-after": "2"}, request=request)
+            return httpx.Response(200, json={"struct": {"title": "CRAMBIN"}}, request=request)
+
+        with patch(PATCH + "httpx.AsyncClient", side_effect=_transport_client(handler)):
+            with self.assertRaises(RuntimeError) as caught:
+                await m.pdb_lookup_structure("1CRN")
+            recovered = await m.pdb_lookup_structure("1CRN")
+        message = str(caught.exception)
+        self.assertIn("429", message)
+        self.assertIn("retry-after: 2", message)
+        self.assertEqual(recovered["records"][0]["identifier"], "1CRN")
+        self.assertEqual(len(attempts), 2)
+
+    async def test_provider_timeout_surfaces_instead_of_an_empty_record(self):
+        def handler(request):
+            raise httpx.ConnectTimeout("timed out", request=request)
+
+        with patch(PATCH + "httpx.AsyncClient", side_effect=_transport_client(handler)):
+            with self.assertRaises(httpx.TimeoutException):
+                await m.pdb_lookup_structure("1CRN")
+            with self.assertRaises(httpx.TimeoutException):
+                await m.chembl_search_molecules("aspirin")
+
+    async def test_provider_server_error_is_not_reported_as_a_missing_record(self):
+        def handler(request):
+            return httpx.Response(503, request=request)
+
+        with patch(PATCH + "httpx.AsyncClient", side_effect=_transport_client(handler)):
+            with self.assertRaisesRegex(RuntimeError, "503"):
+                await m.pdb_lookup_structure("1CRN")
+
+    async def test_geo_multi_platform_matrix_requires_an_explicit_file_name(self):
+        async def listing(url, **kwargs):
+            if "/matrix/" in url:
+                return '<a href="GSE1000-GPL1_series_matrix.txt.gz">one</a><a href="GSE1000-GPL2_series_matrix.txt.gz">two</a>'
+            if "/soft/" in url:
+                raise RuntimeError("HTTP 404 Not Found from ftp.ncbi.nlm.nih.gov")
+            return '<a href="counts.tsv.gz">counts</a>'
+
+        with patch(PATCH + "_get_text", new=AsyncMock(side_effect=listing)):
+            with self.assertRaisesRegex(ValueError, "file_name"):
+                await m.geo_prepare_dataset_download("GSE1000", "series-matrix")
+            chosen = await m.geo_prepare_dataset_download("GSE1000", "series-matrix", "GSE1000-GPL2_series_matrix.txt.gz")
+        self.assertTrue(chosen["artifacts"][0]["sourceUrl"].endswith("GSE1000-GPL2_series_matrix.txt.gz"))
+        self.assertEqual(len(chosen["artifacts"]), 1)
+
+    async def test_geo_missing_directories_are_disclosed_instead_of_an_empty_success(self):
+        with patch(PATCH + "_get_text", new=AsyncMock(side_effect=RuntimeError("HTTP 404 Not Found from ftp.ncbi.nlm.nih.gov"))):
+            result = await m.geo_list_files("GSE1000")
+        self.assertEqual(result["data"]["files"], [])
+        self.assertEqual(len(result["warnings"]), 3)
+        self.assertTrue(all(warning.startswith("No ") for warning in result["warnings"]))
+        self.assertFalse(result["data"]["pagination"]["hasMore"])
+
+    async def test_geo_partial_directory_failure_is_not_a_missing_directory(self):
+        async def listing(url, **kwargs):
+            if "/matrix/" in url:
+                return '<a href="GSE1000_series_matrix.txt.gz">matrix</a>'
+            raise RuntimeError("HTTP 503 Service Unavailable from ftp.ncbi.nlm.nih.gov")
+
+        with patch(PATCH + "_get_text", new=AsyncMock(side_effect=listing)):
+            with self.assertRaisesRegex(RuntimeError, "503"):
+                await m.geo_list_files("GSE1000")
+
+    async def test_pagination_cap_is_disclosed_to_the_caller(self):
+        with self.assertRaisesRegex(ValueError, "between 1 and 25"):
+            await m.geo_list_files("GSE1000", limit=26)
+        with self.assertRaisesRegex(ValueError, "between 1 and 25"):
+            await m.geo_list_files("GSE1000", offset=-1)
+
+    async def test_chembl_fully_filtered_page_still_advances(self):
+        activities = [{"activity_id": 1, "assay_chembl_id": "CHEMBL1", "standard_value": "10"},
+                      {"activity_id": 2, "assay_chembl_id": "CHEMBL2", "standard_value": "20"}]
+        getter = AsyncMock(side_effect=[
+            {"activities": activities, "page_meta": {"total_count": 10}},
+            {"assays": [{"assay_chembl_id": "CHEMBL1", "confidence_score": 1},
+                        {"assay_chembl_id": "CHEMBL2", "confidence_score": 2}]},
+        ])
+        with patch(PATCH + "_get_json", new=getter):
+            result = await m.chembl_search_activities(target_chembl_id="CHEMBL203", confidence_score_min=9,
+                                                     offset=0, limit=2)
+        self.assertEqual(result["records"], [])
+        page = result["data"]["pagination"]
+        self.assertEqual((page["scanned"], page["returned"]), (2, 0))
+        self.assertEqual(page["nextOffset"], 2)
+        self.assertTrue(page["hasMore"])
+
+    async def test_chembl_activity_without_assay_metadata_is_not_silently_dropped(self):
+        getter = AsyncMock(side_effect=[
+            {"activities": [{"activity_id": 1, "assay_chembl_id": "CHEMBL1", "standard_value": "10"}],
+             "page_meta": {"total_count": 1}},
+            {"assays": []},
+        ])
+        with patch(PATCH + "_get_json", new=getter):
+            with self.assertRaisesRegex(ValueError, "metadata"):
+                await m.chembl_search_activities(target_chembl_id="CHEMBL203", confidence_score_min=9)
+
 
 if __name__ == '__main__':
     unittest.main()
