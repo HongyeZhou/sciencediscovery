@@ -2265,7 +2265,8 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       if (stopSubagentMatch && request.method === "POST") {
         const sessionId = decodeURIComponent(stopSubagentMatch[1]!);
         const subagentId = decodeURIComponent(stopSubagentMatch[2]!);
-        if (!stopSessionSubagent(store, sessionId, subagentId)) sendError(response, 404, "Subagent not found in this Session");
+        if (!store.getSession(sessionId)) return sendError(response, 404, `Session not found: ${sessionId}`);
+        if (!stopSessionSubagent(store, sessionId, subagentId)) sendError(response, 404, `Subagent not found: ${subagentId}`);
         else sendJson(response, 200, { stopped: true, sessionId, subagentId });
         return;
       }
@@ -3388,7 +3389,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       const activityMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/agent-activity(?:\/(executions|transfers|timers)\/([^/]+)\/(logs|cancel))?$/);
       if (activityMatch) {
         const sessionId = decodeURIComponent(activityMatch[1]!);
-        if (!store.getSession(sessionId)) return sendError(response, 404, "Session not found");
+        if (!store.getSession(sessionId)) return sendError(response, 404, `Session not found: ${sessionId}`);
         const owners = [{ sessionId, agentId: "main" }, ...store.listSubagents(sessionId).map((child) => ({ sessionId, agentId: `subagent:${child.id}` }))];
         const executions = owners.flatMap((owner) => store.shellExecutions.list(owner));
         const transfers = owners.flatMap((owner) => store.transfers.list(owner));
@@ -3399,7 +3400,10 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         }
         const kind = activityMatch[2]; const id = decodeURIComponent(activityMatch[3] ?? ""); const operation = activityMatch[4];
         const item = (kind === "executions" ? executions : kind === "transfers" ? transfers : timers).find((entry) => entry.id === id);
-        if (!item) return sendError(response, 404, "Record not found in this Session");
+        if (!item) {
+          const noun = kind === "executions" ? "Execution" : kind === "transfers" ? "Transfer" : "Timer";
+          return sendError(response, 404, `${noun} not found: ${id}`);
+        }
         const owner = { sessionId, agentId: item.agentId };
         const runner = (runnerId: string) => {
           if (runnerId === "local") return runnerClient;
@@ -3423,8 +3427,9 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       const resumeChildMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/subagents\/([^/]+)\/resume$/);
       if (resumeChildMatch && request.method === "POST") {
         const sessionId = decodeURIComponent(resumeChildMatch[1]!); const subagentId = decodeURIComponent(resumeChildMatch[2]!);
+        if (!store.getSession(sessionId)) return sendError(response, 404, `Session not found: ${sessionId}`);
         store.assertSessionWritable(sessionId);
-        if (!store.listSubagents(sessionId).some((child) => child.id === subagentId)) return sendError(response, 404, "Subagent not found in this Session");
+        if (!store.listSubagents(sessionId).some((child) => child.id === subagentId)) return sendError(response, 404, `Subagent not found: ${subagentId}`);
         store.notifications.resumeAgent({ sessionId, agentId: `subagent:${subagentId}` });
         sendJson(response, 200, { resumed: true }); return;
       }
@@ -3612,7 +3617,8 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       else if (code === "SKILL_LIBRARY_NOT_FOUND") sendError(response, 404, message);
       else if (code === "SKILL_LIBRARY_CONFLICT") sendError(response, 409, message);
       else if (code === "SKILL_LIBRARY_VALIDATION") sendError(response, 400, message);
-      else if (/^(Project|Session|Proxy server|Provider|Model) not found$/.test(message)) sendError(response, 404, message);
+      else if (/^(Project|Session|Proxy server|Provider|Model) not found(?:: .+)?$/.test(message)) sendError(response, 404, message);
+      else if (/^(Execution|Transfer|Timer|Subagent) not found: .+$/.test(message)) sendError(response, 404, message);
       else if (message === "Session is archived and read-only") sendError(response, 409, message);
       else if (message.startsWith("Proxy server is referenced by ")) sendError(response, 409, message);
       else if (code === "SPECIALIST_RUNTIME_INVALID") sendError(response, 400, message);

@@ -409,6 +409,13 @@ function savedWorkspaceFileRevision(value: unknown): WorkspaceFileRevision | und
   } as WorkspaceFileRevision;
 }
 
+/** Keep rows inserted on the live catalog while a cloned snapshot is restored. */
+function retainAddedById<T extends { id: string }>(restored: T[], live: T[]): T[] {
+  const ids = new Set(restored.map((item) => item.id));
+  const added = live.filter((item) => !ids.has(item.id));
+  return added.length ? [...restored, ...added] : restored;
+}
+
 export class SessionStoreHttpError extends Error {
   constructor(message: string, readonly statusCode: 400 | 404 | 409) {
     super(message);
@@ -1191,12 +1198,28 @@ export class SessionStore {
     this.loaded = false;
   }
 
-  private async saveCatalog(): Promise<void> {
-    this.saveQueue = this.saveQueue.then(() => {
-      if (!this.database) throw new Error("Catalog database is not initialized");
-      this.database.prepare("INSERT INTO catalog_state (id, json) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET json = excluded.json").run(JSON.stringify(this.catalog));
-    });
-    await this.saveQueue;
+  /**
+   * Persist the catalog. `mutate` runs in the same synchronous turn as the
+   * sqlite write, so a reader cannot observe a session that has been removed
+   * from memory but not committed. A failed write restores the pre-mutate
+   * catalog, including rows added while this save waited for the queue.
+   */
+  private async saveCatalog(mutate?: () => void): Promise<void> {
+    const apply = () => {
+      const previous = mutate ? structuredClone(this.catalog) : undefined;
+      try {
+        mutate?.();
+        if (!this.database) throw new Error("Catalog database is not initialized");
+        this.database.prepare("INSERT INTO catalog_state (id, json) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET json = excluded.json").run(JSON.stringify(this.catalog));
+      } catch (error) {
+        if (previous) this.catalog = previous;
+        throw error;
+      }
+    };
+    // A rejected save must not drop every later write. `run` still rejects for this caller.
+    const run = this.saveQueue.then(apply, apply);
+    this.saveQueue = run.then(() => undefined, () => undefined);
+    await run;
   }
 
   private async withSubagentMutation<T>(subagentId: string, mutation: () => Promise<T>): Promise<T> {
@@ -2265,7 +2288,14 @@ export class SessionStore {
         this.database.exec("COMMIT");
       } catch (error) {
         this.database.exec("ROLLBACK");
+        const live = this.catalog;
         this.catalog = previous;
+        // The clone predates anything inserted while the transaction ran.
+        // Put those rows back; the failed settings edit itself stays rolled back.
+        this.catalog.sessions = retainAddedById(previous.sessions, live.sessions);
+        this.catalog.subagents = retainAddedById(previous.subagents, live.subagents);
+        this.catalog.projects = retainAddedById(previous.projects, live.projects);
+        this.catalog.permissionEpochs = retainAddedById(previous.permissionEpochs, live.permissionEpochs);
         throw error;
       }
       this.pluginControl?.changed(projectId);
@@ -4237,37 +4267,26 @@ export class SessionStore {
     return this.withDeletionBoundary(() => this.knownSessionDataPaths(session), () => [session.id],
       [resolve(this.dataDir, "projects", session.projectId, "sessions", session.id)], async (operation) => {
     await this.stageDeletion(operation);
-    const previousSessions = this.catalog.sessions;
-    const previousPermissionEpochs = this.catalog.permissionEpochs;
-    const previousPermissionGrants = this.catalog.permissionGrants;
-    const previousPermissionRequests = this.catalog.permissionRequests;
-    const previousSubagents = this.catalog.subagents;
-    const previousRemoteJobs = this.catalog.remoteJobs;
-    const previousWorkspaceFileRecords = this.catalog.workspaceFileRecords;
-    const previousRemoteWorkspaceSyncs = this.catalog.remoteWorkspaceSyncs;
-    const remoteJobIds = new Set(this.catalog.remoteJobs.filter((job) => job.sessionId === session.id).map((job) => job.id));
     try {
-      this.catalog.sessions = this.catalog.sessions.filter((item) => item.id !== session.id);
-      this.catalog.permissionEpochs = this.catalog.permissionEpochs.filter((epoch) => epoch.sessionId !== session.id);
-      this.catalog.permissionRequests = this.catalog.permissionRequests.filter((request) => request.sessionId !== session.id);
-      this.catalog.permissionGrants = this.catalog.permissionGrants.filter((grant) => grant.sessionId !== session.id
-        && !(grant.action === "remote_job" && remoteJobIds.has(grant.resource)));
-      this.catalog.subagents = this.catalog.subagents.filter((subagent) => subagent.sessionId !== session.id);
-      this.catalog.remoteJobs = this.catalog.remoteJobs.filter((job) => job.sessionId !== session.id);
-      this.catalog.workspaceFileRecords = this.catalog.workspaceFileRecords.map((record) =>
-        record.sessionId === session.id ? { ...record, sessionTitle: session.title } : record);
-      this.catalog.remoteWorkspaceSyncs = this.catalog.remoteWorkspaceSyncs.filter((record) => record.sessionId !== session.id);
-      await this.saveCatalog();
+      // Unpublish only inside the catalog write. Until that callback runs, the
+      // open Session page can still read the session it is showing.
+      await this.saveCatalog(() => {
+        const current = this.getSession(session.id);
+        if (!current) throw new Error("Session not found");
+        const remoteJobIds = new Set(this.catalog.remoteJobs.filter((job) => job.sessionId === current.id).map((job) => job.id));
+        this.catalog.sessions = this.catalog.sessions.filter((item) => item.id !== current.id);
+        this.catalog.permissionEpochs = this.catalog.permissionEpochs.filter((epoch) => epoch.sessionId !== current.id);
+        this.catalog.permissionRequests = this.catalog.permissionRequests.filter((request) => request.sessionId !== current.id);
+        this.catalog.permissionGrants = this.catalog.permissionGrants.filter((grant) => grant.sessionId !== current.id
+          && !(grant.action === "remote_job" && remoteJobIds.has(grant.resource)));
+        this.catalog.subagents = this.catalog.subagents.filter((subagent) => subagent.sessionId !== current.id);
+        this.catalog.remoteJobs = this.catalog.remoteJobs.filter((job) => job.sessionId !== current.id);
+        this.catalog.workspaceFileRecords = this.catalog.workspaceFileRecords.map((record) =>
+          record.sessionId === current.id ? { ...record, sessionTitle: current.title } : record);
+        this.catalog.remoteWorkspaceSyncs = this.catalog.remoteWorkspaceSyncs.filter((record) => record.sessionId !== current.id);
+      });
       operation.committed = true;
     } catch (error) {
-      this.catalog.sessions = previousSessions;
-      this.catalog.permissionEpochs = previousPermissionEpochs;
-      this.catalog.permissionGrants = previousPermissionGrants;
-      this.catalog.permissionRequests = previousPermissionRequests;
-      this.catalog.subagents = previousSubagents;
-      this.catalog.remoteJobs = previousRemoteJobs;
-      this.catalog.workspaceFileRecords = previousWorkspaceFileRecords;
-      this.catalog.remoteWorkspaceSyncs = previousRemoteWorkspaceSyncs;
       await this.rollbackStagedDeletion(operation);
       throw error;
     }
@@ -4289,58 +4308,37 @@ export class SessionStore {
     }, () => sessions.map((session) => session.id),
       [resolve(this.dataDir, "projects", projectId)], async (operation) => {
     await this.stageDeletion(operation);
-    const sessionIds = new Set(sessions.map((session) => session.id));
-    const previousProjects = this.catalog.projects;
-    const previousSessions = this.catalog.sessions;
-    const previousPermissionEpochs = this.catalog.permissionEpochs;
-    const previousPermissionGrants = this.catalog.permissionGrants;
-    const previousPermissionRequests = this.catalog.permissionRequests;
-    const previousSubagents = this.catalog.subagents;
-    const previousRemoteJobs = this.catalog.remoteJobs;
-    const previousRemoteWorkspaceSyncs = this.catalog.remoteWorkspaceSyncs;
-    const previousArtifacts = this.catalog.artifacts;
-    const previousArtifactVersions = this.catalog.artifactVersions;
-    const previousArtifactAnnotations = this.catalog.artifactAnnotations;
-    const previousWorkspaceFileRecords = this.catalog.workspaceFileRecords;
-    const previousWorkspaceFileRevisions = this.catalog.workspaceFileRevisions;
-    const remoteJobIds = new Set(this.catalog.remoteJobs.filter((job) => sessionIds.has(job.sessionId)).map((job) => job.id));
-    const projectArtifactIds = new Set(this.catalog.artifacts.filter((artifact) => artifact.projectId === projectId).map((artifact) => artifact.id));
-    const projectArtifactVersionIds = new Set(this.catalog.artifactVersions
-      .filter((version) => projectArtifactIds.has(version.artifactId))
-      .map((version) => version.id));
     try {
-      this.catalog.projects = this.catalog.projects.filter((item) => item.id !== projectId);
-      this.catalog.sessions = this.catalog.sessions.filter((session) => !sessionIds.has(session.id));
-      this.catalog.permissionEpochs = this.catalog.permissionEpochs.filter((epoch) => !sessionIds.has(epoch.sessionId));
-      this.catalog.permissionRequests = this.catalog.permissionRequests.filter((request) => request.projectId !== projectId
-        && (!request.sessionId || !sessionIds.has(request.sessionId)));
-      this.catalog.permissionGrants = this.catalog.permissionGrants.filter((grant) => grant.projectId !== projectId
-        && (!grant.sessionId || !sessionIds.has(grant.sessionId))
-        && !(grant.action === "remote_job" && remoteJobIds.has(grant.resource)));
-      this.catalog.subagents = this.catalog.subagents.filter((subagent) => !sessionIds.has(subagent.sessionId));
-      this.catalog.remoteJobs = this.catalog.remoteJobs.filter((job) => !sessionIds.has(job.sessionId));
-      this.catalog.remoteWorkspaceSyncs = this.catalog.remoteWorkspaceSyncs.filter((record) => !sessionIds.has(record.sessionId));
-      this.catalog.artifacts = this.catalog.artifacts.filter((artifact) => artifact.projectId !== projectId);
-      this.catalog.artifactVersions = this.catalog.artifactVersions.filter((version) => !projectArtifactIds.has(version.artifactId));
-      this.catalog.artifactAnnotations = this.catalog.artifactAnnotations.filter((annotation) => !projectArtifactVersionIds.has(annotation.artifactVersionId));
-      this.catalog.workspaceFileRecords = this.catalog.workspaceFileRecords.filter((record) => record.projectId !== projectId);
-      this.catalog.workspaceFileRevisions = this.catalog.workspaceFileRevisions.filter((revision) => revision.projectId !== projectId);
-      await this.saveCatalog();
+      await this.saveCatalog(() => {
+        if (!this.getProject(projectId)) throw new Error("Project not found");
+        // Include a Session inserted while this delete waited: it belongs to
+        // the project that is about to disappear.
+        sessions = this.listSessions(projectId, "all");
+        const sessionIds = new Set(sessions.map((session) => session.id));
+        const remoteJobIds = new Set(this.catalog.remoteJobs.filter((job) => sessionIds.has(job.sessionId)).map((job) => job.id));
+        const projectArtifactIds = new Set(this.catalog.artifacts.filter((artifact) => artifact.projectId === projectId).map((artifact) => artifact.id));
+        const projectArtifactVersionIds = new Set(this.catalog.artifactVersions
+          .filter((version) => projectArtifactIds.has(version.artifactId))
+          .map((version) => version.id));
+        this.catalog.projects = this.catalog.projects.filter((item) => item.id !== projectId);
+        this.catalog.sessions = this.catalog.sessions.filter((session) => !sessionIds.has(session.id));
+        this.catalog.permissionEpochs = this.catalog.permissionEpochs.filter((epoch) => !sessionIds.has(epoch.sessionId));
+        this.catalog.permissionRequests = this.catalog.permissionRequests.filter((request) => request.projectId !== projectId
+          && (!request.sessionId || !sessionIds.has(request.sessionId)));
+        this.catalog.permissionGrants = this.catalog.permissionGrants.filter((grant) => grant.projectId !== projectId
+          && (!grant.sessionId || !sessionIds.has(grant.sessionId))
+          && !(grant.action === "remote_job" && remoteJobIds.has(grant.resource)));
+        this.catalog.subagents = this.catalog.subagents.filter((subagent) => !sessionIds.has(subagent.sessionId));
+        this.catalog.remoteJobs = this.catalog.remoteJobs.filter((job) => !sessionIds.has(job.sessionId));
+        this.catalog.remoteWorkspaceSyncs = this.catalog.remoteWorkspaceSyncs.filter((record) => !sessionIds.has(record.sessionId));
+        this.catalog.artifacts = this.catalog.artifacts.filter((artifact) => artifact.projectId !== projectId);
+        this.catalog.artifactVersions = this.catalog.artifactVersions.filter((version) => !projectArtifactIds.has(version.artifactId));
+        this.catalog.artifactAnnotations = this.catalog.artifactAnnotations.filter((annotation) => !projectArtifactVersionIds.has(annotation.artifactVersionId));
+        this.catalog.workspaceFileRecords = this.catalog.workspaceFileRecords.filter((record) => record.projectId !== projectId);
+        this.catalog.workspaceFileRevisions = this.catalog.workspaceFileRevisions.filter((revision) => revision.projectId !== projectId);
+      });
       operation.committed = true;
     } catch (error) {
-      this.catalog.projects = previousProjects;
-      this.catalog.sessions = previousSessions;
-      this.catalog.permissionEpochs = previousPermissionEpochs;
-      this.catalog.permissionGrants = previousPermissionGrants;
-      this.catalog.permissionRequests = previousPermissionRequests;
-      this.catalog.subagents = previousSubagents;
-      this.catalog.remoteJobs = previousRemoteJobs;
-      this.catalog.remoteWorkspaceSyncs = previousRemoteWorkspaceSyncs;
-      this.catalog.artifacts = previousArtifacts;
-      this.catalog.artifactVersions = previousArtifactVersions;
-      this.catalog.artifactAnnotations = previousArtifactAnnotations;
-      this.catalog.workspaceFileRecords = previousWorkspaceFileRecords;
-      this.catalog.workspaceFileRevisions = previousWorkspaceFileRevisions;
       await this.rollbackStagedDeletion(operation);
       throw error;
     }

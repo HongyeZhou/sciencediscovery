@@ -439,12 +439,11 @@ async function readUntilTerminal(response: Response): Promise<string[]> {
  * Give the hung gateway turn time to actually be in flight before stopping it.
  *
  * The built-in loop's in-process model call is what the 400-attempt (10s) default budget was sized
- * for. Under a real JiuwenSwarm + adapter (SCIENCE_AGENT_EXECUTOR=jiuwenswarm, scripts/with-jiuwenswarm.sh)
- * a single turn's round trip was measured at 5.0-5.4s in isolation, but CI's `ut:host` workload runs
- * `pnpm --recursive test` for the whole workspace against that one shared instance and adapter
- * (scripts/with-jiuwenswarm.sh's own doc comment: "a test runner's parallel files share them"), so real
- * runs contend for it — a 10s-bound wait was observed to miss by ~460ms under that load. 2400 attempts
- * (60s) gives real headroom without weakening what the assertion checks.
+ * for. Under a real JiuwenSwarm + adapter (a test declaring `swarm:required`, which alone gets
+ * SCIENCE_AGENT_EXECUTOR=jiuwenswarm) a single turn's round trip was measured at 5.0-5.4s in isolation, and
+ * a 10s-bound wait was observed to miss by ~460ms when the whole workspace once shared that instance. The
+ * declaring tests now take it one at a time, but the host is still busy with every other test file;
+ * 2400 attempts (60s) gives real headroom without weakening what the assertion checks.
  */
 async function waitForGatewayTurn(api: TestApi, expected: number): Promise<void> {
   const attempts = onJiuwenSwarm ? 2_400 : 400;
@@ -465,7 +464,7 @@ async function waitForRunStatus(api: TestApi, sessionId: string, runId: string, 
   return current!;
 }
 
-test("cancelling a queued run does not start it or append it to Session context", async (context) => {
+test("cancelling a queued run does not start it or append it to Session context", { tags: ["swarm:required"] }, async (context) => {
   const api = await startApi(context, "queued-cancel");
   const sessionId = await createSession(api, "Queued cancellation");
 
@@ -497,7 +496,7 @@ test("cancelling a queued run does not start it or append it to Session context"
   }
 });
 
-test("a blocked run holds its Session queue until the user decides permission", async (context) => {
+test("a blocked run holds its Session queue until the user decides permission", { tags: ["swarm:required"] }, async (context) => {
   const api = await startApi(context, "blocked-queue", startBlockingPermissionGateway);
   const sessionId = await createSession(api, "Blocked queue", { approvalMode: "ask_for_dangerous" });
 
@@ -527,7 +526,7 @@ test("a blocked run holds its Session queue until the user decides permission", 
   }
 });
 
-test("GET session usage reports gateway token usage for a completed run", async (context) => {
+test("GET session usage reports gateway token usage for a completed run", { tags: ["swarm:required"] }, async (context) => {
   const api = await startApi(context, "usage-http", startUsageGateway);
   const sessionId = await createSession(api, "Usage HTTP");
 
@@ -543,7 +542,7 @@ test("GET session usage reports gateway token usage for a completed run", async 
   assert.equal(usage.totals.unreportedInvocationCount, 0);
 });
 
-test("cancelling a blocked run preserves reported model usage", async (context) => {
+test("cancelling a blocked run preserves reported model usage", { tags: ["swarm:required"] }, async (context) => {
   const api = await startApi(context, "blocked-cancel-usage", startBlockingPermissionUsageGateway);
   const sessionId = await createSession(api, "Blocked cancel usage", { approvalMode: "ask_for_dangerous" });
 
@@ -572,7 +571,7 @@ test("cancelling a blocked run preserves reported model usage", async (context) 
   }
 });
 
-test("stopping a stuck run ends the stream as cancelled and frees the Session", async (context) => {
+test("stopping a stuck run ends the stream as cancelled and frees the Session", { tags: ["swarm:required"] }, async (context) => {
   const api = await startApi(context, "run-cancel");
   const sessionId = await createSession(api, "Stuck session");
 
@@ -611,7 +610,7 @@ test("stopping a stuck run ends the stream as cancelled and frees the Session", 
   assert.equal((await cancelRun(api, sessionId)).status, 200, "a repeated Stop after the queue drains is a safe no-op");
 });
 
-test("Reviewer stop has its own route and does not cancel an Agent run", async (context) => {
+test("Reviewer stop has its own route and does not cancel an Agent run", { tags: ["swarm:required"] }, async (context) => {
   const api = await startApi(context, "reviewer-stop-isolation");
   const sessionId = await createSession(api, "Reviewer isolation");
   const run = await startRun(api, sessionId, "Analyze the dataset");
@@ -627,7 +626,7 @@ test("Reviewer stop has its own route and does not cancel an Agent run", async (
   assert.ok((await streamed).includes("run.cancelled"));
 });
 
-test("a stuck Session does not block runs in another Session", async (context) => {
+test("a stuck Session does not block runs in another Session", { tags: ["swarm:required"] }, async (context) => {
   const api = await startApi(context, "run-isolation");
   const stuckSessionId = await createSession(api, "Session A");
   const otherSessionId = await createSession(api, "Session B");
@@ -650,7 +649,7 @@ test("a stuck Session does not block runs in another Session", async (context) =
   assert.ok((await stuckStream).includes("run.cancelled"));
 });
 
-test("cancelling a blocked run persists the approval's terminal state and the tool input in the replay", async (context) => {
+test("cancelling a blocked run persists the approval's terminal state and the tool input in the replay", { tags: ["swarm:required"] }, async (context) => {
   const api = await startApi(context, "blocked-cancel-replay", startBlockingPermissionGateway);
   const sessionId = await createSession(api, "Blocked cancel replay", { approvalMode: "ask_for_dangerous" });
 
@@ -695,7 +694,7 @@ test("cancelling a blocked run persists the approval's terminal state and the to
   assert.ok(resolved.sequence > events[requiredIndex]!.sequence);
 });
 
-test("run child stream endpoint serves empty streams and rejects invalid ids", async (context) => {
+test("run child stream endpoint serves empty streams and rejects invalid ids", { tags: ["swarm:required"] }, async (context) => {
   const api = await startApi(context, "stream-endpoint", startBlockingPermissionGateway);
   const sessionId = await createSession(api, "Stream endpoint", { approvalMode: "ask_for_dangerous" });
   const blocked = await createRun(api, sessionId, "Run code and wait for approval");

@@ -116,6 +116,7 @@ import { ApiClient, ApiRequestError, isAbortError } from "./api.js";
 import { replaceDefaultModelOverride } from "./default-model-override.js";
 import { settleLoads, startupLoads, systemSettingsLoads, workspaceCapabilitiesFromQuota } from "./settings-loads.js";
 import { isAuthFailure } from "./api/auth.js";
+import { classifySessionPollMiss } from "./api/session-miss.js";
 import { TrajectoryViewer } from "@sciencediscovery/trajectory/web";
 import { createSessionActivity } from "./run-stream/session-activity.js";
 import { groupArtifactsBySession, upsertArtifactSession } from "./artifact-session-groups.js";
@@ -1585,7 +1586,12 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
     if (!activeSessionId) return;
     let active = true;
     const refresh = () => refreshGovernedDownloads(activeSessionId).catch((reason: Error) => {
-      if (active) reportError(reason);
+      if (!active) return;
+      void classifySessionPollMiss(client, activeSessionId, reason).then((miss) => {
+        if (!active || miss.kind === "stale") return;
+        if (miss.kind === "gone" || miss.kind === "other") reportError(new Error(miss.message));
+        else reportError(reason);
+      });
     });
     void refresh();
     const timer = window.setInterval(() => void refresh(), 2_000);
@@ -1593,7 +1599,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
       active = false;
       window.clearInterval(timer);
     };
-  }, [activeSessionId, refreshGovernedDownloads, reportError]);
+  }, [activeSessionId, client, refreshGovernedDownloads, reportError]);
   const addPendingAnnotation = useCallback((annotation: ArtifactAnnotation) => {
     setPendingAnnotations((current) => [...current.filter((item) => item.id !== annotation.id), annotation]);
   }, []);
