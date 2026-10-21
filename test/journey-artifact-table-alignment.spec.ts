@@ -112,9 +112,9 @@ test("J429 Artifact table headings align with values without changing prose or s
       const source = await open("analysis.py");
       await expect(source.locator("pre.artifact-source-preview")).toContainText(SOURCE.trim());
       await expect(source.locator("pre.artifact-source-preview")).toHaveCSS("white-space", "pre-wrap");
-      await close(source);
     });
     await journey.step("Read the dataset at laptop and desktop widths", "Text and numeric values align with their headers at 1280px and 1920px.", async () => {
+      await close(page.getByRole("dialog", { name: "Artifact: results/analysis.py" }));
       const dialog = await open("dataset.json");
       for (const width of [1280, 1920]) {
         await page.setViewportSize({ width, height: 1080 });
@@ -122,16 +122,15 @@ test("J429 Artifact table headings align with values without changing prose or s
         await expect(dialog.locator("tbody")).toContainText("12.5");
         await expect(dialog.locator("tbody")).toContainText("实验组");
       }
-      await close(dialog);
     });
     await journey.step("Read the Markdown table", "Default, right and center aligned columns keep their declared alignment and readable prose.", async () => {
+      await close(page.getByRole("dialog", { name: "Artifact: results/dataset.json" }));
       const dialog = await open("report.md");
       for (const width of [1280, 1920]) {
         await page.setViewportSize({ width, height: 1080 });
         await expectColumnAlignment(dialog.locator(".markdown-body table"));
         await expect(dialog.locator(".markdown-body > p")).toHaveText(PROSE);
       }
-      await close(dialog);
     });
   } finally {
     await cleanupJourney(page, fixture);
