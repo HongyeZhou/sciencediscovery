@@ -160,6 +160,8 @@ import {
   DEFAULT_SYSTEM_QUOTA_SETTINGS,
   DEFAULT_REVIEWER_SPECIALIST_LEVEL,
   DEFAULT_REVIEWER_FEEDBACK_POLICY,
+  DEFAULT_REVIEWER_SPECIALIST_SETTINGS,
+  DEFAULT_SESSION_REVIEWER_SPECIALIST_SETTINGS,
   DEFAULT_SYSTEM_TIMEOUT_SETTINGS,
   DEFAULT_MEMORY_GRAPH_SETTINGS,
   DEFAULT_WEB_SETTINGS,
@@ -973,7 +975,7 @@ export class SessionStore {
       const semanticReviewEnabled = session.semanticReviewEnabled ?? true;
       const reviewerAutomaticReviewEnabled = typeof session.reviewerAutomaticReviewEnabled === "boolean"
         ? session.reviewerAutomaticReviewEnabled
-        : true;
+        : DEFAULT_SESSION_REVIEWER_SPECIALIST_SETTINGS.automaticReviewEnabled;
       const reviewerSpecialistLevel = isReviewerSpecialistLevel(session.reviewerSpecialistLevel)
         ? session.reviewerSpecialistLevel
         : DEFAULT_REVIEWER_SPECIALIST_LEVEL;
@@ -1114,6 +1116,20 @@ export class SessionStore {
       ? savedReviewerFeedbackPolicy
       : DEFAULT_REVIEWER_FEEDBACK_POLICY;
     const migratedReviewerFeedbackPolicy = saved.reviewerSpecialistFeedbackPolicy !== reviewerSpecialistFeedbackPolicy;
+    // #323/#413: Reviewer capability defaults on. Missing field → on. A persisted
+    // false without the one-time migration flag is the pre-#353 product default
+    // and is lifted once; later explicit opt-outs set the flag and stay off.
+    let reviewerSpecialistEnabled = saved.reviewerSpecialistEnabled
+      ?? DEFAULT_REVIEWER_SPECIALIST_SETTINGS.enabled;
+    let reviewerSpecialistDefaultOnMigrated = saved.reviewerSpecialistDefaultOnMigrated === true;
+    let migratedReviewerSpecialistDefaultOn = false;
+    if (!reviewerSpecialistDefaultOnMigrated) {
+      if (reviewerSpecialistEnabled === false) {
+        reviewerSpecialistEnabled = DEFAULT_REVIEWER_SPECIALIST_SETTINGS.enabled;
+      }
+      reviewerSpecialistDefaultOnMigrated = true;
+      migratedReviewerSpecialistDefaultOn = true;
+    }
     this.catalog = {
       artifactAnnotations,
       artifactVersions,
@@ -1137,9 +1153,10 @@ export class SessionStore {
       proxyServers,
       quotaSettings,
       sandboxNetworkSettings,
-      reviewerSpecialistEnabled: saved.reviewerSpecialistEnabled ?? true,
+      reviewerSpecialistEnabled,
       reviewerSpecialistFeedbackPolicy,
       reviewerSpecialistLevel,
+      reviewerSpecialistDefaultOnMigrated,
       remoteHosts,
       remoteJobs,
       remoteWorkspaceSyncs,
@@ -1189,6 +1206,7 @@ export class SessionStore {
       || migratedPermissionGrants
       || migratedReviewerSpecialistLevel
       || migratedReviewerFeedbackPolicy
+      || migratedReviewerSpecialistDefaultOn
       || migratedSpecialists
       || migratedArtifactCatalog
       || migratedWorkspaceFileProvenance
@@ -1845,6 +1863,9 @@ export class SessionStore {
     }
     this.catalog.reviewerSpecialistEnabled = value.enabled;
     if (value.feedbackPolicy !== undefined) this.catalog.reviewerSpecialistFeedbackPolicy = value.feedbackPolicy;
+    // Record that the user (or API) chose a value so the default-on migration
+    // will not override an intentional opt-out on the next load.
+    this.catalog.reviewerSpecialistDefaultOnMigrated = true;
     await this.saveCatalog();
     return this.getReviewerSpecialistSettings();
   }
@@ -2872,8 +2893,8 @@ export class SessionStore {
       reviewMode: governance.reviewMode === "manual" ? "manual" : "auto",
       ...(remoteRunnerHostIds ? { remoteRunnerHostIds } : {}),
       ...(runnerIds ? { runnerIds } : {}),
-      reviewerAutomaticReviewEnabled: true,
-      reviewerSpecialistLevel: DEFAULT_REVIEWER_SPECIALIST_LEVEL,
+      reviewerAutomaticReviewEnabled: DEFAULT_SESSION_REVIEWER_SPECIALIST_SETTINGS.automaticReviewEnabled,
+      reviewerSpecialistLevel: DEFAULT_SESSION_REVIEWER_SPECIALIST_SETTINGS.level,
       semanticReviewEnabled: resolved.effective.semanticReviewEnabled,
       settingsOverrides,
       ...(governance.specialistId ? { specialistId: governance.specialistId } : {}),
