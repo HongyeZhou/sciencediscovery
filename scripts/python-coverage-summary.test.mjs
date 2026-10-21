@@ -52,6 +52,16 @@ test("excludes test files and preserves Python line and branch counts", () => {
   assert.deepEqual(summary.sources, [{ path: "services/example/src/example.py", totals: summary.totals }]);
 });
 
+test("excludes pytest configuration outside test directories from coverage", () => {
+  for (const path of ["conftest.py", "services/example/conftest.py", "services\\example\\conftest.py"]) {
+    const summary = summarizePythonCoverage({
+      files: { ...rawCoverage.files, [path]: { summary: { covered_lines: 20, num_statements: 20 } } },
+    });
+    assert.equal(summary.files, 1);
+    assert.deepEqual(summary.totals.lines, { covered: 6, percentage: 75, total: 8 });
+  }
+});
+
 test("aggregates services by counts instead of averaging percentages", () => {
   const aggregate = aggregatePythonCoverage([
     {

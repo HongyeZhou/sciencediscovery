@@ -26,6 +26,7 @@ export function isPythonTestSource(file) {
   const normalized = file.replaceAll("\\", "/");
   const basename = normalized.split("/").at(-1) || "";
   return /(^|\/)(?:test|tests|__tests__|\.venv)\//.test(normalized)
+    || /^conftest\.py$/i.test(basename)
     || /^test_.*\.py$/i.test(basename)
     || /_test\.py$/i.test(basename);
 }
