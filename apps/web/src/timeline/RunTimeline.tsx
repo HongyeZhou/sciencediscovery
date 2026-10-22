@@ -969,6 +969,7 @@ export function RunTimeline({
               </div>
               {pending && isRunning && onPermissionDecision ? (
                 <PermissionDecisionActions
+                  action={entry.request.action}
                   busy={decidingPermissionIds.includes(entry.request.id)
                     || decidingPermissionMatchers.includes(permissionMatchingKey(entry.request))}
                   onDecision={(decision) => void decidePermission(entry.request, decision)}

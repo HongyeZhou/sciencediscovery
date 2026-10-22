@@ -26,17 +26,25 @@ export function permissionMatchingKey(request: PermissionRequest): string {
   return `${request.action}:${resource}`;
 }
 
+/**
+ * A sandbox-network grant covers only the listed hosts, on the requesting
+ * Runner, until the owning agent run ends. "Allow same type" reads as blanket
+ * network access, so that one action names the hosts it actually grants.
+ */
 export function PermissionDecisionActions({
+  action,
   busy,
   onDecision,
 }: {
+  action?: PermissionRequest["action"];
   busy: boolean;
   onDecision: (decision: PermissionDecision) => void;
 }) {
   const { t } = useLocale();
+  const sandboxNetwork = action === "sandbox_network";
   return <div className="plan-actions permission-decision-actions">
     <button className="secondary-button" disabled={busy} onClick={() => onDecision("allow_once")} type="button">{t("permissions.allowOnce")}</button>
-    <button className="secondary-button" disabled={busy} onClick={() => onDecision("allow_matching")} type="button">{t("permissions.allowMatching")}</button>
+    <button className="secondary-button" disabled={busy} onClick={() => onDecision("allow_matching")} title={sandboxNetwork ? t("permissions.allowSandboxNetworkHostsHint") : undefined} type="button">{sandboxNetwork ? t("permissions.allowSandboxNetworkHosts") : t("permissions.allowMatching")}</button>
     <button className="danger-button" disabled={busy} onClick={() => onDecision("deny")} type="button">{t("permissions.deny")}</button>
   </div>;
 }

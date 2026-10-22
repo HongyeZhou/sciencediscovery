@@ -606,7 +606,7 @@ export async function handlePermissionsUntilTerminal(
 ): Promise<{ decisions: number; run: JourneyRun }> {
   const decision = options.decision ?? "allow-once";
   const labels = {
-    "allow-matching": /^(Allow same type|Allow matching|允许同类操作)$/,
+    "allow-matching": /^(Allow same type|Allow matching|允许同类操作|Allow these hosts for this run|本次运行允许这些主机)$/,
     "allow-once": /^(Allow once|Allow|仅允许一次)$/,
     deny: /^(Deny|拒绝)$/,
   } as const;
