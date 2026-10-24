@@ -92,30 +92,79 @@ function parseFrame(raw: string): SseFrame | undefined {
 }
 
 /** Called for every event with the cursor that came with it, if any. Callers
- *  keep the largest value they saw and reconnect with it. */
-export type RunEventHandler = (event: RunStreamEvent, sequence?: number) => void;
+ *  keep the largest value they saw and reconnect with it.
+ *
+ *  `event` is `null` for a frame that could not be read: there is nothing to
+ *  fold in, but the cursor still moves. */
+export type RunEventHandler = (event: RunStreamEvent | null, sequence?: number) => void;
+
+/** What a stream reports about itself while it runs. */
+export interface StreamOptions {
+  /**
+   * Called once, when the stream ends, with the number of frames it could not
+   * read. Those frames are skipped — the stream carries on and the cursor
+   * moves past them — but the run is missing them, and the user is told once
+   * rather than once per frame.
+   */
+  onSkippedFrames?: (count: number) => void;
+}
+
+/**
+ * Hand one frame to the caller. True when the frame was delivered.
+ *
+ * A frame the server wrote badly must not end the run: the server is still
+ * writing, and the frames after this one are still good. So a frame that
+ * cannot be read is counted and stepped over rather than thrown from, and the
+ * cursor it carried is still handed over — a reconnect asks for `?after=`, and
+ * without that the same unreadable frame would be fetched again, forever.
+ */
+function deliver(frame: SseFrame, onEvent: RunEventHandler): boolean {
+  try {
+    onEvent(JSON.parse(frame.data) as RunStreamEvent, frame.id);
+    return true;
+  } catch {
+    // Either the payload was not JSON, or the handler could not take it.
+  }
+  try {
+    onEvent(null, frame.id);
+  } catch {
+    // The cursor cannot move either; there is nothing left to try for it.
+  }
+  return false;
+}
 
 async function pump(
   response: Response,
   onEvent: RunEventHandler,
+  onSkippedFrames?: (count: number) => void,
 ): Promise<void> {
   if (!response.body) throw new Error(TEXT.errors.noStream);
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   const frames = new SseFrameDecoder();
+  let skipped = 0;
   try {
     while (true) {
       const { done, value } = await reader.read();
       const decoded = frames.push(decoder.decode(value, { stream: !done }));
       // The last chunk may end without the blank line that closes a frame.
       for (const frame of done ? [...decoded, ...frames.flush()] : decoded) {
-        onEvent(JSON.parse(frame.data) as RunStreamEvent, frame.id);
+        if (!deliver(frame, onEvent)) skipped += 1;
       }
       if (done) break;
     }
   } finally {
     // Aborting errors the body stream; release the reader either way.
     await reader.cancel().catch(() => undefined);
+    // One notice for the whole stream, however it ended.
+    if (skipped > 0) {
+      try {
+        onSkippedFrames?.(skipped);
+      } catch {
+        // A notice that could not be shown must not stand in for the
+        // stream's own outcome.
+      }
+    }
   }
 }
 
@@ -133,13 +182,14 @@ export async function streamMessage(
   body: SendMessageRequest,
   onEvent: RunEventHandler,
   signal?: AbortSignal,
+  options?: StreamOptions,
 ): Promise<void> {
   const response = await client.fetchStream(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
     body: JSON.stringify(body),
     method: "POST",
     ...(signal ? { signal } : {}),
   });
-  await pump(response, onEvent);
+  await pump(response, onEvent, options?.onSkippedFrames);
 }
 
 /**
@@ -154,6 +204,7 @@ export async function subscribeRunEvents(
   after: number,
   onEvent: RunEventHandler,
   signal?: AbortSignal,
+  options?: StreamOptions,
 ): Promise<void> {
   const response = await client.fetchStream(
     `/api/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/events?after=${after}`,
@@ -162,7 +213,7 @@ export async function subscribeRunEvents(
       ...(signal ? { signal } : {}),
     },
   );
-  await pump(response, onEvent);
+  await pump(response, onEvent, options?.onSkippedFrames);
 }
 
 /** The same events as JSON, for rebuilding a run that already finished. */

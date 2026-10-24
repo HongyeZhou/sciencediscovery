@@ -619,6 +619,9 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
     (target: string): RunEventHandler =>
       (event, sequence) => {
         if (sessionRef.current !== target) return;
+        // A `null` event is a frame the stream could not read: nothing is
+        // folded in, but its id still moves the replay cursor, so a reconnect
+        // does not ask for the same unreadable frame again.
         updateRun((current) => reduceRunStream(current, event, sequence));
       },
     [updateRun],
@@ -670,7 +673,9 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
         setRunning(true);
       }
       try {
-        await subscribeRunEvents(client, target, runId, 0, applyEvent(target), controller.signal);
+        await subscribeRunEvents(client, target, runId, 0, applyEvent(target), controller.signal, {
+          onSkippedFrames: (count) => toast(TEXT.conversation.malformedFrames(count)),
+        });
       } catch (reason) {
         if (isAuthFailure(reason)) {
           onAuthRejected();
@@ -722,7 +727,9 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
       const controller = new AbortController();
       abortRef.current = controller;
       try {
-        await streamMessage(client, session, { content: text }, applyEvent(session), controller.signal);
+        await streamMessage(client, session, { content: text }, applyEvent(session), controller.signal, {
+          onSkippedFrames: (count) => toast(TEXT.conversation.malformedFrames(count)),
+        });
       } catch (reason) {
         if (isAuthFailure(reason)) {
           onAuthRejected();
@@ -743,7 +750,7 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
         }
       }
     },
-    [applyEvent, client, ensureSession, onAuthRejected, report, resetRun, settle, updateRun],
+    [applyEvent, client, ensureSession, onAuthRejected, report, resetRun, settle, toast, updateRun],
   );
 
   /**

@@ -144,6 +144,8 @@ export const ZH = {
     truncatedBody: "内容较长，这里是其中一部分。",
     droppedEvents: (count: number) => `有 ${count} 条更早的事件未能重放，以下是可恢复的部分。`,
     unknownEvents: (count: number) => `有 ${count} 个本版本不认识的事件被跳过。`,
+    /** 事件流里读不出来的帧：运行本身继续了，但这一段内容缺失。 */
+    malformedFrames: (count: number) => `有 ${count} 条无法从事件流中读出的事件被跳过。`,
     streamEnded: "连接已结束，运行状态未知。刷新可重新获取。",
     emptyTurn: "这一轮没有产出文本。",
     toolCall: "工具调用",
