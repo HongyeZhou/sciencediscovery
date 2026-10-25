@@ -54,20 +54,23 @@ for (const layer of layers) {
   }
   if (!summary) continue;
   rows.push({ layer, ...summary });
-  const { planned = 0, executed = 0, passed = 0, failed = 0, skipped = 0 } = summary;
-  if (summary.status !== "PASS") problems.push(`${layer}: status ${summary.status}`);
+  const { planned = 0, executed = 0, passed = 0, failed = 0, skipped = 0, providerFaults = 0 } = summary;
+  // A provider fault is the model gateway's outage, not the product's
+  // failure. It stays visible in the problems below and does not fail the
+  // layer; a product failure in the same layer still does.
+  if (summary.status !== "PASS" && summary.status !== "PROVIDER_FAULT") problems.push(`${layer}: status ${summary.status}`);
   if (planned === 0) problems.push(`${layer}: selected no test`);
   if (executed !== planned) problems.push(`${layer}: executed ${executed} of ${planned} planned`);
-  if (passed !== planned) problems.push(`${layer}: passed ${passed} of ${planned} planned`);
+  if (passed + providerFaults !== planned) problems.push(`${layer}: passed ${passed} of ${planned} planned`);
   if (failed > 0) problems.push(`${layer}: ${failed} failed`);
   if (skipped > 0) problems.push(`${layer}: ${skipped} skipped — a skip is not a pass`);
 }
 
 if (rows.length === 0) problems.push(`no frozen plan reported under ${resultsRoot}; the layer stopped before it collected its tests`);
 
-const lines = ["### Shared plan", "", "| slice | plan digest | planned | executed | passed | failed | skipped |", "| --- | --- | --- | --- | --- | --- | --- |"];
+const lines = ["### Shared plan", "", "| slice | plan digest | planned | executed | passed | failed | provider faults | skipped |", "| --- | --- | --- | --- | --- | --- | --- | --- |"];
 for (const row of rows) {
-  lines.push(`| ${row.layer} | \`${String(row.planDigest).slice(0, 12)}\` | ${row.planned} | ${row.executed} | ${row.passed} | ${row.failed} | ${row.skipped} |`);
+  lines.push(`| ${row.layer} | \`${String(row.planDigest).slice(0, 12)}\` | ${row.planned} | ${row.executed} | ${row.passed} | ${row.failed} | ${row.providerFaults ?? 0} | ${row.skipped} |`);
 }
 if (problems.length > 0) lines.push("", "Problems:", "", ...problems.map((problem) => `- ${problem}`));
 for (const row of rows) {

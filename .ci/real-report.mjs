@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { canonical, validatePlan, verifyResults } from '../test/support/tagged/plan.mjs';
 import { realShards } from '../test/support/tagged/execution.mjs';
+import { isProviderFaultProblem } from '../test/support/tagged/provider-fault.mjs';
 import { collectSuite, renderSuite } from './biomni-gate.mjs';
 
 export function reconcile(plan, root) {
@@ -21,7 +22,11 @@ export function reconcile(plan, root) {
       // A valid failed shard still executed its cases. Retain those results so
       // suite accounting distinguishes FAIL from NOT_RUN while the gate fails.
       results.push(...summary.results);
-      if (summary.status !== 'PASS' || verifyResults(workerPlan, summary.results).exitCode) throw new Error('SHARD_FAILED');
+      // A shard whose only failures are transient gateway faults did not fail
+      // the product. It stays visible in the accounting and does not fail the
+      // gate; a product failure in the same shard still does.
+      const shardVerdict = verifyResults(workerPlan, summary.results);
+      if (summary.status !== 'PASS' && !(summary.status === 'PROVIDER_FAULT' && shardVerdict.exitCode === 0)) throw new Error('SHARD_FAILED');
     } catch (error) { errors.push(`${shard.name}: ${error.code === 'ENOENT' ? 'SHARD_EVIDENCE_MISSING' : error.message}`); }
   }
   return verifyResults(plan, results, errors);
@@ -40,7 +45,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     const baseline = policy.mode === 'compare' ? JSON.parse(readFileSync(policy.baseline)) : undefined;
     const biomni = collectSuite(plan, root, policy, baseline);
     if (biomni) {
-      if (verdict.status !== 'PASS') {
+      // A provider fault is not a product regression: it does not invalidate
+      // the biomni accounting, while a real failure does.
+      if (verdict.problems.some(problem => !isProviderFaultProblem(problem))) {
         biomni.problems.push('BIOMNI_EXECUTION_ACCOUNTING_FAILED');
         biomni.status = 'failed'; biomni.non_regression_certified = false;
       }
@@ -54,7 +61,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       verdict.biomni = { status: biomni.status, non_regression_certified: biomni.non_regression_certified, expected: biomni.expected, measured: biomni.measured, summary: biomni.summary };
     }
   } catch { verdict.problems.push('BIOMNI_GATE_EVIDENCE_OR_POLICY_INVALID'); }
-  if (verdict.problems.length) { verdict.status = 'FAIL'; verdict.exitCode = 1; }
+  // Only a product problem fails the gate. A provider fault stays visible in
+  // the verdict and its problems without failing the daily suite.
+  if (verdict.problems.some(problem => !isProviderFaultProblem(problem))) { verdict.status = 'FAIL'; verdict.exitCode = 1; }
   writeFileSync(join(root,'verdict.json'), JSON.stringify(verdict,null,2)+'\n');
   // Retain the existing dashboard artifact name and a single suite-level plan.
   // Only score-projected worker artifacts enter this assembly.
@@ -66,7 +75,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   mkdirSync(join(combined,'e2e-real/tagged'),{recursive:true});
   writeFileSync(join(combined,'e2e-real/tagged/plan.json'),JSON.stringify(plan));
   writeFileSync(join(combined,'e2e-real/tagged/summary.json'),JSON.stringify(verdict));
-  const report = `### Real E2E: ${verdict.status}\n\n${plan.profile}, backend=${plan.execution.backend}, revision=${plan.revision}\n\nPlanned ${verdict.planned}; executed ${verdict.executed}; passed ${verdict.passed}.\n\n${verdict.biomni ? `Biomni public tasks: ${verdict.biomni.measured}/${verdict.biomni.expected}; ${verdict.biomni.status}; non-regression certified: ${verdict.biomni.non_regression_certified}.\n\n` : ''}${verdict.problems.map(p=>`- ${p}`).join('\n')}\n`;
+  const report = `### Real E2E: ${verdict.status}\n\n${plan.profile}, backend=${plan.execution.backend}, revision=${plan.revision}\n\nPlanned ${verdict.planned}; executed ${verdict.executed}; passed ${verdict.passed}; provider faults ${verdict.providerFaults ?? 0}.\n\n${verdict.biomni ? `Biomni public tasks: ${verdict.biomni.measured}/${verdict.biomni.expected}; ${verdict.biomni.status}; non-regression certified: ${verdict.biomni.non_regression_certified}.\n\n` : ''}${verdict.problems.map(p=>`- ${p}`).join('\n')}\n`;
   console.log(report);
   console.log(biomniReport);
   if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, report);

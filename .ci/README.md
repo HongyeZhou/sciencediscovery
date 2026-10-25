@@ -291,8 +291,9 @@ minutes generation; DRB-59/64 allow 120 minutes. Nightly judge timeout is 10
 minutes. Team generation allows 55 minutes; PUCT generation 120 minutes.
 Its optional AI audit allows up to 65 more minutes when explicitly enabled
 locally; both daily and release leave that audit disabled. Job setup counts toward the four-hour worker
-ceiling. `fail-fast: false` retains evidence from independent workers; there
-are no automatic case retries. Rebuilding a merge group repeats its model calls.
+ceiling. `fail-fast: false` retains evidence from independent workers; the only
+automatic repeat is the one an early model-gateway fault earns, described
+below. Rebuilding a merge group repeats its model calls.
 Monthly usage is the sum of actual provider usage across queue attempts,
 approximately 30 daily runs and version candidates; provider rates and actual
 call counts, not timeout ceilings, determine money spent.
@@ -309,6 +310,35 @@ Both default to Python 3.14 independently of the product service environments;
 `SCIENCE_RESEARCH_PYTHON` overrides only the benchmark interpreter. The existing
 offline research UT check therefore exercises the same dependencies as real
 workers without model calls or gated dataset downloads.
+
+### Transient model-gateway faults in the daily suite
+
+A real-model case can fail because the configured provider answered with a
+server error, not because the product ran and did not deliver. The daily
+suite tells the two apart. A failure that carries a gateway status (500, 502,
+503, 504) together with a provider marker — the gateway's own `181001`
+model-call code, `new_api_error`, `model_not_found`, "no available channel" —
+is recorded as `PROVIDER_FAULT` rather than `FAIL`:
+
+- the provider's own text is kept unchanged in the failure record;
+- the case counts as executed, and the cases that passed in the same job stay
+  `PASS`;
+- the accounting reports `PROVIDER_FAULT: <case>` instead of `FAIL: <case>`,
+  and the suite's status is `PROVIDER_FAULT` rather than `FAIL`;
+- such a suite does not fail the daily gate: the product neither ran nor
+  failed to deliver in that case. The fault stays visible in the verdict, the
+  step summary and the artifacts.
+
+An authentication (401/403) or rate-limit (429) answer is a decision, not an
+outage, and is never soft-classified; neither is a semantic failure, a
+delivery miss or a timeout. A product failure in the same job still fails the
+gate exactly as before.
+
+A case whose first attempt died early on such a fault is run once more, on
+its own. Only an attempt that failed within five minutes is repeated, so a
+long research case that got that far is never repeated, and a product failure
+is never repeated at all. The repeat keeps its own evidence directory, and the
+first attempt's record stays in the artifacts.
 
 ### L5 full-public benchmark and baseline candidate
 

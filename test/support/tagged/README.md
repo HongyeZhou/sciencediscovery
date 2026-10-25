@@ -36,6 +36,13 @@ An exit code of zero alone is not sufficient. Results left by a previous run are
 removed before starting a worker, so an early `exit(0)` cannot reuse stale PASS
 records.
 
+A live-model case that failed on a transient model-gateway fault is the one
+outcome that does not fail a run. It is recorded as `PROVIDER_FAULT` with the
+provider's own text unchanged, counted as executed, and reported under its own
+problem code; the suite's status is `PROVIDER_FAULT` rather than `FAIL`. The
+product did not run in that case, so it did not fail to deliver either. A
+product failure in the same run still fails it. See `.ci/README.md`.
+
 Identity reconciliation uses the testcase ID plus the concrete OS,
 architecture and (for browser cases) selected backend, not just an aggregate count. Retry plugins are not enabled; repeated
 pytest phases cannot be collapsed into an apparently clean pass.
