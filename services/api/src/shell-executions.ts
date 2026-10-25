@@ -6,18 +6,65 @@ import type { DatabaseSync } from "node:sqlite";
 import { VersionStore, type AgentStateRef } from "@sciencediscovery/cas";
 import type { RunnerClient } from "@sciencediscovery/executor";
 import { shortErrorMessage, type OperationalLogger } from "@sciencediscovery/operational-logging";
-import type { AgentShellExecution, ExecutionOwner, ManagedExecution, ShellExecutionResult } from "@sciencediscovery/schema";
+import type { AgentShellExecution, ExecutionOwner, ExecutionRun, ManagedExecution, ShellExecutionResult } from "@sciencediscovery/schema";
 import type { AgentNotifications } from "./agent-notifications.js";
 import { apiLog } from "./logging.js";
 
 type Record = Omit<AgentShellExecution, "result"> & { resultRef?: AgentStateRef };
-type RecordExecution = (id: string, dispatch: RunnerClient["executeShell"], status: () => "succeeded" | "failed" | "cancelled") => Promise<ShellExecutionResult>;
+type RecordExecution = (id: string, dispatch: RunnerClient["executeShell"], status: () => ExecutionRun["status"]) => Promise<ShellExecutionResult>;
 type RunnerResolver = (runnerId: string) => RunnerClient;
 const terminal = (state: ManagedExecution["state"]) => state !== "queued" && state !== "running";
 const MAX_CONSECUTIVE_OBSERVATION_FAILURES = 5;
 const MAX_OBSERVATION_RETRY_DELAY_MS = 5_000;
 const RUNNER_REQUEST_TIMEOUT_MS = 10_000;
 class RecordedRunnerFailure extends Error {}
+
+/**
+ * A Runner observation settles an outcome only when it carries a committed
+ * version receipt — or never started, so nothing can still be running.
+ * Everything else leaves the outcome unconfirmed: the command may have run,
+ * but no committed result proves how it ended.
+ */
+const settledObservation = (observed: ManagedExecution): boolean =>
+  Boolean(observed.version) || !observed.startedAt;
+
+/**
+ * The provenance status of the Runner's last observation. A lost observation
+ * is `unconfirmed`: neither a success nor a failure. When a completed
+ * observation carries a committed result, the exit code settles succeeded vs
+ * failed — the same rule live observe and later reconcile both use.
+ */
+const observedStatus = (observed: ManagedExecution | undefined): ExecutionRun["status"] => {
+  if (!observed) return "unconfirmed";
+  switch (observed.state) {
+    case "completed":
+      if (!(observed.result && observed.version)) return "unconfirmed";
+      return observed.result.exitCode === 0 ? "succeeded" : "failed";
+    case "failed": return settledObservation(observed) ? "failed" : "unconfirmed";
+    case "cancelled": return settledObservation(observed) ? "cancelled" : "unconfirmed";
+    default: return "unconfirmed";
+  }
+};
+
+/**
+ * A Runner outcome adopted for an execution whose own outcome was never
+ * observed. The command is not replayed: the Runner's committed record for
+ * that Execution ID is read and adopted as-is.
+ */
+export interface AdoptedShellOutcome {
+  /** The shell execution record that now carries the committed outcome. */
+  execution: AgentShellExecution;
+  /** The Runner's committed observation. */
+  observed: ManagedExecution;
+  /** The outcome the Runner settled. */
+  status: "succeeded" | "failed" | "cancelled";
+}
+
+/**
+ * Records the real provenance outcome of an adopted execution. It runs after
+ * the shell record is durable, and its failure never invalidates that record.
+ */
+export type OutcomeAdopter = (adopted: AdoptedShellOutcome) => Promise<void>;
 type ObservationFailure = { cause?: unknown; code?: unknown; message?: unknown; name?: unknown; statusCode?: unknown };
 const observationFailureChain = (error: unknown): ObservationFailure[] => {
   const chain: ObservationFailure[] = [];
@@ -87,6 +134,7 @@ export class ShellExecutions {
   private readonly active = new Map<string, Promise<void>>();
   private readonly reconciling = new Map<string, Promise<void>>();
   private runnerConnection?: (runnerId: string) => string;
+  private outcomeAdopter?: OutcomeAdopter;
 
   constructor(private readonly db: DatabaseSync, private readonly versions: VersionStore,
     private readonly notifications: AgentNotifications, private readonly pollMs = 200,
@@ -107,6 +155,15 @@ export class ShellExecutions {
   /** Names the connection each Runner request went through, so a lost observation is not read as a failed job. */
   describeRunnerConnections(describe: (runnerId: string) => string): void {
     this.runnerConnection = describe;
+  }
+
+  /**
+   * Install the writer that records an adopted outcome in the provenance log.
+   * It runs only when an execution whose outcome was never observed is
+   * adopted as a committed Runner result (via settle / reconcile).
+   */
+  setOutcomeAdopter(adopter: OutcomeAdopter): void {
+    this.outcomeAdopter = adopter;
   }
 
   private connection(runnerId: string): { runnerConnection?: string } {
@@ -184,7 +241,7 @@ export class ShellExecutions {
           observed = await this.follow(execution, runner, observed, (value) => { observed = value; });
           stage = "finalization";
           if (!observed.result && (observed.state === "failed" || observed.state === "cancelled")
-            && (observed.version || !observed.startedAt)) {
+            && settledObservation(observed)) {
             throw new RecordedRunnerFailure(observed.error ?? `Execution ${observed.state} before producing a result`);
           }
           if (!observed.result || !observed.version || (!request.explicitHandoff && !observed.result.workspaceSnapshot)) {
@@ -193,7 +250,7 @@ export class ShellExecutions {
           // The envelope receipt is authoritative, including older Runners
           // that do not duplicate it inside the result payload.
           return { ...observed.result, workspaceVersion: observed.version };
-        }, () => observed?.state === "cancelled" ? "cancelled" : observed?.state === "completed" ? "succeeded" : "failed");
+        }, () => observedStatus(observed));
         execution.resultRef = await this.versions.put("agent-state", JSON.stringify(result), "application/json");
         execution.runnerVersionId = observed!.version!.digest;
         this.finish(execution, { state: observed!.state, provenance: "committed" });
@@ -316,18 +373,43 @@ export class ShellExecutions {
       execution.resultRef = await this.versions.put("agent-state",
         JSON.stringify({ ...observed.result, workspaceVersion: observed.version }), "application/json");
       delete execution.error;
+      // Drop the premature "unconfirmed" notice so finish can insert the real outcome.
+      this.notifications.reopenExecution(ownerOf(execution), execution.id);
       this.finish(execution, { state: observed.state, provenance: "committed" });
+      await this.recordAdoptedOutcome(execution, observed);
       return;
     }
-    if ((observed.state === "failed" || observed.state === "cancelled") && (observed.version || !observed.startedAt)) {
+    if ((observed.state === "failed" || observed.state === "cancelled") && settledObservation(observed)) {
+      this.notifications.reopenExecution(ownerOf(execution), execution.id);
       this.finish(execution, { state: observed.state, provenance: "committed",
         error: observed.error ?? `Execution ${observed.state} before producing a result` });
+      await this.recordAdoptedOutcome(execution, observed);
       return;
     }
     // A Runner restart or an uncommitted end leaves the Runner itself without an outcome.
     const error = `Runner could not confirm the outcome: ${observed.error ?? "it ended without a committed result"}. The command was not replayed.`;
     if (execution.state === "unknown") this.save({ ...execution, error });
     else this.finish(execution, { state: "unknown", provenance: "unconfirmed", error });
+  }
+
+  /**
+   * Append the real provenance outcome for an execution that settle() just
+   * committed. Failures here never undo the durable shell record.
+   */
+  private async recordAdoptedOutcome(execution: Record, observed: ManagedExecution): Promise<void> {
+    const status = observedStatus(observed);
+    if (status !== "succeeded" && status !== "failed" && status !== "cancelled") return;
+    try {
+      await this.outcomeAdopter?.({
+        execution: this.find(execution.id, ownerOf(execution)),
+        observed,
+        status,
+      });
+    } catch (error) {
+      this.log.warn("shell_execution_outcome_not_recorded", {
+        ...correlation(execution), ...failureFields(error), ...this.connection(execution.runnerId),
+      });
+    }
   }
 
   private finish(execution: Record, patch: Pick<Record, "state" | "provenance"> & { error?: string }): void {

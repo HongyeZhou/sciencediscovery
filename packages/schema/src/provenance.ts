@@ -72,8 +72,14 @@ export interface ExecutionRun {
    * `cancelled` records a Runner execution that was interrupted mid-flight
    * because the agent run it belonged to was aborted — a user Stop or a run
    * timeout — rather than because the execution itself failed.
+   *
+   * `unconfirmed` records an execution whose outcome was never observed: the
+   * Runner accepted the command but the status read was lost, so no committed
+   * result proves how the command ended. It is neither a success nor a
+   * failure. A later reconciliation may append the real outcome for the same
+   * Execution ID; readers resolve the latest settled row for that ID.
    */
-  status: "cancelled" | "failed" | "succeeded";
+  status: "cancelled" | "failed" | "succeeded" | "unconfirmed";
   stderr: CasObjectRef;
   stdout: CasObjectRef;
   tool: "run_python" | "run_r" | "run_shell" | "run_direct_shell";

@@ -35,7 +35,7 @@ import type {
 } from "@sciencediscovery/schema";
 
 import { MemoryGraphClient, type ArtifactProvenanceGraphResult } from "@sciencediscovery/memory";
-import { ProvenanceRecorder } from "@sciencediscovery/provenance";
+import { effectiveExecutionRuns, ProvenanceRecorder } from "@sciencediscovery/provenance";
 import { SessionStore, SessionStoreHttpError } from "../store.js";
 
 export function classifyWorkspaceFilePreview(path: string): WorkspaceFile["previewKind"] {
@@ -164,9 +164,11 @@ async function artifactVersionProvenanceFromGraph(
   // code + executionLog: one Code node per execution. The graph gives the
   // hashes; language/tool/runId come from the ExecutionRun (fetched once) so
   // the response shape matches the store path exactly.
-  const runs = sourceSessionId
+  // Runs are append-only: one row per execution, carrying the outcome readers
+  // must use — a settled outcome supersedes an unconfirmed observation.
+  const runs = effectiveExecutionRuns(sourceSessionId
     ? (await store.listExecutionRuns(sourceSessionId)).filter((run) => version.executionRunIds.includes(run.id))
-    : [];
+    : []);
   const codeHash = graph.codeHash ?? null;
   const stdoutHash = graph.stdoutHash ?? null;
   const stderrHash = graph.stderrHash ?? null;
@@ -258,9 +260,9 @@ async function artifactVersionProvenanceFromStore(
   sourceSessionId: string | undefined,
   version: ScientificArtifactVersion,
 ): Promise<ArtifactVersionProvenance> {
-  const runs = sourceSessionId
+  const runs = effectiveExecutionRuns(sourceSessionId
     ? (await store.listExecutionRuns(sourceSessionId)).filter((run) => version.executionRunIds.includes(run.id))
-    : [];
+    : []);
   const manifests = version.turnId && sourceSessionId
     ? (await store.listPromptManifests(sourceSessionId)).filter((manifest) => manifest.turnId === version.turnId)
     : [];
