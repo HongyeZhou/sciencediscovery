@@ -19,6 +19,7 @@ import { fileDigest, validatePlan, canonical } from './plan.mjs';
 import { normalizeTags } from './tags.mjs';
 import { hostPlatform, hostArch } from './environment.mjs';
 import { backendName, assertMockedOrder } from './execution.mjs';
+import { PROVIDER_FAULT, detectProviderFaultFromErrors } from './provider-fault.mjs';
 const root = fileURLToPath(new URL('../../../', import.meta.url));
 function descriptor(test) {
   const source = relative(root, test.location.file).replaceAll('\\','/');
@@ -48,10 +49,18 @@ export default class TaggedReporter {
   onTestEnd(test,result) {
     const d=descriptor(test), e=this.entries.get(d.id);
     if(!e) { this.errors.push(`UNEXPECTED_RESULT: ${d.id}`);return; }
-    this.results.push({key:e.key, outcome:result.status==='passed'?'PASS':result.status==='skipped'?'SKIPPED':'FAIL',
+    const errors=result.errors.map(error=>error.message);
+    // A live-model case that failed on a transient gateway fault is not the
+    // product's failure. The provider's own words stay in `errors`; only the
+    // outcome changes, so the accounting can tell the two apart.
+    const fault=e.tags.includes('model:real')&&result.status==='failed'
+      ? detectProviderFaultFromErrors(errors) : null;
+    this.results.push({key:e.key, outcome:fault?PROVIDER_FAULT:result.status==='passed'?'PASS':result.status==='skipped'?'SKIPPED':'FAIL',
+      ...(fault?{providerFault:fault}:{}),
+      durationMs:result.duration,
       actualTarget:{os:hostPlatform(process.platform),arch:hostArch(process.arch)},
       actualBackend:backendName(process.env.CI_E2E_BACKEND ?? 'jiuwenswarm'),
-      errors:result.errors.map(error=>error.message)});
+      errors});
   }
   onError(error) { this.errors.push(error.message); }
   onEnd() {
