@@ -918,7 +918,8 @@ test("an execution interrupted by a run abort is recorded as cancelled, not fail
   assert.equal(run?.status, "cancelled");
   assert.equal(run?.exitCode, null);
 
-  // A Runner that breaks on its own is still a failure.
+  // A Runner call that throws without an abort never observed the outcome:
+  // the command may have run, so the row is unconfirmed rather than failed.
   const brokenRunner = {
     health: async () => ({ sandbox: "seatbelt" }),
     executeShell: async (): Promise<ShellExecutionResult> => { throw new Error("Runner is unavailable"); },
@@ -929,11 +930,11 @@ test("an execution interrupted by a run abort is recorded as cancelled, not fail
     permissionEpoch,
     runnerClient: brokenRunner,
     sessionId: session.id,
-    turnId: "turn-failed",
+    turnId: "turn-unconfirmed",
     workspaceRoot,
   }));
   const runs = await store.listExecutionRuns(session.id);
-  assert.equal(runs.at(-1)?.status, "failed");
+  assert.equal(runs.at(-1)?.status, "unconfirmed");
   assert.equal(runs.at(-1)?.sandbox, "seatbelt");
   assert.equal(runs.at(-1)?.environmentRevisionId, SYSTEM_SHELL_SEATBELT_ENVIRONMENT_REVISION_ID);
 });

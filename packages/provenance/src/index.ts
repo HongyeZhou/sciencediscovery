@@ -3,6 +3,7 @@
 
 export * from "./citation-review.js";
 export * from "./computation-review.js";
+export * from "./execution-outcome.js";
 export * from "./review-log.js";
 export * from "./review-quality-metrics.js";
 export * from "./review-policy.js";
