@@ -1,6 +1,7 @@
 // Copyright (C) 2026-2026 Huawei Technologies Co., Ltd
 // Licensed under the Apache License, Version 2.0 (the "License");
 
+export * from "./arguments.js";
 export * from "./bounded-output.js";
 export * from "./deferred-tools.js";
 export * from "./loop-guard.js";

@@ -300,6 +300,16 @@ call when `SCIENCE_AGENT_JIUWENSWARM_SUBAGENTS=jiuwenswarm`: JiuwenSwarm's own
 sub-agents share the run's gateway without the boundary and would take a withheld
 response for their final answer.
 
+The same holds for a call whose arguments parse but leave out an argument the
+tool cannot run without — a `task` call without its `prompt`. The gateway
+withholds it the same way, naming the missing argument, so the model re-issues
+it instead of the run carrying a failed tool card for a call that never ran. A
+tool that declares no such requirement is left alone. Where there is no recovery
+boundary the call reaches the tool, which answers it with the same
+invalid-arguments result any other unusable call gets; the same is true on the
+last recovery attempt, so a run ends on a tool error rather than on a withheld
+call.
+
 ### Invalid tool argument diagnostics
 
 Invalid model tool arguments produce a `[model-arguments]` warning with the gateway

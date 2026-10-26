@@ -1368,6 +1368,50 @@ test("a run whose model re-issues an invalid call after recovery feedback comple
   } finally { await started.close(); }
 });
 
+test("a task call that leaves out its prompt is withheld, and only the model's re-issued call starts the subagent", async () => {
+  const wires: string[] = [];
+  let subagents = 0;
+  const adapter = await fakeAdapter(async ({ body }, response) => {
+    response.writeHead(200);
+    const ask = async (messages: unknown[]) => wires.push(await fetch(`${body.model.baseUrl}/chat/completions`, {
+      method: "POST", headers: { authorization: `Bearer ${body.model.apiKey}` },
+      body: JSON.stringify({ stream: true, messages }),
+    }).then((reply) => reply.text()));
+    // The first turn: the model calls task without its instructions.
+    await ask([{ role: "user", content: "go" }]);
+    // The recovery turn: the model re-issues the call with a prompt.
+    await ask([{ role: "user", content: "go" },
+      { role: "user", content: "[Tool argument recovery 1/2; invalid_tool_arguments] Re-issue it." }]);
+    // The re-issued call reaches the bridge and runs the real task tool.
+    const args = { description: "Check the uploaded CSV", prompt: "Read the CSV and report its quality." };
+    response.write(line({ event: { type: "tool.started", trace: { id: "call-1", name: "task", args, status: "running" } } }));
+    await fetch(body.bridge.url, {
+      method: "POST", headers: { authorization: `Bearer ${body.bridge.token}` },
+      body: JSON.stringify({ name: "task", arguments: args }),
+    });
+    response.end(line({ done: { finalText: "the CSV was checked" } }));
+  });
+  try {
+    let calls = 0;
+    const agent = createJiuwenSwarmAgentFactory({ adapterUrl: adapter.url, modelStreamer: async () => ++calls === 1 ? {
+      assistantMessage: { role: "assistant", content: "" },
+      toolCalls: [{ id: "call-1", name: "task", args: { description: "Check the uploaded CSV" } }],
+    } : {
+      assistantMessage: { role: "assistant", content: "" },
+      toolCalls: [{ id: "call-1", name: "task",
+        args: { description: "Check the uploaded CSV", prompt: "Read the CSV and report its quality." } }],
+    } })(withRunSubagent({ runSubagent: (async () => {
+      subagents += 1;
+      return { id: "sub-1", status: "completed", steps: [] };
+    }) as never }));
+    await agent.execute("go");
+    assert.match(wires[0] ?? "", /invalid_tool_arguments:tool_calls_withheld/);
+    assert.match(wires[0] ?? "", /task \(missing required argument: prompt\)/);
+    assert.doesNotMatch(wires[0] ?? "", /"tool_calls"/, "the call that left out its prompt never reaches the bridge");
+    assert.equal(subagents, 1, "only the model's re-issued call starts a subagent");
+  } finally { await adapter.close(); }
+});
+
 test("with JiuwenSwarm's own sub-agents, which have no recovery boundary, an invalid call fails its request instead of being withheld", async () => {
   const { adapter, wires } = swarmAsking([[{ role: "user", content: "go" }]], "failed");
   const started = await adapter;

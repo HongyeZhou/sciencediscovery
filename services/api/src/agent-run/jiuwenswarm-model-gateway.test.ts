@@ -21,7 +21,7 @@ import { join } from "node:path";
 
 import { ModelRequestError, type ModelTurn, type streamModelTurn } from "@sciencediscovery/model";
 
-import { isSwarmCompaction, startModelGateway, toModelRequest, withoutWithheldNotice } from "./jiuwenswarm-model-gateway.js";
+import { isSwarmCompaction, startModelGateway, toModelRequest, withoutWithheldNotice, type ModelGatewayLifecycle } from "./jiuwenswarm-model-gateway.js";
 
 const POLICY = { maxRetries: 0, maxTokens: 1000, requestTimeoutMs: 1000 };
 
@@ -120,6 +120,13 @@ const answer = (extra: Partial<ModelTurn> = {}): ModelTurn => ({
 async function gateway(streamer: typeof streamModelTurn) {
   const controller = new AbortController();
   const started = await startModelGateway(ENDPOINT, POLICY, controller.signal, streamer);
+  return { ...started, controller };
+}
+
+/** A gateway whose run declares what its tools cannot run without. */
+async function gatewayWithLifecycle(streamer: typeof streamModelTurn, lifecycle: ModelGatewayLifecycle) {
+  const controller = new AbortController();
+  const started = await startModelGateway(ENDPOINT, POLICY, controller.signal, streamer, undefined, lifecycle);
   return { ...started, controller };
 }
 
@@ -539,6 +546,85 @@ test("without a recovery boundary on every requester, unparseable arguments fail
       assert.doesNotMatch(wire, /tool_calls_withheld/);
       assert.deepEqual(g.lastFailure()?.tools, ["run_shell"]);
     }
+  } finally { await g.close(); }
+});
+
+/** A model turn that calls the given tool with the given arguments. */
+const toolCallTurn = (name: string, args: Record<string, unknown>): ModelTurn => answer({
+  toolCalls: [{ id: "call-1", name, args }],
+  assistantMessage: { role: "assistant", content: "", tool_calls: [{ id: "call-1", type: "function",
+    function: { name, arguments: JSON.stringify(args) } }] },
+});
+
+test("a call that leaves out an argument its tool cannot run without is withheld and re-issued", async () => {
+  for (const stream of [false, true]) {
+    const g = await gatewayWithLifecycle(async () => toolCallTurn("task", { description: "Check the uploaded CSV" }),
+      { progress() {}, requiredArguments: { task: ["description", "prompt"] } });
+    try {
+      const response = await post(g, { stream, messages: [{ role: "user", content: "go" }] });
+      assert.equal(response.status, 200);
+      const wire = await response.text();
+      const payloads = stream ? wire.split("\n\n").filter(s => s.startsWith("data: {")).map(s => JSON.parse(s.slice(6))) : [JSON.parse(wire)];
+      for (const p of payloads) {
+        assert.equal(p.error, undefined);
+        assert.equal((p.choices[0].delta ?? p.choices[0].message).tool_calls, undefined, "a call that cannot run is never executed");
+      }
+      assert.equal(payloads.at(-1).choices[0].finish_reason, "length", "Swarm's recovery boundary engages on a withheld response");
+      const content = payloads.map(p => (p.choices[0].delta ?? p.choices[0].message).content ?? "").join("");
+      assert.match(content, /\[invalid_tool_arguments:tool_calls_withheld\] No tools from this response were executed\./);
+      assert.match(content, /task \(missing required argument: prompt\)/, "the model is told what to put right");
+      assert.doesNotMatch(wire, /Check the uploaded CSV/, "the arguments themselves are not echoed");
+      assert.deepEqual(g.lastFailure()?.tools, ["task"]);
+    } finally { await g.close(); }
+  }
+});
+
+test("an empty required argument is withheld like a missing one", async () => {
+  const g = await gatewayWithLifecycle(async () => toolCallTurn("task", { description: "Check the uploaded CSV", prompt: "" }),
+    { progress() {}, requiredArguments: { task: ["description", "prompt"] } });
+  try {
+    const wire = await (await post(g, { messages: [{ role: "user", content: "go" }] })).text();
+    assert.match(wire, /task \(missing required argument: prompt\)/);
+    assert.doesNotMatch(wire, /"tool_calls"/);
+  } finally { await g.close(); }
+});
+
+test("a complete call, and a tool that declares no requirement, are both left alone", async () => {
+  for (const [name, args] of [
+    ["task", { description: "Check the uploaded CSV", prompt: "Read the CSV and report its quality." }],
+    ["run_shell", {}],
+  ] as const) {
+    const g = await gatewayWithLifecycle(async () => toolCallTurn(name, args),
+      { progress() {}, requiredArguments: { task: ["description", "prompt"] } });
+    try {
+      const wire = await (await post(g, { messages: [{ role: "user", content: "go" }] })).text();
+      assert.doesNotMatch(wire, /tool_calls_withheld/, `${name} must not be withheld`);
+      assert.equal(JSON.parse(wire).choices[0].message.tool_calls.length, 1, `${name} must still be executed`);
+      assert.equal(g.lastFailure(), undefined);
+    } finally { await g.close(); }
+  }
+});
+
+test("without a recovery boundary an incomplete call goes to the tool, which rejects it by itself", async () => {
+  const g = await gatewayWithLifecycle(async () => toolCallTurn("task", { description: "Check the uploaded CSV" }),
+    { progress() {}, recoversWithheldCalls: false, requiredArguments: { task: ["description", "prompt"] } });
+  try {
+    const wire = await (await post(g, { messages: [{ role: "user", content: "go" }] })).text();
+    assert.doesNotMatch(wire, /tool_calls_withheld/);
+    assert.equal(JSON.parse(wire).choices[0].message.tool_calls.length, 1, "the tool answers the call itself");
+    assert.equal(g.lastFailure(), undefined, "the run does not end on a withheld call");
+  } finally { await g.close(); }
+});
+
+test("the last recovery attempt lets an incomplete call through instead of ending the run", async () => {
+  const g = await gatewayWithLifecycle(async () => toolCallTurn("task", { description: "Check the uploaded CSV" }),
+    { progress() {}, requiredArguments: { task: ["description", "prompt"] } });
+  try {
+    const wire = await (await post(g, { messages: [{ role: "user",
+      content: "[Tool argument recovery 2/2; invalid_tool_arguments] Re-issue it." }] })).text();
+    assert.doesNotMatch(wire, /tool_calls_withheld/);
+    assert.equal(JSON.parse(wire).choices[0].message.tool_calls.length, 1, "the tool answers the call itself");
+    assert.equal(g.lastFailure(), undefined, "the run does not end on a withheld call");
   } finally { await g.close(); }
 });
 
