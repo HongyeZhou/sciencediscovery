@@ -18,6 +18,7 @@ import { RunnerUnavailableError } from "./runner-readiness.js";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
 import type { AgentTool } from "@sciencediscovery/tools";
+import { invalidToolArguments, missingRequiredArguments } from "@sciencediscovery/tools";
 import type { WorkspaceTransfer, WorkspaceTransferInput } from "@sciencediscovery/schema";
 import {
   SANDBOX_SKILL_EXTENSIONS_ROOT,
@@ -2073,6 +2074,23 @@ export function createMcpTools(options: Pick<WorkspaceToolOptions, "mcpTools" | 
   return filterTools(tools, options.toolPolicy);
 }
 
+/**
+ * The arguments a `task` call cannot run without.
+ *
+ * `prompt` carries the delegated work and `description` labels it. Both are
+ * required by the task schema, and the subagent store requires them too, so a
+ * call that leaves one out never reaches a subagent.
+ */
+export const TASK_REQUIRED_ARGUMENTS = ["description", "prompt"] as const;
+
+/** What the model is told when a `task` call left out a required argument. */
+const taskArgumentMessage = (missing: readonly string[]): string =>
+  `Invalid task arguments: ${missing.map((name) => `"${name}"`).join(", ")} `
+  + `${missing.length === 1 ? "is" : "are"} required and must be a non-empty string. `
+  + "The task tool starts a subagent, and the subagent needs the full instructions in \"prompt\"; "
+  + "\"description\" is only a short label and never substitutes for it. "
+  + "Re-issue this call with a complete prompt.";
+
 /** Default delegation preserves the established request/result and budget semantics. */
 export function createSubagentTools(options: Pick<WorkspaceToolOptions, "runSubagent" | "specialists" | "toolPolicy" | "listArtifacts">): AgentTool[] {
   const tools: AgentTool[] = [];
@@ -2136,6 +2154,11 @@ export function createSubagentTools(options: Pick<WorkspaceToolOptions, "runSuba
         specialistSummary ? `Choose specialistId by semantic match against specialist descriptions. Set specialistId so the specialist's instructions, skills, and connectors are applied. Available specialists: ${specialistSummary}` : "",
       ].filter(Boolean).join(" "),
       execute: async (toolCallId, params, signal) => {
+        // A call without its instructions never starts a subagent. It is
+        // answered here, before the delegation, so the model is told what to
+        // add instead of the run carrying a subagent that failed to start.
+        const missing = missingRequiredArguments(params as Record<string, unknown>, TASK_REQUIRED_ARGUMENTS);
+        if (missing.length) return invalidToolArguments(taskArgumentMessage(missing));
         const subagent = await options.runSubagent!({
           ...(params.brief ? { brief: params.brief } : {}),
           description: params.description,
@@ -2158,6 +2181,7 @@ export function createSubagentTools(options: Pick<WorkspaceToolOptions, "runSuba
       label: "Run subagent",
       name: "task",
       parameters: taskParameters,
+      requiredArguments: TASK_REQUIRED_ARGUMENTS,
     };
     tools.push(task);
   }

@@ -1877,6 +1877,63 @@ test("subagent tools preserve structured governance inputs", async () => {
   assert.doesNotMatch(result.content[0]?.type === "text" ? result.content[0].text : "", /steps/);
 });
 
+test("a task call that leaves out a required argument is answered before any subagent starts", async () => {
+  const timestamp = new Date().toISOString();
+  let started = 0;
+  const tools = createWorkspaceTools(process.cwd(), {
+    runSubagent: async (input): Promise<Subagent> => {
+      started += 1;
+      return {
+        createdAt: timestamp,
+        id: "subagent-1",
+        input,
+        maxTurns: input.maxTurns ?? DEFAULT_SUBAGENT_MAX_TURNS,
+        parentTurnId: "turn-1",
+        sessionId: "session-1",
+        status: "completed",
+        steps: [{
+          content: "The CSV has no missing values.",
+          createdAt: timestamp,
+          id: "assistant-result",
+          kind: "assistant",
+          status: "completed",
+        }],
+        timeoutSeconds: input.timeoutSeconds ?? DEFAULT_SUBAGENT_TIMEOUT_SECONDS,
+        turnCount: 1,
+        usage: { inputTokens: 20, outputTokens: 5, totalTokens: 25 },
+      };
+    },
+    enabledConnectorIds: [],
+    executePython: async () => { throw new Error("not used"); },
+  });
+  const task = tools.find((candidate) => candidate.name === "task");
+  assert.ok(task);
+  assert.deepEqual(task.requiredArguments, ["description", "prompt"], "the task tool declares what it cannot run without");
+
+  // The first call of a specialist delegation may arrive without its instructions.
+  const withoutPrompt = await task.execute("task-call", { description: "Check the uploaded CSV" } as never);
+  assert.equal(started, 0, "a call without its instructions never reaches a subagent");
+  assert.equal(withoutPrompt.isError, true);
+  const details = withoutPrompt.details as { ok: boolean; error: { code: string; message: string; retryable: boolean } };
+  assert.equal(details.ok, false);
+  assert.equal(details.error.code, "INVALID_TOOL_ARGUMENTS");
+  assert.equal(details.error.retryable, true, "the model is told the call can be re-issued");
+  assert.match(details.error.message, /"prompt" is required/);
+  assert.match(details.error.message, /never substitutes for it/);
+  assert.deepEqual(JSON.parse(withoutPrompt.content[0]!.text), details, "the model reads the same answer");
+
+  // An empty prompt is no instructions either.
+  const emptyPrompt = await task.execute("task-call", { description: "Check the uploaded CSV", prompt: "  " } as never);
+  assert.equal(started, 0);
+  assert.equal(emptyPrompt.isError, true);
+  assert.match((emptyPrompt.details as { error: { message: string } }).error.message, /"prompt" is required/);
+
+  // A complete call still delegates.
+  const complete = await task.execute("task-call", { description: "Check the uploaded CSV", prompt: "Read the CSV and report its quality." } as never);
+  assert.equal(started, 1, "a complete call starts exactly one subagent");
+  assert.equal(complete.isError, undefined);
+});
+
 test("subagent result joins adjacent streamed assistant fragments", () => {
   const timestamp = new Date().toISOString();
   const subagent = {

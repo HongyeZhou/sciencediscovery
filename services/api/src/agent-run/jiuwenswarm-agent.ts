@@ -17,7 +17,7 @@ import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 
 import type { AgentEvent } from "@sciencediscovery/orchestration";
-import { TOOL_SEARCH_NAME, TOOL_SEARCH_SPEC, type AgentTool } from "@sciencediscovery/tools";
+import { TOOL_SEARCH_NAME, TOOL_SEARCH_SPEC, requiredArgumentsOf, type AgentTool } from "@sciencediscovery/tools";
 
 import { DurableContextStore } from "@sciencediscovery/context";
 
@@ -367,7 +367,10 @@ class JiuwenSwarmAgent implements NativeAgentHandle {
       trajectory.enabled ? { request: (input) => trajectory.modelRequest(input), completed: (turn, history) => trajectory.modelCompleted(turn, history) } : undefined,
       { progress: () => this.markProgress("model:upstream"), beforeTurn: () => this.emit({ type: "turn_start" }),
         // Only the run's own instance has the output-recovery boundary; JiuwenSwarm's sub-agents do not.
-        recoversWithheldCalls: !jiuwenSwarmSubagents });
+        recoversWithheldCalls: !jiuwenSwarmSubagents,
+        // A call that leaves out an argument its tool cannot run without is withheld and re-issued
+        // by the model, instead of the run carrying a failed card for a call that never ran.
+        requiredArguments: requiredArgumentsOf(registry.values()) });
     const deadlines = new RunDeadlines(this.options.runTimeoutMs ?? DEFAULT_AGENT_TURN_TIMEOUT_MS,
       this.options.runIdleTimeoutMs ?? DEFAULT_AGENT_IDLE_TIMEOUT_MS, () => {
         this.logGatewayProgress(`${deadlines.expired ?? "unknown"}_deadline_expired`, modelGateway);
