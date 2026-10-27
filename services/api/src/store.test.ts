@@ -660,6 +660,53 @@ test("intentional Reviewer opt-out survives reload after default-on migration", 
   assert.equal(reopened.getReviewerSpecialistSettings().enabled, false);
 });
 
+test("new Session under an existing Project gets current Automatic review defaults without rewriting older Sessions", async (context) => {
+  const tempRoot = resolve(process.cwd(), ".tmp", `reviewer-new-session-defaults-${Date.now()}-${process.pid}`);
+  context.after(() => rm(tempRoot, { force: true, recursive: true }));
+  const store = new SessionStore(tempRoot);
+  await store.load();
+  const project = await store.createProject("Existing project with history");
+  const legacy = await store.createSession(project.id, "Legacy session", {}, {}, { allowUnconfiguredModel: true });
+  await store.updateSessionReviewerSpecialistSettings(legacy.id, {
+    automaticReviewEnabled: false,
+    level: "deep",
+  });
+  assert.deepEqual(store.getSessionReviewerSpecialistSettings(legacy.id), {
+    automaticReviewEnabled: false,
+    level: "deep",
+  });
+
+  const created = await store.createSession(project.id, "Fresh session", {}, {}, { allowUnconfiguredModel: true });
+  assert.deepEqual(store.getSessionReviewerSpecialistSettings(created.id), {
+    automaticReviewEnabled: true,
+    level: "quick",
+  });
+  assert.deepEqual(store.getSessionReviewerSpecialistSettings(legacy.id), {
+    automaticReviewEnabled: false,
+    level: "deep",
+  });
+
+  const persisted = await readPersistedCatalog(tempRoot);
+  const persistedLegacy = persisted.sessions.find((item) => item.id === legacy.id);
+  const persistedCreated = persisted.sessions.find((item) => item.id === created.id);
+  assert.equal(persistedLegacy?.reviewerAutomaticReviewEnabled, false);
+  assert.equal(persistedLegacy?.reviewerSpecialistLevel, "deep");
+  assert.equal(persistedCreated?.reviewerAutomaticReviewEnabled, true);
+  assert.equal(persistedCreated?.reviewerSpecialistLevel, "quick");
+
+  const reopened = new SessionStore(tempRoot);
+  await reopened.load();
+  assert.deepEqual(reopened.getSessionReviewerSpecialistSettings(legacy.id), {
+    automaticReviewEnabled: false,
+    level: "deep",
+  });
+  assert.deepEqual(reopened.getSessionReviewerSpecialistSettings(created.id), {
+    automaticReviewEnabled: true,
+    level: "quick",
+  });
+  assert.equal(reopened.getReviewerSpecialistSettings().enabled, true);
+});
+
 test("SessionStore appends run events losslessly and survives reload", async (context) => {
   const tempRoot = resolve(process.cwd(), ".tmp", `run-events-${Date.now()}-${process.pid}`);
   await mkdir(tempRoot, { recursive: true });

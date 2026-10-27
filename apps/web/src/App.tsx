@@ -253,6 +253,7 @@ import type { CsvViewerSource } from "./csv-artifact/types.js";
 import { opensInCsvViewer } from "./csvArtifact.js";
 import { IdeaTreeView } from "./IdeaTreeView.js";
 import { ReviewerControlCard } from "./ReviewerControlCard.js";
+import { automaticReviewComposerState } from "./automatic-review-composer.js";
 import { ConnectorPicker } from "./composer/ConnectorPicker.js";
 import { ApprovalModeToggle } from "./composer/ApprovalModeToggle.js";
 import { ReviewerPanel } from "./ReviewerPanel.js";
@@ -4149,6 +4150,10 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
     sessionArchived,
     stoppingSessionIds,
   });
+  const automaticReviewComposer = automaticReviewComposerState({
+    reviewerSettings: reviewerSpecialistSettings,
+    sessionAutomaticReviewEnabled: session?.reviewerAutomaticReviewEnabled ?? false,
+  });
   const composerTrigger = getComposerTrigger(message, composerTextarea.current?.selectionStart ?? message.length);
   const selectedComposerCommands = selectedSkillAuthoringCommands(message);
   const composerSuggestions: ComposerSuggestion[] = !composerTrigger ? [] : composerTrigger.symbol === "@"
@@ -4774,7 +4779,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
                   {activeThinkingControls.legacyBudget ? <div className="composer-thinking-notice" role="note">
                     {t("composer.thinkingLegacyNotice")}
                   </div> : null}
-                  {reviewerSpecialistSettings && !reviewerSpecialistSettings.enabled && session.reviewerAutomaticReviewEnabled
+                  {automaticReviewComposer.showUnavailableNotice
                     ? <div className="composer-thinking-notice" role="status">{t("reviewer.automaticUnavailable")}</div>
                     : null}
                   <div className="composer-footer">
@@ -4813,21 +4818,26 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
                       onChange={(approvalMode) => void updateSessionSettings({ approvalMode })}
                     />
                     <button
-                      aria-checked={Boolean(reviewerSpecialistSettings?.enabled && session.reviewerAutomaticReviewEnabled)}
+                      aria-checked={automaticReviewComposer.switchChecked}
                       aria-label={t("reviewer.automaticReview")}
                       className="automatic-review-toggle"
-                      disabled={sessionArchived || reviewerSessionSettingsBusy || !reviewerSpecialistSettings}
-                      onClick={() => reviewerSpecialistSettings?.enabled
-                        ? void updateSessionReviewerSpecialistSettings({
-                          automaticReviewEnabled: !session.reviewerAutomaticReviewEnabled,
-                          level: session.reviewerSpecialistLevel,
-                        })
-                        : openSystemSettings("specialists")}
+                      disabled={sessionArchived || reviewerSessionSettingsBusy || !automaticReviewComposer.capabilityKnown}
+                      onClick={() => {
+                        if (!automaticReviewComposer.capabilityKnown) return;
+                        if (automaticReviewComposer.capabilityEnabled) {
+                          void updateSessionReviewerSpecialistSettings({
+                            automaticReviewEnabled: !session.reviewerAutomaticReviewEnabled,
+                            level: session.reviewerSpecialistLevel,
+                          });
+                          return;
+                        }
+                        openSystemSettings("specialists");
+                      }}
                       role="switch"
-                      title={t(reviewerSpecialistSettings?.enabled ? "reviewer.automaticReview" : "reviewer.automaticUnavailable")}
+                      title={t(automaticReviewComposer.titleKey)}
                       type="button"
                     >
-                      {t("reviewer.automaticReview")}: {t(reviewerSpecialistSettings?.enabled && session.reviewerAutomaticReviewEnabled ? "common.on" : "common.off")}
+                      {t("reviewer.automaticReview")}: {t(automaticReviewComposer.labelOn ? "common.on" : "common.off")}
                     </button>
                     <ComposerRunButton action={{ ...composerRunAction, runDisabled: composerRunAction.runDisabled || evolveCommandBlocked }} onStop={() => void stopRun()} />
                   </div>
