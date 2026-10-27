@@ -199,6 +199,9 @@ cmd_start() {
   verify_compatibility_patches
   # Detach completely (stdin, stdout, stderr): a background job that keeps the caller's stdout open
   # makes `scripts/jiuwenswarm.sh start | tee ...`, or any script capturing its output, wait forever.
+  # Setup normally creates this root; mkdir keeps a fresh explicit root startable before setup
+  # finishes writing the instance workspace (failures remain loud if the binary is missing).
+  mkdir -p "$JIUWENSWARM_HOME"
   cd "$JIUWENSWARM_HOME"
   # Web search is configured from ScienceDiscovery's web settings, which the API applies with config.set.
   # Put our guarded sitecustomize hook in every JiuwenSwarm Python process. It applies JiuwenSwarm's
