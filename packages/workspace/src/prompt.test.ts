@@ -38,6 +38,13 @@ function skill(id: string, description: string): RuntimeSkill {
   };
 }
 
+test("system prompt steers Python/R through run_shell, not retired run_python/run_r", () => {
+  const prompt = buildWorkspaceSystemPrompt([], true);
+  assert.match(prompt, /There is no run_python or run_r tool/);
+  assert.match(prompt, /exactly one of command or scriptPath/);
+  assert.match(prompt, /Prefer run_shell/);
+});
+
 test("managed environment prompt directs mutations through governed tools", () => {
   const prompt = buildWorkspaceSystemPrompt([], true);
   assert.match(prompt, /environment_list\/environment_create\/environment_delete\/environment_install\/environment_uninstall/);

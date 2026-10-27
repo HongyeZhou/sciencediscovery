@@ -6,6 +6,7 @@ export * from "./bounded-output.js";
 export * from "./deferred-tools.js";
 export * from "./loop-guard.js";
 export * from "./registry.js";
+export * from "./retired-tools.js";
 export * from "./sanitize.js";
 export * from "./tool-output-store.js";
 export type { AgentTool, AgentToolResult } from "./types.js";
