@@ -117,7 +117,7 @@ test("研究员交付报告后可看到独立完成的自动审核", { tag: "@mo
       await toggle.click();
       await expect(toggle).not.toBeChecked();
       const fold = page.locator("details.workspace-fold").filter({ hasText: "Reviewer Specialist" });
-      await fold.locator("summary").click();
+      if (await fold.getAttribute("open") === null) await fold.locator("summary").click();
       await fold.getByRole("button", { name: "Run review", exact: true }).click();
       await expect.poll(async () => {
         const response = await page.request.get(`${apiBaseUrl()}/api/sessions/${fixture.session.id}/reviewer-audit-tasks`, { headers: authorizationHeader() });
