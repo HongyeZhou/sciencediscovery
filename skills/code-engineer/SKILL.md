@@ -221,6 +221,15 @@ Caching applies **only to `--action inspect`**. The script stores loaded DuckDB 
 
 Note: `--action run` does **not** use this cache. The Python (`pandas`) and R (`readxl`/`read.csv`) subprocesses re-read the data files on every invocation. If you want run-time caching for an analysis pipeline, cache results yourself and reuse them.
 
+## Nonlinear fitting and confidence intervals (lmfit)
+
+When the analysis needs nonlinear least-squares fits or parameter **confidence intervals** with **lmfit** (especially the pinned **1.3.4** used in science demos), read [references/lmfit-conf-interval.md](references/lmfit-conf-interval.md) **before** the first `conf_interval` / `run_python` call.
+
+- Prefer `result.conf_interval()` after `Model.fit(...)`.
+- Or `conf_interval(minimizer, result)` after `Minimizer.minimize()` — minimizer first.
+- Do not guess alternate signatures; wrong calls fail under 1.3.4 and produce opaque failed cards before a later self-repair.
+- Never swallow fit/CI exceptions or invent confidence-interval numbers.
+
 ## Quality Assurance （optional but highly recommended）
 
 For analyses where result quality matters, use the `result-evaluator` skill to evaluate output reliability and methodological rigor. This is especially recommended when:
