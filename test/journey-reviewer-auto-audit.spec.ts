@@ -62,14 +62,17 @@ test("研究员交付报告后可看到独立完成的自动审核", { tag: "@mo
       data: { enabled: true }, headers: authorizationHeader(),
     });
     expect(enabled.ok()).toBeTruthy();
-    await journey.step("在输入框旁配置自动审核", "自动审核默认开启，关闭状态在刷新后保留，并可再次开启。", async () => {
+    await journey.step("在输入框旁配置自动审核", "自动审核默认开启，输入框旁无 Reviewer 关闭误报，关闭状态在刷新后保留，并可再次开启。", async () => {
       await openProjectSession(page, fixture);
       const toggle = page.locator(".composer-footer").getByRole("switch", { name: "Automatic review", exact: true });
       await expect(toggle).toBeChecked();
+      await expect(page.getByRole("status").filter({ hasText: "Automatic review is unavailable" })).toHaveCount(0);
+      await expect(toggle).toHaveAttribute("title", "Automatic review");
       await toggle.click();
       await expect(toggle).not.toBeChecked();
       await page.reload();
       await expect(toggle).not.toBeChecked();
+      await expect(page.getByRole("status").filter({ hasText: "Automatic review is unavailable" })).toHaveCount(0);
       await toggle.click();
       await expect(toggle).toBeChecked();
     });
