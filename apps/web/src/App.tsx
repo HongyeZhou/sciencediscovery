@@ -2855,12 +2855,14 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
     }
   }
 
+  const reviewerCapabilityEnabled = session?.reviewerSpecialistEnabled ?? reviewerSpecialistSettings?.enabled;
+
   async function runManualReviewerSpecialist(): Promise<void> {
     const targetSessionId = activeSessionId;
     if (!targetSessionId
       || manualReviewerBusyBySession[targetSessionId]
       || reviewerCheckpointRunning
-      || !reviewerSpecialistSettings?.enabled
+      || !reviewerCapabilityEnabled
       || session?.archivedAt) return;
     const messageId = crypto.randomUUID();
     const toolCallId = `manual-review:${messageId}`;
@@ -4739,7 +4741,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
                   {activeThinkingControls.legacyBudget ? <div className="composer-thinking-notice" role="note">
                     {t("composer.thinkingLegacyNotice")}
                   </div> : null}
-                  {reviewerSpecialistSettings && !reviewerSpecialistSettings.enabled && session.reviewerAutomaticReviewEnabled
+                  {reviewerCapabilityEnabled === false && session.reviewerAutomaticReviewEnabled
                     ? <div className="composer-thinking-notice" role="status">{t("reviewer.automaticUnavailable")}</div>
                     : null}
                   <div className="composer-footer">
@@ -4778,21 +4780,21 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
                       onChange={(approvalMode) => void updateSessionSettings({ approvalMode })}
                     />
                     <button
-                      aria-checked={Boolean(reviewerSpecialistSettings?.enabled && session.reviewerAutomaticReviewEnabled)}
+                      aria-checked={Boolean(reviewerCapabilityEnabled && session.reviewerAutomaticReviewEnabled)}
                       aria-label={t("reviewer.automaticReview")}
                       className="automatic-review-toggle"
                       disabled={sessionArchived || reviewerSessionSettingsBusy || !reviewerSpecialistSettings}
-                      onClick={() => reviewerSpecialistSettings?.enabled
+                      onClick={() => reviewerCapabilityEnabled
                         ? void updateSessionReviewerSpecialistSettings({
                           automaticReviewEnabled: !session.reviewerAutomaticReviewEnabled,
                           level: session.reviewerSpecialistLevel,
                         })
                         : openSystemSettings("specialists")}
                       role="switch"
-                      title={t(reviewerSpecialistSettings?.enabled ? "reviewer.automaticReview" : "reviewer.automaticUnavailable")}
+                      title={t(reviewerCapabilityEnabled ? "reviewer.automaticReview" : "reviewer.automaticUnavailable")}
                       type="button"
                     >
-                      {t("reviewer.automaticReview")}: {t(reviewerSpecialistSettings?.enabled && session.reviewerAutomaticReviewEnabled ? "common.on" : "common.off")}
+                      {t("reviewer.automaticReview")}: {t(reviewerCapabilityEnabled && session.reviewerAutomaticReviewEnabled ? "common.on" : "common.off")}
                     </button>
                     <ComposerRunButton action={{ ...composerRunAction, runDisabled: composerRunAction.runDisabled || evolveCommandBlocked }} onStop={() => void stopRun()} />
                   </div>
@@ -4971,7 +4973,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
 
             {session && evolveRuns.length ? <details className="workspace-fold"><summary><ChevronRightIcon className="fold-chevron" size={15} /><strong>{t("evolve.card.title")}</strong><span className="fold-meta">{evolveRuns.length}</span></summary><EvolveRunCard onOpenRun={setOpenEvolveRunId} runs={evolveRuns} /></details> : null}
 
-            {session && reviewerSpecialistSettings?.enabled ? <details className="workspace-fold"><summary>{t("specialist.reviewerName")}</summary><ReviewerControlCard
+            {session && reviewerCapabilityEnabled ? <details className="workspace-fold"><summary>{t("specialist.reviewerName")}</summary><ReviewerControlCard
               busy={Boolean(manualReviewerBusyBySession[session.id]) || reviewerCheckpointRunning || reviewerAuditRunning}
               configBusy={reviewerSessionSettingsBusy}
               disabled={sessionArchived}

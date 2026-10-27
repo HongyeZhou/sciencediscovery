@@ -51,9 +51,11 @@ test("automatic audit is durable, non-blocking, and creates bounded feedback", a
   context.after(() => removeDataDir(dataDir));
   const store = new SessionStore(dataDir);
   await store.load();
+  assert.equal(store.getReviewerSpecialistSettings().enabled, true);
+  await store.updateReviewerSpecialistSettings({ enabled: false });
   const project = await store.createProject("Reviewer task");
   const session = await store.createSession(project.id, "Audit", {}, {}, { allowUnconfiguredModel: true });
-  assert.equal(store.getReviewerSpecialistSettings().enabled, true);
+  assert.equal(store.getReviewerSpecialistSettings(session.id).enabled, true);
   const registered = await store.createArtifactVersion({
     content: { hash: "a".repeat(64), size: 3 },
     kind: "markdown",
@@ -687,7 +689,7 @@ test("automatic review exposes a disabled capability instead of silently omittin
   await store.load();
   await store.updateReviewerSpecialistSettings({ enabled: false });
   const project = await store.createProject("Disabled Reviewer");
-  const session = await store.createSession(project.id, "Report", {}, {}, { allowUnconfiguredModel: true });
+  const session = await store.createSession(project.id, "Report", {}, { reviewerSpecialistEnabled: false }, { allowUnconfiguredModel: true });
   const report = await store.createArtifactVersion({
     content: { hash: "d".repeat(64), size: 1 }, kind: "markdown", logicalName: "report.md", mediaType: "text/markdown",
     origin: "llm_declared", sessionId: session.id, sourcePath: "report.md",

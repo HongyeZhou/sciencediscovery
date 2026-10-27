@@ -19,8 +19,8 @@ test.describe("journey-reviewer-auto-audit.spec", { tag: ["@isolation:global", "
  *   1. Verify automatic review is on and toggle it beside the composer in an isolated Session.
  *   2. Deliver a Markdown report and wait for the main run to finish.
  *   3. Observe the independent automatic audit complete and expose its read-only result.
- *   4. Run a manual review and verify a disabled global capability is explained beside the composer.
- *   5. Deliver another report with the capability off and observe a neutral skip reason in the conversation.
+ *   4. Turn automatic review off, run a manual review, and verify the saved global opt-out does not block this new session.
+ *   5. Deliver another report with automatic review off and verify no new audit task is created.
  * Environment: Isolated API/Runner with its own ports and data directory.
  * Type: mocked
  * LLM: journey-owned local OpenAI-compatible stub only.
@@ -35,7 +35,7 @@ test("研究员交付报告后可看到独立完成的自动审核", { tag: "@mo
   test.setTimeout(270_000);
   journey.scenario({
     goal: "研究员交付一份报告后，主任务立即完成；Reviewer Specialist 在后台完成只读 Quick 审核并显示结果。",
-    preconditions: ["隔离 API 与 Runner 已启动", "本地模型 stub 不访问网络", "Reviewer Specialist 已启用"],
+    preconditions: ["隔离 API 与 Runner 已启动", "本地模型 stub 不访问网络", "系统 Reviewer 关闭，新会话独立启用"],
   });
   const stub = await scriptedModel([[
     { arguments: { command: "mkdir -p results && printf '# Report\\n\\nA concise result.\\n' > results/report.md" }, tool: "run_shell" },
@@ -46,22 +46,20 @@ test("研究员交付报告后可看到独立完成的自动审核", { tag: "@mo
     { arguments: { path: "results/second-report.md" }, tool: "declare_artifact" },
     { text: "The second report is ready." },
   ]]);
+  const originalReviewer = await (await page.request.get(`${apiBaseUrl()}/api/reviewer-specialist/settings`, {
+    headers: authorizationHeader(),
+  })).json() as { enabled: boolean };
+  const disabledGlobal = await page.request.put(`${apiBaseUrl()}/api/reviewer-specialist/settings`, {
+    data: { enabled: false }, headers: authorizationHeader(),
+  });
+  expect(disabledGlobal.ok()).toBeTruthy();
   const fixture = await createProjectAndSession(page, {
     approvalMode: "always_allow",
     model: { apiToken: stub.apiToken, baseUrl: stub.baseUrl, model: stub.model, name: `Reviewer audit ${Date.now()}` },
     projectName: `Reviewer auto audit ${Date.now()}`,
     sessionTitle: "Automatic review",
   });
-  const originalReviewer = await (await page.request.get(`${apiBaseUrl()}/api/reviewer-specialist/settings`, {
-    headers: authorizationHeader(),
-  })).json() as { enabled: boolean };
   try {
-    // Other global-isolation journeys can change this shared test catalog.
-    // Fresh-install defaults are asserted by the store and coordinator tests.
-    const enabled = await page.request.put(`${apiBaseUrl()}/api/reviewer-specialist/settings`, {
-      data: { enabled: true }, headers: authorizationHeader(),
-    });
-    expect(enabled.ok()).toBeTruthy();
     await journey.step("在输入框旁配置自动审核", "自动审核默认开启，关闭状态在刷新后保留，并可再次开启。", async () => {
       await openProjectSession(page, fixture);
       const toggle = page.locator(".composer-footer").getByRole("switch", { name: "Automatic review", exact: true });
@@ -115,6 +113,9 @@ test("研究员交付报告后可看到独立完成的自动审核", { tag: "@mo
       await expect(auditCard).toContainText("Quick");
     });
     await journey.step("手动复核仍然可用", "Run review 完成一次独立的手动审核。", async () => {
+      const toggle = page.locator(".composer-footer").getByRole("switch", { name: "Automatic review", exact: true });
+      await toggle.click();
+      await expect(toggle).not.toBeChecked();
       const fold = page.locator("details.workspace-fold").filter({ hasText: "Reviewer Specialist" });
       await fold.locator("summary").click();
       await fold.getByRole("button", { name: "Run review", exact: true }).click();
@@ -123,33 +124,32 @@ test("研究员交付报告后可看到独立完成的自动审核", { tag: "@mo
         const tasks = await response.json() as Array<{ origin: string; status: string }>;
         return tasks.some((task) => task.origin === "manual" && task.status === "completed");
       }).toBe(true);
+      await toggle.click();
+      await expect(toggle).toBeChecked();
     });
-    await journey.step("系统关闭时显示原因", "输入框旁明确说明自动审核不可用。", async () => {
+    await journey.step("新会话不受旧系统开关阻止", "系统开关仍为关闭，新会话自动审核和手动复核均可用。", async () => {
       const response = await page.request.put(`${apiBaseUrl()}/api/reviewer-specialist/settings`, {
         data: { enabled: false }, headers: authorizationHeader(),
       });
       expect(response.ok()).toBeTruthy();
       await page.reload();
-      await expect(page.getByRole("status").filter({ hasText: "Automatic review is unavailable" })).toBeVisible();
-      await expect(page.locator(".composer-footer").getByRole("switch", { name: "Automatic review", exact: true })).not.toBeChecked();
+      await expect(page.getByRole("status").filter({ hasText: "Automatic review is unavailable" })).toHaveCount(0);
+      await expect(page.locator(".composer-footer").getByRole("switch", { name: "Automatic review", exact: true })).toBeChecked();
+      const settings = await page.request.get(`${apiBaseUrl()}/api/reviewer-specialist/settings`, { headers: authorizationHeader() });
+      expect((await settings.json()).enabled).toBe(false);
     });
-    await journey.step("查看未执行审核的原因", "系统能力关闭后交付的报告显示中性跳过记录，刷新后仍可见。", async () => {
+    await journey.step("关闭自动审阅后继续交付", "第二份报告完成，不创建自动审核任务，刷新后仍保持关闭。", async () => {
+      const toggle = page.locator(".composer-footer").getByRole("switch", { name: "Automatic review", exact: true });
+      await toggle.click();
+      const tasksUrl = `${apiBaseUrl()}/api/sessions/${fixture.session.id}/reviewer-audit-tasks`;
+      const before = await (await page.request.get(tasksUrl, { headers: authorizationHeader() })).json();
       const run = await sendUserMessage(page, fixture.session.id, "Deliver another Markdown report.");
       expect((await waitForRunTerminal(page, fixture.session.id, run.id)).status).toBe("completed");
-      const reason = "Automatic review skipped: Reviewer Specialist is off in System configuration → Specialists.";
-      const skipPanel = page.locator(".reviewer-specialist-panel").filter({ hasText: reason });
-      // Collapsed process records hide the subtitle; the visible heading
-      // carries the skip reason, and expansion exposes the full body.
-      const skipHeading = skipPanel.locator(".reviewer-specialist-panel-heading strong");
-      await expect(skipHeading).toContainText(reason, { timeout: 90_000 });
-      await expect(skipHeading).toBeVisible();
-      await expect(skipPanel).not.toHaveClass(/failed/);
+      await expect(page.locator(".artifact-catalog-section")).toContainText("second-report.md");
+      const after = await (await page.request.get(tasksUrl, { headers: authorizationHeader() })).json();
+      expect(after).toEqual(before);
       await page.reload();
-      await expect(skipHeading).toBeVisible();
-      await expect(skipHeading).toContainText(reason);
-      await expect(skipPanel).not.toHaveClass(/failed/);
-      await skipPanel.locator("summary").click();
-      await expect(skipPanel.locator(".reviewer-specialist-results").getByText(reason, { exact: true })).toBeVisible();
+      await expect(toggle).not.toBeChecked();
     });
   } finally {
     await page.request.put(`${apiBaseUrl()}/api/reviewer-specialist/settings`, {

@@ -1126,7 +1126,7 @@ async function executeAgentRun(
     permission: permissionRuntime,
     responseSink,
   });
-  const reviewerSpecialistSettings = store.getReviewerSpecialistSettings();
+  const reviewerSpecialistSettings = store.getReviewerSpecialistSettings(sessionId);
   const sessionReviewerSpecialistSettings = store.getSessionReviewerSpecialistSettings(sessionId);
   const subagentPool = new SubagentPool(maxConcurrentSubagents);
   let launchedSubagentCalls = 0;

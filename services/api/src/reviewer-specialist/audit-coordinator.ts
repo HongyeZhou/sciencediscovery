@@ -72,7 +72,7 @@ export class ReviewerAuditCoordinator {
   ) {}
 
   async enqueueManual(sessionId: string, messageId: string): Promise<ReviewerAuditTask> {
-    if (!this.store.getReviewerSpecialistSettings().enabled) throw new Error("Reviewer Specialist is off");
+    if (!this.store.getReviewerSpecialistSettings(sessionId).enabled) throw new Error("Reviewer Specialist is off");
     const sessionSettings = this.store.getSessionReviewerSpecialistSettings(sessionId);
     return await this.createTask({
       artifactVersionIds: this.latestReportArtifactVersionIds(sessionId),
@@ -361,8 +361,8 @@ export class ReviewerAuditCoordinator {
         }
         if (task.origin === "artifact_registered") {
           const sessionSettings = this.store.getSessionReviewerSpecialistSettings(sessionId);
-          if (!this.store.getReviewerSpecialistSettings().enabled || !sessionSettings.automaticReviewEnabled) {
-            const reason = !this.store.getReviewerSpecialistSettings().enabled
+          if (!this.store.getReviewerSpecialistSettings(sessionId).enabled || !sessionSettings.automaticReviewEnabled) {
+            const reason = !this.store.getReviewerSpecialistSettings(sessionId).enabled
               ? "Automatic review skipped: Reviewer Specialist is off in System configuration → Specialists."
               : "Automatic review skipped: automatic review was turned off for this session.";
             await this.publishCheckpoint(task);

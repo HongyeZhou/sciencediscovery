@@ -83,6 +83,8 @@ export interface Session {
    */
   remoteRunnerHostIds?: string[];
   runnerIds?: string[];
+  /** New Sessions own their Reviewer capability; absent in legacy Sessions that inherit the system switch. */
+  reviewerSpecialistEnabled?: boolean;
   /** Enables automatic Reviewer Specialist tasks for this Session only. */
   reviewerAutomaticReviewEnabled: boolean;
   /** Quick is the default; Deep adds semantic verification for this Session. */
@@ -500,6 +502,9 @@ export interface SessionRunEvent {
 }
 
 export interface CreateSessionRequest {
+  reviewerSpecialistEnabled?: boolean;
+  reviewerAutomaticReviewEnabled?: boolean;
+  reviewerSpecialistLevel?: ReviewerSpecialistLevel;
   /** Compatibility shortcut for settingsOverrides.modelId. */
   modelId?: string;
   approvalMode?: ApprovalMode;

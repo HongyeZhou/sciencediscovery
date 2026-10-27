@@ -2256,6 +2256,9 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
             reviewMode: body.reviewMode,
             remoteRunnerHostIds: body.remoteRunnerHostIds,
             runnerIds: body.runnerIds,
+            reviewerSpecialistEnabled: body.reviewerSpecialistEnabled,
+            reviewerAutomaticReviewEnabled: body.reviewerAutomaticReviewEnabled,
+            reviewerSpecialistLevel: body.reviewerSpecialistLevel,
             specialistId: body.specialistId,
           },
           {

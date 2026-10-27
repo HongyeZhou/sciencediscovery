@@ -14,7 +14,7 @@ Completeness depends on what was recorded and which evidence relationships were 
 
 ## Add another perspective on an artifact
 
-Reviewer and session automatic review are on by default for new installs. Eligible report artifacts trigger background reviews in the same workflow, without a second message. Use **Automatic review** beside the composer’s Approval mode to turn it off for a session. **Run review** and Quick/Deep settings remain in the workspace Reviewer controls. Findings and reasons attach to specific artifact versions, helping locate missing citations, mismatched sources, or incomplete computational provenance.
+Reviewer and automatic review are on by default for every new session, including sessions created in existing projects. Eligible report artifacts trigger background reviews in the same workflow, without a second message. Use **Automatic review** beside the composer’s Approval mode to turn it off for a session. **Run review** and Quick/Deep settings remain in the workspace Reviewer controls. Findings and reasons attach to specific artifact versions, helping locate missing citations, mismatched sources, or incomplete computational provenance.
 
 Quick review focuses on citation structure and computational evidence chains. Deeper checking requires accessible sources, suitable tools, and time. A well-formed citation does not establish support, and a recorded execution does not establish sound statistics.
 
@@ -24,10 +24,10 @@ Reviewer feedback does not automatically edit artifacts or guarantee a subsequen
 
 The practical benefit is turning vague doubt into a traceable issue: a missing source, a calculation inconsistent with its result, or a conclusion that exceeds the evidence. This supports efforts to reduce research hallucinations, but model reviews can be wrong and a graph is not proof of truth.
 
-Scientific memory is optional. Its local-file backend needs no separate graph database; choose Neo4j when that backend is needed. Existing explicit Reviewer opt-outs are preserved. If the system capability is off, the composer explains why automatic review is unavailable; eligible reports record a skipped reason in the review card. Starting with one analysis that delivers reliable artifacts makes it easier to understand the records when adding provenance and review.
+Scientific memory is optional. Its local-file backend needs no separate graph database; choose Neo4j when that backend is needed. Existing explicit Reviewer opt-outs are preserved. Older sessions continue to inherit the saved system Reviewer switch. If that switch is off, their composer explains why automatic review is unavailable; eligible reports record a skipped reason in the review card. Starting with one analysis that delivers reliable artifacts makes it easier to understand the records when adding provenance and review.
 
 - [ScienceMemory setup](../advanced-setup/science-memory-setup.md): local storage and Neo4j.
 - [Review and provenance design](../developer-docs/review-provenance.md): versions, evidence, and findings.
 - [ScienceMemory design](../developer-docs/science-memory.md): task and citation chains.
 
-The live controls are the global Reviewer Specialist switch and the session Automatic review toggle. Legacy `reviewMode` and `semanticReviewEnabled` fields do not control this path.
+Use the session Automatic review toggle for new sessions; turning it off still allows manual Run review. The system Reviewer Specialist switch controls older sessions that inherit it. Upgrades preserve saved system, project and session settings, including false values. Legacy `reviewMode` and `semanticReviewEnabled` fields do not control this path.

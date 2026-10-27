@@ -622,29 +622,68 @@ test("catalogs without a Reviewer switch enable automatic review on migration", 
   const reopened = new SessionStore(tempRoot);
   await reopened.load();
   assert.equal(reopened.getReviewerSpecialistSettings().enabled, true);
-  assert.equal((await readPersistedCatalog(tempRoot)).reviewerSpecialistDefaultOnMigrated, true);
 });
 
-test("pre-#353 Reviewer default-off catalogs migrate to enabled once", async (context) => {
+test("legacy Reviewer false remains unchanged when no migration marker exists", async (context) => {
   const tempRoot = resolve(process.cwd(), ".tmp", `reviewer-legacy-off-${Date.now()}-${process.pid}`);
   context.after(() => rm(tempRoot, { force: true, recursive: true }));
   const store = new SessionStore(tempRoot);
   await store.load();
+  const project = await store.createProject("Existing project");
+  const oldSession = await store.createSession(project.id, "Existing session", {}, {}, { allowUnconfiguredModel: true });
+  await store.updateSessionReviewerSpecialistSettings(oldSession.id, { automaticReviewEnabled: false, level: "deep" });
+  const inheritedSession = await store.createSession(project.id, "Inherits system Reviewer", {}, {}, { allowUnconfiguredModel: true });
   const catalog = await readPersistedCatalog(tempRoot);
   catalog.reviewerSpecialistEnabled = false;
+  for (const session of catalog.sessions) delete (session as Record<string, unknown>).reviewerSpecialistEnabled;
   delete catalog.reviewerSpecialistDefaultOnMigrated;
   const database = new DatabaseSync(resolve(tempRoot, "catalog.sqlite"));
   database.prepare("UPDATE catalog_state SET json = ? WHERE id = 1").run(JSON.stringify(catalog));
   database.close();
   const reopened = new SessionStore(tempRoot);
   await reopened.load();
-  assert.equal(reopened.getReviewerSpecialistSettings().enabled, true);
+  assert.equal(reopened.getReviewerSpecialistSettings().enabled, false);
   const persisted = await readPersistedCatalog(tempRoot);
-  assert.equal(persisted.reviewerSpecialistEnabled, true);
-  assert.equal(persisted.reviewerSpecialistDefaultOnMigrated, true);
+  assert.equal(persisted.reviewerSpecialistEnabled, false);
+  assert.equal(reopened.getReviewerSpecialistSettings(oldSession.id).enabled, false);
+  assert.equal(reopened.getReviewerSpecialistSettings(inheritedSession.id).enabled, false);
+  assert.deepEqual(reopened.getSessionReviewerSpecialistSettings(inheritedSession.id), { automaticReviewEnabled: true, level: "quick" });
+  assert.deepEqual(reopened.getSessionReviewerSpecialistSettings(oldSession.id), { automaticReviewEnabled: false, level: "deep" });
+  assert.deepEqual(persisted.projects, catalog.projects);
+  assert.deepEqual(persisted.globalSettings, catalog.globalSettings);
 });
 
-test("intentional Reviewer opt-out survives reload after default-on migration", async (context) => {
+test("new Sessions use independent Reviewer defaults in existing and new Projects", async (context) => {
+  const tempRoot = resolve(process.cwd(), ".tmp", `reviewer-session-defaults-${Date.now()}-${process.pid}`);
+  context.after(() => rm(tempRoot, { force: true, recursive: true }));
+  const store = new SessionStore(tempRoot);
+  await store.load();
+  const existingProject = await store.createProject("Existing project");
+  await store.updateReviewerSpecialistSettings({ enabled: false });
+  const explicit = await store.createSession(existingProject.id, "Explicit choices", {}, {
+    reviewerSpecialistEnabled: false, reviewerAutomaticReviewEnabled: false, reviewerSpecialistLevel: "deep",
+  }, { allowUnconfiguredModel: true });
+  const projects = [existingProject, await store.createProject("New project")];
+  for (const project of projects) {
+    const session = await store.createSession(project.id, "New session", {}, {}, { allowUnconfiguredModel: true });
+    assert.equal(session.reviewerSpecialistEnabled, true);
+    assert.equal(store.getReviewerSpecialistSettings(session.id).enabled, true);
+    assert.deepEqual(store.getSessionReviewerSpecialistSettings(session.id), { automaticReviewEnabled: true, level: "quick" });
+    await store.updateSessionReviewerSpecialistSettings(session.id, { automaticReviewEnabled: false, level: "deep" });
+  }
+  const reopened = new SessionStore(tempRoot);
+  await reopened.load();
+  assert.equal(reopened.getReviewerSpecialistSettings().enabled, false);
+  assert.equal(reopened.getReviewerSpecialistSettings(explicit.id).enabled, false);
+  assert.deepEqual(reopened.getSessionReviewerSpecialistSettings(explicit.id), { automaticReviewEnabled: false, level: "deep" });
+  for (const session of projects.flatMap((project) => reopened.listSessions(project.id))) {
+    if (session.id === explicit.id) continue;
+    assert.equal(reopened.getReviewerSpecialistSettings(session.id).enabled, true);
+    assert.deepEqual(reopened.getSessionReviewerSpecialistSettings(session.id), { automaticReviewEnabled: false, level: "deep" });
+  }
+});
+
+test("intentional Reviewer opt-out survives reload", async (context) => {
   const tempRoot = resolve(process.cwd(), ".tmp", `reviewer-opt-out-${Date.now()}-${process.pid}`);
   context.after(() => rm(tempRoot, { force: true, recursive: true }));
   const store = new SessionStore(tempRoot);
@@ -652,7 +691,6 @@ test("intentional Reviewer opt-out survives reload after default-on migration", 
   assert.equal(store.getReviewerSpecialistSettings().enabled, true);
   await store.updateReviewerSpecialistSettings({ enabled: false });
   assert.equal(store.getReviewerSpecialistSettings().enabled, false);
-  assert.equal((await readPersistedCatalog(tempRoot)).reviewerSpecialistDefaultOnMigrated, true);
   const reopened = new SessionStore(tempRoot);
   await reopened.load();
   assert.equal(reopened.getReviewerSpecialistSettings().enabled, false);
