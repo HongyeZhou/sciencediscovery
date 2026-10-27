@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { canonical, validatePlan, verifyResults } from '../test/support/tagged/plan.mjs';
 import { realShards } from '../test/support/tagged/execution.mjs';
-import { isProviderFaultProblem } from '../test/support/tagged/provider-fault.mjs';
+import { isProviderFaultProblem, PROVIDER_FAULT } from '../test/support/tagged/provider-fault.mjs';
 import { collectSuite, renderSuite } from './biomni-gate.mjs';
 
 export function reconcile(plan, root) {
@@ -22,11 +22,23 @@ export function reconcile(plan, root) {
       // A valid failed shard still executed its cases. Retain those results so
       // suite accounting distinguishes FAIL from NOT_RUN while the gate fails.
       results.push(...summary.results);
-      // A shard whose only failures are transient gateway faults did not fail
-      // the product. It stays visible in the accounting and does not fail the
-      // gate; a product failure in the same shard still does.
-      const shardVerdict = verifyResults(workerPlan, summary.results);
-      if (summary.status !== 'PASS' && !(summary.status === 'PROVIDER_FAULT' && shardVerdict.exitCode === 0)) throw new Error('SHARD_FAILED');
+      // A shard whose cases only faulted at the model gateway is still valid
+      // evidence: the identity checks above apply, and its results are folded
+      // into the suite's accounting. It does not certify the suite — the
+      // suite's own accounting decides the exit code, and a remaining provider
+      // fault makes that exit non-zero. Turning it into an opaque shard
+      // failure instead would lose the provider-fault problems it carries.
+      // A product failure in the same shard still fails the shard.
+      if (summary.status !== 'PASS' && summary.status !== 'PROVIDER_FAULT') throw new Error('SHARD_FAILED');
+      // The shard's own claim has to agree with the results it carries: a
+      // shard cannot hide a fault behind a `PASS` it did not earn.
+      if ((summary.providerFaults ?? 0) !== verifyResults(workerPlan, summary.results).providerFaults) throw new Error('SHARD_RESULT_ACCOUNTING_MISMATCH');
+      // The audit codes a failed repeat leaves behind are not implied by the
+      // case results, so the suite's accounting takes them over: a repeat
+      // that did not work is still an unverified case.
+      for (const problem of summary.problems ?? []) {
+        if (isProviderFaultProblem(problem) && !problem.startsWith(`${PROVIDER_FAULT}: `)) errors.push(`${shard.name}: ${problem}`);
+      }
     } catch (error) { errors.push(`${shard.name}: ${error.code === 'ENOENT' ? 'SHARD_EVIDENCE_MISSING' : error.message}`); }
   }
   return verifyResults(plan, results, errors);
@@ -61,9 +73,14 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       verdict.biomni = { status: biomni.status, non_regression_certified: biomni.non_regression_certified, expected: biomni.expected, measured: biomni.measured, summary: biomni.summary };
     }
   } catch { verdict.problems.push('BIOMNI_GATE_EVIDENCE_OR_POLICY_INVALID'); }
-  // Only a product problem fails the gate. A provider fault stays visible in
-  // the verdict and its problems without failing the daily suite.
-  if (verdict.problems.some(problem => !isProviderFaultProblem(problem))) { verdict.status = 'FAIL'; verdict.exitCode = 1; }
+  // A provider fault stays distinguishable: it keeps its own status and its
+  // own problems, and it is never read as a product failure. It does not
+  // pass the gate either — a planned case that only faulted is unverified, so
+  // the suite exits non-zero. Only a product problem turns the verdict into a
+  // hard `FAIL`.
+  const productProblems = verdict.problems.filter(problem => !isProviderFaultProblem(problem));
+  if (productProblems.length) { verdict.status = 'FAIL'; verdict.exitCode = 1; }
+  else if (verdict.problems.some(problem => isProviderFaultProblem(problem))) { verdict.status = 'PROVIDER_FAULT'; verdict.exitCode = 1; }
   writeFileSync(join(root,'verdict.json'), JSON.stringify(verdict,null,2)+'\n');
   // Retain the existing dashboard artifact name and a single suite-level plan.
   // Only score-projected worker artifacts enter this assembly.

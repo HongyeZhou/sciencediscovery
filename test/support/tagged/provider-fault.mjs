@@ -34,8 +34,21 @@ export const PROVIDER_FAULT = 'PROVIDER_FAULT';
 
 /** The distinct problem code the accounting shows, never a plain `FAIL:`. */
 export const providerFaultProblem = key => `${PROVIDER_FAULT}: ${key}`;
+/**
+ * The audit codes a failed early repeat leaves behind. The repeat did not
+ * work because the same provider was still failing, so these belong to the
+ * provider-fault family and never read as a product failure.
+ */
+export const providerFaultRepeatFailed = code => `${PROVIDER_FAULT}_REPEAT_FAILED: ${code}`;
+export const providerFaultRepeatReportMissing = `${PROVIDER_FAULT}_REPEAT_REPORT_MISSING`;
+/**
+ * Whether a problem belongs to the provider-fault family: the soft class
+ * itself, and the audit codes a failed early repeat leaves behind. Both
+ * describe the gateway's outage, never the product's own failure.
+ */
 export const isProviderFaultProblem = problem =>
-  typeof problem === 'string' && problem.startsWith(`${PROVIDER_FAULT}: `);
+  typeof problem === 'string'
+  && (problem.startsWith(`${PROVIDER_FAULT}: `) || problem.startsWith(`${PROVIDER_FAULT}_`));
 
 /**
  * Server statuses, in the order they are recognised. A number only counts in

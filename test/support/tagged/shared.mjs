@@ -23,7 +23,7 @@ import { schema } from './tags.mjs';
 import { profiles, slices, nodeSources, nodeExtraSources, pythonProjects, pythonSources, pythonPlugins } from './profiles.mjs';
 import { preflight } from './environment.mjs';
 import { executionConfig, realShards, mockedShards } from './execution.mjs';
-import { PROVIDER_FAULT, retryableProviderFaults } from './provider-fault.mjs';
+import { PROVIDER_FAULT, retryableProviderFaults, providerFaultRepeatFailed, providerFaultRepeatReportMissing } from './provider-fault.mjs';
 import { checks } from './checks.mjs';
 import { planGroups, schedule, utWorkers, SWARM, SWARM_TAG } from './scheduler.mjs';
 import { startSwarm, withoutSwarm } from './swarm.mjs';
@@ -44,6 +44,13 @@ function run(command,args,env,log,cwd=root,{echo=false}={}) {
 }
 function python(project){return join(root,'services',project,'.venv/bin/python');}
 function projectEnv(env,project){return {...env,PYTHONPATH:[join(root,'services',project,'tests'),join(root,'services',project,'src')].join(':')};}
+/**
+ * How many cases are repeated when a whole batch faulted early. A batch that
+ * faults as a whole is a gateway outage, not a flaky case: repeating every
+ * case in it would re-run the suite against a provider that is already down.
+ * A couple of repeats are enough to tell whether the gateway recovered.
+ */
+const OUTAGE_PROBE_REPEATS=2;
 /**
  * Coverage is recorded by the run that gates, never by a second one: `--coverage`
  * instruments exactly this execution and changes nothing about what is selected.
@@ -376,23 +383,41 @@ export async function main(args=process.argv.slice(2)) {
       // One repeat for a case whose first attempt died early on a transient
       // gateway fault. The case runs on its own, so a product failure is never
       // repeated, and a case that got far is never repeated either. A repeat
-      // that does not work leaves the provider fault where it was.
+      // that does not work leaves the provider fault where it was — and is
+      // audited, so a failed repeat is not a console line nobody reads.
       const repeat=retryableProviderFaults(batchResults);
-      const repeatEntries=repeat.map(r=>batch.entries.find(e=>e.key===r.key)).filter(Boolean);
+      // A batch where every case faulted early is a gateway outage, not a
+      // flaky case. Repeating the whole batch would re-run the suite against a
+      // provider that is already down, so at most a couple of cases are
+      // repeated as a probe; the rest keep their provider fault, and the gate
+      // stays non-green either way.
+      const totalOutage=batchResults.length>0&&batchResults.every(r=>r.outcome===PROVIDER_FAULT);
+      const chosen=totalOutage?repeat.slice(0,OUTAGE_PROBE_REPEATS):repeat;
+      if(totalOutage&&chosen.length<repeat.length)console.log(`Repeating ${chosen.length} of ${repeat.length} faulted case(s): the whole batch faulted, which reads as an outage`);
+      const repeatEntries=chosen.map(r=>batch.entries.find(e=>e.key===r.key)).filter(Boolean);
       if(repeatEntries.length){
         const repeatPlan=join(outputDir,`playwright-${key}-retry-plan.json`);json(repeatPlan,subplan(plan,repeatEntries));
         const repeatReport=join(outputDir,`playwright-${key}-retry-results.json`);rmSync(repeatReport,{force:true});
         console.log(`Repeating ${repeatEntries.length} case(s) after a transient gateway fault: ${repeatEntries.map(e=>e.id).join(', ')}`);
         const again=await browserRun(batch,repeatPlan,repeatReport,`${key}-retry`);
+        // A repeat that did not work is recorded, not only printed: the case
+        // stays unverified and the run says why.
+        if(!again.data)errors.push(providerFaultRepeatReportMissing);
+        else if(again.code!==0)errors.push(providerFaultRepeatFailed(again.code));
         const repeated=new Map((again.data?.results??[]).map(r=>[r.key,r]));
         if(again.data?.errors?.length)console.log(`Gateway-fault repeat reported: ${again.data.errors.join('; ')}`);
         batchResults=batchResults.map(r=>repeated.has(r.key)?{...repeated.get(r.key),retriedAfterProviderFault:true}:r);
       }
-      // A worker whose only failures are provider faults did not fail the
-      // product, so its exit code is not a worker failure. A case that never
-      // reported is still a missing case, and the accounting says so.
-      const productFailures=batchResults.filter(r=>r.outcome==='FAIL');
-      const providerFaultOnly=first.code===1&&!productFailures.length&&batchResults.some(r=>r.outcome===PROVIDER_FAULT);
+      // The worker's exit code belongs to its first attempt, so it is paired
+      // with the results that attempt reported. A worker whose only failures
+      // were transient gateway faults did not fail the product: the outage is
+      // already accounted for under its own code, and the report exists. It
+      // is not an opaque worker failure on top of that — but it is not a pass
+      // either: the accounting exits non-zero while a provider fault remains.
+      // A missing report is an opaque failure and stays one.
+      const firstResults=first.data?.results??[];
+      const productFailures=firstResults.filter(r=>r.outcome==='FAIL');
+      const providerFaultOnly=first.code===1&&!productFailures.length&&firstResults.some(r=>r.outcome===PROVIDER_FAULT);
       if(first.code&&!providerFaultOnly)errors.push(`PLAYWRIGHT_WORKER_FAILED: ${first.code}`);
       results.push(...batchResults);
       if(first.data)errors.push(...first.data.errors);else errors.push('PLAYWRIGHT_REPORT_MISSING');
