@@ -346,7 +346,12 @@ no profile can turn an outage into a green required check.
 
 An authentication (401/403) or rate-limit (429) answer is a decision, not an
 outage, and is never soft-classified; neither is a semantic failure, a
-delivery miss or a timeout.
+delivery miss or a timeout. The provider context has to name the gateway
+itself: a product delivery failure that merely quotes a provider status — the
+words "provider", "llm", "gateway" or "upstream" beside a `500` — is the
+product's own failure and stays a `FAIL`. A delivery miss or an assertion
+diff is the product's own report in the first place, so it stays a `FAIL`
+even when it carries the provider's words with it.
 
 A case whose first attempt died early on such a fault is run once more, on
 its own. Only an attempt that failed within five minutes is repeated, so a

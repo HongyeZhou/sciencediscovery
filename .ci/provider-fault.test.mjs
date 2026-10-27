@@ -105,6 +105,24 @@ test('one unrelated line cannot turn a product failure into an outage', () => {
   assert.equal(detectProviderFaultFromErrors([]), null);
 });
 
+test('a product failure that quotes a provider status is never soft-classified', () => {
+  // "provider", "llm", "gateway" and "upstream" are the words any product
+  // text that quotes a provider status says too. They are not a provider
+  // context, so a delivery failure that mentions one stays a product failure.
+  assert.equal(detectProviderFault('delivery failed; provider said HTTP 500'), null);
+  assert.equal(detectProviderFault('upstream returned HTTP 503 while the run was still going'), null);
+  assert.equal(detectProviderFault('the llm gateway answered HTTP 500'), null);
+  assert.equal(detectProviderFault('the provider endpoint returned HTTP 502'), null);
+  // The product's own report of a delivery miss stays the product's own
+  // report, even when it carries the provider's words with it.
+  assert.equal(detectProviderFault(`${DELIVERY_MISS}; run_error=${GATEWAY_500}`), null);
+  assert.equal(detectProviderFault('Main run must complete and reference a readable nonempty final artifact; Expected: "passed"; Received: "failed"'), null);
+  // The gateway's own report is still a provider fault.
+  assert.equal(detectProviderFault(GATEWAY_500).code, 'provider-server-error');
+  assert.equal(detectProviderFault(GATEWAY_503).code, 'provider-server-error');
+  assert.equal(detectProviderFault('Error: Main run failed: ' + GATEWAY_500).code, 'provider-server-error');
+});
+
 test('the reporter records a live-model gateway fault apart from a product failure', t => {
   const { plan, written } = report(t, {
     title: 'DRB-75', tags: realCaseTags, status: 'failed', errors: [GATEWAY_500], duration: 9_300,
