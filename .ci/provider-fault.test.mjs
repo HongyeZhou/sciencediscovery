@@ -1,6 +1,7 @@
 // Copyright (C) 2026 Huawei Technologies Co., Ltd
 // SPDX-License-Identifier: Apache-2.0
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -9,7 +10,7 @@ import { createTest } from '../test/support/tagged/compat.mjs';
 import { createPlan, fileDigest, subplan, verifyResults } from '../test/support/tagged/plan.mjs';
 import { hostPlatform, hostArch } from '../test/support/tagged/environment.mjs';
 import { realShards } from '../test/support/tagged/execution.mjs';
-import { PROVIDER_FAULT, detectProviderFault, detectProviderFaultFromErrors, retryableProviderFaults } from '../test/support/tagged/provider-fault.mjs';
+import { PROVIDER_FAULT, detectProviderFault, detectProviderFaultFromErrors, retryableProviderFaults, providerFaultRepeatFailed, providerFaultRepeatReportMissing } from '../test/support/tagged/provider-fault.mjs';
 import TaggedReporter from '../test/support/tagged/playwright-reporter.mjs';
 import { reconcile } from './real-report.mjs';
 
@@ -150,7 +151,7 @@ test('the visible-gateway-error journey stays a mocked case', () => {
   assert.match(journey, /@model:mock/);
 });
 
-test('a provider fault is reported under its own code and does not fail the gate', () => {
+test('a provider fault is reported under its own code and does not pass the gate', () => {
   const plan = createPlan([identity('case-a', realTags)], {
     revision: 'candidate', targets: [target], execution: { backend: 'jiuwenswarm', model: 'generator', judge: null },
   });
@@ -159,11 +160,31 @@ test('a provider fault is reported under its own code and does not fail the gate
     key: entry.key, outcome: PROVIDER_FAULT, actualTarget: entry.target, actualBackend: entry.backend,
     providerFault: { code: 'provider-server-error', status: 503 },
   }]);
+  // Distinguishable from a product failure ...
   assert.equal(verdict.status, 'PROVIDER_FAULT');
-  assert.equal(verdict.exitCode, 0);
-  assert.equal(verdict.providerFaults, 1);
   assert.ok(verdict.problems.includes(`PROVIDER_FAULT: ${entry.key}`));
   assert.ok(!verdict.problems.includes(`FAIL: ${entry.key}`));
+  // ... and not a pass: the planned case is unverified.
+  assert.equal(verdict.exitCode, 1);
+  assert.equal(verdict.providerFaults, 1);
+  assert.equal(verdict.passed, 0);
+});
+
+test('a job whose cases all faulted stays a provider fault and still fails', () => {
+  const plan = createPlan([identity('case-a', realTags), identity('case-b', realTags)], {
+    revision: 'candidate', targets: [target], execution: { backend: 'jiuwenswarm', model: 'generator', judge: null },
+  });
+  const faulted = entry => ({ key: entry.key, outcome: PROVIDER_FAULT, actualTarget: entry.target, actualBackend: entry.backend });
+  const verdict = verifyResults(plan, plan.entries.map(faulted));
+  assert.equal(verdict.status, 'PROVIDER_FAULT');
+  assert.equal(verdict.exitCode, 1);
+  assert.equal(verdict.passed, 0);
+  assert.equal(verdict.failed, 0);
+  assert.equal(verdict.providerFaults, 2);
+  for (const entry of plan.entries) {
+    assert.ok(verdict.problems.includes(`PROVIDER_FAULT: ${entry.key}`));
+    assert.ok(!verdict.problems.includes(`FAIL: ${entry.key}`));
+  }
 });
 
 test('a mixed job keeps its passes as passes and still fails on a product failure', () => {
@@ -175,21 +196,30 @@ test('a mixed job keeps its passes as passes and still fails on a product failur
   const faulted = entry => ({ key: entry.key, outcome: PROVIDER_FAULT, actualTarget: entry.target, actualBackend: entry.backend });
   const failed = entry => ({ key: entry.key, outcome: 'FAIL', actualTarget: entry.target, actualBackend: entry.backend });
 
+  // A pass beside a provider fault stays a pass; the fault keeps its own code
+  // and the job does not pass.
   const mixed = verifyResults(plan, [passed(first), faulted(second)]);
   assert.equal(mixed.status, 'PROVIDER_FAULT');
-  assert.equal(mixed.exitCode, 0);
+  assert.equal(mixed.exitCode, 1);
   assert.equal(mixed.passed, 1);
   assert.equal(mixed.failed, 0);
   assert.equal(mixed.providerFaults, 1);
+  assert.ok(mixed.problems.includes(`PROVIDER_FAULT: ${second.key}`));
 
   const withProductFailure = verifyResults(plan, [passed(first), failed(second)]);
   assert.equal(withProductFailure.status, 'FAIL');
   assert.equal(withProductFailure.exitCode, 1);
   assert.equal(withProductFailure.passed, 1);
   assert.equal(withProductFailure.failed, 1);
+
+  // Only a run without a provider fault and without a product problem passes.
+  const clean = verifyResults(plan, [passed(first), passed(second)]);
+  assert.equal(clean.status, 'PASS');
+  assert.equal(clean.exitCode, 0);
+  assert.equal(clean.passed, 2);
 });
 
-test('the daily reconcile reports a provider fault without failing the suite', t => {
+test('the reconcile keeps a provider fault visible and does not pass the suite', t => {
   const plan = createPlan([identity('case-a', realTags), identity('case-b', realTags)], {
     revision: 'candidate', profile: 'daily', targets: [target], execution: { backend: 'jiuwenswarm', model: 'generator', judge: null },
   });
@@ -207,11 +237,64 @@ test('the daily reconcile reports a provider fault without failing the suite', t
   }
   const verdict = reconcile(plan, root);
   assert.equal(verdict.status, 'PROVIDER_FAULT');
-  assert.equal(verdict.exitCode, 0);
+  // The suite does not pass on a provider fault alone ...
+  assert.equal(verdict.exitCode, 1);
+  // ... the passes stay passes, and the fault stays visible under its own code
+  // instead of being turned into an opaque shard failure.
   assert.equal(verdict.passed, 1);
   assert.equal(verdict.providerFaults, 1);
   assert.ok(verdict.problems.some(problem => problem.startsWith('PROVIDER_FAULT:')));
   assert.ok(!verdict.problems.some(problem => problem.includes('SHARD_FAILED')));
+});
+
+test('the reconcile fails a suite whose cases all faulted, and keeps their rows', t => {
+  const plan = createPlan([identity('case-a', realTags), identity('case-b', realTags)], {
+    revision: 'candidate', profile: 'daily', targets: [target], execution: { backend: 'jiuwenswarm', model: 'generator', judge: null },
+  });
+  const root = directory(t);
+  for (const shard of realShards(plan)) {
+    const directory = join(root, `real-e2e-results-${shard.name}`, 'e2e-real/tagged');
+    mkdirSync(directory, { recursive: true });
+    const worker = subplan(plan, plan.entries.filter(entry => shard.keys.includes(entry.key)));
+    writeFileSync(join(directory, 'plan.json'), JSON.stringify(worker));
+    const results = worker.entries.map(entry => ({
+      key: entry.key, outcome: PROVIDER_FAULT, actualTarget: entry.target, actualBackend: entry.backend,
+      providerFault: { code: 'provider-server-error', status: 500 },
+    }));
+    writeFileSync(join(directory, 'summary.json'), JSON.stringify(verifyResults(worker, results)));
+  }
+  const verdict = reconcile(plan, root);
+  assert.equal(verdict.status, 'PROVIDER_FAULT');
+  assert.equal(verdict.exitCode, 1);
+  assert.equal(verdict.passed, 0);
+  assert.equal(verdict.providerFaults, 2);
+  assert.equal(verdict.executed, plan.entries.length);
+  for (const entry of plan.entries) {
+    assert.ok(verdict.problems.includes(`PROVIDER_FAULT: ${entry.key}`));
+    assert.ok(!verdict.problems.includes(`FAIL: ${entry.key}`));
+  }
+  assert.ok(!verdict.problems.some(problem => problem.includes('SHARD_FAILED')));
+});
+
+test('the reconcile passes a suite whose cases all passed', t => {
+  const plan = createPlan([identity('case-a', realTags), identity('case-b', realTags)], {
+    revision: 'candidate', profile: 'daily', targets: [target], execution: { backend: 'jiuwenswarm', model: 'generator', judge: null },
+  });
+  const root = directory(t);
+  for (const shard of realShards(plan)) {
+    const directory = join(root, `real-e2e-results-${shard.name}`, 'e2e-real/tagged');
+    mkdirSync(directory, { recursive: true });
+    const worker = subplan(plan, plan.entries.filter(entry => shard.keys.includes(entry.key)));
+    writeFileSync(join(directory, 'plan.json'), JSON.stringify(worker));
+    const results = worker.entries.map(entry => ({
+      key: entry.key, outcome: 'PASS', actualTarget: entry.target, actualBackend: entry.backend,
+    }));
+    writeFileSync(join(directory, 'summary.json'), JSON.stringify(verifyResults(worker, results)));
+  }
+  const verdict = reconcile(plan, root);
+  assert.equal(verdict.status, 'PASS');
+  assert.equal(verdict.exitCode, 0);
+  assert.equal(verdict.passed, plan.entries.length);
 });
 
 test('the daily reconcile still fails the suite on a product failure', t => {
@@ -242,4 +325,44 @@ test('only an early gateway fault is worth repeating', () => {
   assert.deepEqual(retryableProviderFaults([late]), []);
   assert.deepEqual(retryableProviderFaults([product]), []);
   assert.deepEqual(retryableProviderFaults([early, late, product]), [early]);
+});
+
+test('a failed repeat is audited and stays a provider fault, not a product failure', () => {
+  const plan = createPlan([identity('case-a', realTags)], {
+    revision: 'candidate', targets: [target], execution: { backend: 'jiuwenswarm', model: 'generator', judge: null },
+  });
+  const entry = plan.entries[0];
+  const passed = { key: entry.key, outcome: 'PASS', actualTarget: entry.target, actualBackend: entry.backend };
+  for (const problem of [providerFaultRepeatFailed(1), providerFaultRepeatReportMissing]) {
+    const verdict = verifyResults(plan, [passed], [problem]);
+    assert.equal(verdict.status, 'PROVIDER_FAULT');
+    assert.equal(verdict.exitCode, 1);
+    assert.ok(verdict.problems.includes(problem));
+    assert.ok(!verdict.problems.some(item => item.startsWith('FAIL:')));
+  }
+});
+
+test('the shared-plan summary does not report a faulted layer as green', t => {
+  const results = directory(t);
+  const layer = join(results, 'e2e-real');
+  mkdirSync(join(layer, 'tagged'), { recursive: true });
+  const summary = {
+    status: 'PROVIDER_FAULT', exitCode: 1, planDigest: 'a'.repeat(64),
+    planned: 2, executed: 2, passed: 1, failed: 0, skipped: 0, providerFaults: 1,
+  };
+  const report = (document) => {
+    writeFileSync(join(layer, 'tagged', 'summary.json'), JSON.stringify(document));
+    const env = { ...process.env, CI_RESULTS_DIR: results };
+    delete env.GITHUB_STEP_SUMMARY;
+    return spawnSync(process.execPath, [join(root, '.ci/tagged-summary.mjs')], { env, encoding: 'utf8' });
+  };
+  // A case that faulted is unverified: the layer does not report green, and
+  // the fault stays visible in the table.
+  const faulted = report(summary);
+  assert.equal(faulted.status, 1);
+  assert.match(faulted.stdout, /provider fault/);
+  assert.match(faulted.stdout, /\| 1 \|/);
+  // A layer whose cases all passed is still green.
+  const clean = report({ ...summary, status: 'PASS', exitCode: 0, passed: 2, providerFaults: 0 });
+  assert.equal(clean.status, 0);
 });

@@ -127,20 +127,25 @@ export function verifyResults(plan, results, errors = []) {
     if (seen.has(r.key)) problems.push(`DUPLICATE_RESULT: ${r.key}`);
     seen.set(r.key, r);
     // A provider fault is the gateway's outage, not the product's failure. It
-    // is reported under its own code and never counted as a failed case.
+    // is reported under its own code and never counted as a failed case — but
+    // it is an unverified case, and it does not pass the gate either.
     if (r.outcome === PROVIDER_FAULT) problems.push(providerFaultProblem(r.key));
     else if (r.outcome !== 'PASS') problems.push(`${r.outcome || 'INVALID_OUTCOME'}: ${r.key}`);
     if (canonical(r.actualTarget) !== canonical(expected.get(r.key).target)) problems.push(`TARGET_MISMATCH: ${r.key}`);
     if (expected.get(r.key).backend && r.actualBackend !== expected.get(r.key).backend) problems.push(`BACKEND_MISMATCH: ${r.key}`);
   }
   for (const key of expected.keys()) if (!seen.has(key)) problems.push(`NOT_RUN: ${key}`);
-  // A provider fault is visible but does not fail the gate on its own: the
-  // product neither ran nor failed to deliver in that case.
+  // A provider fault stays visible under its own code, and a product problem
+  // stays a product problem: the two are never conflated. But a planned case
+  // that only faulted is an unverified case, so it does not pass the gate
+  // either. A soft class is not a soft green: only a run without a single
+  // provider fault and without a single product problem exits 0.
   const productProblems = problems.filter(problem => !isProviderFaultProblem(problem));
+  const providerFaultProblems = problems.filter(problem => isProviderFaultProblem(problem));
   const providerFaults = [...seen.values()].filter(r => r.outcome === PROVIDER_FAULT).length;
   return {
-    status: productProblems.length ? 'FAIL' : providerFaults ? 'PROVIDER_FAULT' : 'PASS',
-    exitCode: productProblems.length ? 1 : 0,
+    status: productProblems.length ? 'FAIL' : providerFaultProblems.length ? 'PROVIDER_FAULT' : 'PASS',
+    exitCode: productProblems.length || providerFaultProblems.length ? 1 : 0,
     planDigest: plan.digest, planned: expected.size, reported: results.length,
     executed: [...seen.values()].filter(r => ["PASS", "FAIL", PROVIDER_FAULT].includes(r.outcome)).length,
     failed: [...seen.values()].filter(r => r.outcome === "FAIL").length,

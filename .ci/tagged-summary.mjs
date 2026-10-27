@@ -56,12 +56,15 @@ for (const layer of layers) {
   rows.push({ layer, ...summary });
   const { planned = 0, executed = 0, passed = 0, failed = 0, skipped = 0, providerFaults = 0 } = summary;
   // A provider fault is the model gateway's outage, not the product's
-  // failure. It stays visible in the problems below and does not fail the
-  // layer; a product failure in the same layer still does.
+  // failure, and the table keeps it visible under its own count. It is not a
+  // pass either: a planned case that only faulted is unverified, so the layer
+  // cannot report green. A product failure in the same layer still fails it
+  // as a product failure.
   if (summary.status !== "PASS" && summary.status !== "PROVIDER_FAULT") problems.push(`${layer}: status ${summary.status}`);
+  if (providerFaults > 0 || summary.status === "PROVIDER_FAULT") problems.push(`${layer}: ${providerFaults} provider fault(s) — an unverified case is not a pass`);
   if (planned === 0) problems.push(`${layer}: selected no test`);
   if (executed !== planned) problems.push(`${layer}: executed ${executed} of ${planned} planned`);
-  if (passed + providerFaults !== planned) problems.push(`${layer}: passed ${passed} of ${planned} planned`);
+  if (passed !== planned) problems.push(`${layer}: passed ${passed} of ${planned} planned`);
   if (failed > 0) problems.push(`${layer}: ${failed} failed`);
   if (skipped > 0) problems.push(`${layer}: ${skipped} skipped — a skip is not a pass`);
 }

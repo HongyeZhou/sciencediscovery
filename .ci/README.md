@@ -309,11 +309,11 @@ Both default to Python 3.14 independently of the product service environments;
 offline research UT check therefore exercises the same dependencies as real
 workers without model calls or gated dataset downloads.
 
-### Transient model-gateway faults in the daily suite
+### Transient model-gateway faults in the real-model suite
 
 A real-model case can fail because the configured provider answered with a
-server error, not because the product ran and did not deliver. The daily
-suite tells the two apart. A failure that carries a gateway status (500, 502,
+server error, not because the product ran and did not deliver. The suite
+tells the two apart. A failure that carries a gateway status (500, 502,
 503, 504) together with a provider marker — the gateway's own `181001`
 model-call code, `new_api_error`, `model_not_found`, "no available channel" —
 is recorded as `PROVIDER_FAULT` rather than `FAIL`:
@@ -323,20 +323,38 @@ is recorded as `PROVIDER_FAULT` rather than `FAIL`:
   `PASS`;
 - the accounting reports `PROVIDER_FAULT: <case>` instead of `FAIL: <case>`,
   and the suite's status is `PROVIDER_FAULT` rather than `FAIL`;
-- such a suite does not fail the daily gate: the product neither ran nor
-  failed to deliver in that case. The fault stays visible in the verdict, the
-  step summary and the artifacts.
+- the fault stays visible in the verdict, the step summary and the artifacts.
+
+**A soft classification is not a soft pass.** A planned case that only faulted
+is an unverified case: the product was never checked in it. The required
+real-E2E check — Daily, merge L3 and release L5 alike — therefore does **not**
+pass while a provider fault remains:
+
+| Outcome | Status | Exit code |
+| --- | --- | --- |
+| Every planned case passed | `PASS` | 0 |
+| A provider fault remains (no product failure) | `PROVIDER_FAULT` | non-zero |
+| A product failure | `FAIL` | non-zero |
+
+The two failure kinds stay apart in the accounting — a provider fault is never
+reported as a product `FAIL`, and a product failure is never softened into an
+outage — but neither one is a pass. The floor is the same in the worker, in
+the shard summary, in the suite reconcile and in the shared-plan summary, so
+no profile can turn an outage into a green required check.
 
 An authentication (401/403) or rate-limit (429) answer is a decision, not an
 outage, and is never soft-classified; neither is a semantic failure, a
-delivery miss or a timeout. A product failure in the same job still fails the
-gate exactly as before.
+delivery miss or a timeout.
 
 A case whose first attempt died early on such a fault is run once more, on
 its own. Only an attempt that failed within five minutes is repeated, so a
 long research case that got that far is never repeated, and a product failure
-is never repeated at all. The repeat keeps its own evidence directory, and the
-first attempt's record stays in the artifacts.
+is never repeated at all. When a whole batch faults early, the batch reads as
+an outage and only a couple of cases are repeated as a probe. The repeat keeps
+its own evidence directory, and the first attempt's record stays in the
+artifacts. A repeat that did not work is recorded in the accounting
+(`PROVIDER_FAULT_REPEAT_FAILED`, `PROVIDER_FAULT_REPEAT_REPORT_MISSING`)
+instead of only in the log: the case stays unverified and the run says why.
 
 ### L5 full-public benchmark and baseline candidate
 
