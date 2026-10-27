@@ -231,6 +231,31 @@ test("run_shell runs in the workspace when the model passes the workspace's host
   assert.deepEqual(seen, [".", "analysis"]);
 });
 
+test("run_shell missing or dual command/scriptPath returns retryable INVALID_TOOL_ARGUMENTS", async () => {
+  let executed = 0;
+  const tools = createWorkspaceTools(process.cwd(), {
+    enabledConnectorIds: [],
+    executePython: async () => { throw new Error("legacy tool must not run"); },
+    executeShell: async () => {
+      executed += 1;
+      throw new Error("run_shell must not execute without a single target");
+    },
+  });
+  const tool = tools.find((candidate) => candidate.name === "run_shell");
+  assert.ok(tool);
+
+  for (const args of [{}, { command: "true", scriptPath: "script.py" }] as const) {
+    const result = await tool.execute("shell-args", args as never);
+    assert.equal(result.isError, true);
+    const details = result.details as { ok: false; error: { code: string; retryable: boolean; message: string } };
+    assert.equal(details.error.code, "INVALID_TOOL_ARGUMENTS");
+    assert.equal(details.error.retryable, true);
+    assert.match(details.error.message, /exactly one of command or scriptPath/);
+    assert.match(details.error.message, /no run_python or run_r/);
+  }
+  assert.equal(executed, 0, "invalid argument shapes never reach the shell");
+});
+
 for (const selection of [
   { name: "legacy local default", localRunnerAllowed: undefined, ids: [] },
   { name: "local and remote", localRunnerAllowed: true, ids: ["runner-1"] },

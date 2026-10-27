@@ -1481,7 +1481,14 @@ export function createWorkspaceTools(workspaceRoot: string, options: WorkspaceTo
         + (options.shellExecutions ? " Foreground execution waits up to wait_ms (default 10000); background=true returns after acceptance. A wait deadline does not stop the command. Retain the returned Execution ID and use execution_status/logs/cancel; do not resubmit a running or unknown command." : ""),
       execute: async (toolCallId, params, signal, onProgress) => {
         if (Boolean(params.command) === Boolean(params.scriptPath)) {
-          throw new Error("Provide exactly one of command or scriptPath");
+          // Same contract as missing required task fields: a call that cannot
+          // run must return retryable INVALID_TOOL_ARGUMENTS, not a deep throw
+          // that surfaces as an opaque TOOL_EXECUTION_FAILED card.
+          return invalidToolArguments(
+            "Invalid run_shell arguments: provide exactly one of command or scriptPath. "
+            + "Python and R run through run_shell (there is no run_python or run_r tool). "
+            + "Example: command=\"python -c 'print(1)'\" or scriptPath=\"analysis.py\".",
+          );
         }
         let code = sandboxWorkspacePaths(workspaceRoot,
           [params.command?.trim() ?? "", ...(params.command ? params.arguments ?? [] : []).map(shellQuote)].join(" ").trim());

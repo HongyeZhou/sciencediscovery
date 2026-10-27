@@ -27,6 +27,7 @@ import {
 } from "./deferred-tools.js";
 import { ToolLoopGuard } from "./loop-guard.js";
 import { isRemoteContentTool, neutralizeUntrustedTags } from "./sanitize.js";
+import { retiredToolGuidance } from "./retired-tools.js";
 import type { AgentTool } from "./types.js";
 
 export interface ToolSpec {
@@ -343,8 +344,14 @@ export class ToolRegistry<TMessage extends RuntimeMessage> implements ToolDispat
       details = result.details;
       isError = false;
     } else if (!this.tools.has(call.name)) {
-      content = `Unknown tool: ${call.name}`;
-      details = { ok: false, error: { code: "UNKNOWN_TOOL", message: content, retryable: false } };
+      const retired = retiredToolGuidance(call.name);
+      if (retired) {
+        content = retired;
+        details = { ok: false, error: { code: "RETIRED_TOOL", message: retired, retryable: true } };
+      } else {
+        content = `Unknown tool: ${call.name}`;
+        details = { ok: false, error: { code: "UNKNOWN_TOOL", message: content, retryable: false } };
+      }
       isError = true;
     } else if (!this.toolIsAvailable(call.name)) {
       content = `Error: Tool '${call.name}' is not available under the current run capability policy.`;
