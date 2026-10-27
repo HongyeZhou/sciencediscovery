@@ -108,6 +108,7 @@ import { DEFAULT_MODEL_API_VARIANT, MODEL_API_VARIANTS } from "@sciencediscovery
 import {
   classifyScientificArtifact,
   createLocalSessionTitle,
+  DEFAULT_REVIEWER_SPECIALIST_SETTINGS,
   resolveScientificArtifactKind,
   UNTITLED_SESSION_TITLE,
 } from "@sciencediscovery/schema";
@@ -4989,7 +4990,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
               })}
               onRun={() => void runManualReviewerSpecialist()}
               onStop={() => void stopReviewerSpecialist()}
-              settings={reviewerSpecialistSettings}
+              settings={{ ...DEFAULT_REVIEWER_SPECIALIST_SETTINGS, ...reviewerSpecialistSettings, enabled: reviewerCapabilityEnabled }}
               stopping={stoppingReviewerSessionIds.has(session.id)}
             /></details> : null}
             {activeSessionId ? <AgentActivityPanel key={activeSessionId} client={client} focus={activityFocus} sessionId={activeSessionId} /> : null}

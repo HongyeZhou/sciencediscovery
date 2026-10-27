@@ -2078,7 +2078,7 @@ export const en = {
   "specialist.create": "Create specialist",
   "specialist.builtinSectionAria": "Built-in specialists",
   "specialist.reviewerName": "Reviewer Specialist",
-  "specialist.reviewerHint": "New sessions have Reviewer enabled independently. This switch controls older sessions; choose Quick/Deep per session.",
+  "specialist.reviewerHint": "New sessions have Reviewer enabled independently. This switch controls older sessions. Choose the level of Quick/Deep per Session.",
   "specialist.reviewerTurnOff": "Turn Reviewer Specialist off",
   "specialist.reviewerTurnOn": "Turn Reviewer Specialist on",
   "specialist.reviewerOnTitle": "Reviewer Specialist is On. Click to turn it Off.",
