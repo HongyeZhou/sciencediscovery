@@ -9,6 +9,8 @@ export function finalAnswer(run, messages) {
 }
 
 export function deliveryStatus(runStatus, delivered) {
+  // Active Runs are still in flight; do not classify them as delivery failure.
+  if (["queued", "running", "blocked"].includes(runStatus)) return "running";
   return delivered.length ? runStatus === "completed" ? "passed" : "partial" : "failed";
 }
 

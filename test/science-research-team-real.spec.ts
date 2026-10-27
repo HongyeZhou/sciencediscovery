@@ -139,10 +139,23 @@ test("TC-E2E-01 research team with custom Specialist and MCP signoff", { tag: ["
       terminal = stopped.status === "stopped";
     }
     metrics.generation_duration_ms = Date.now() - started;
+    metrics.budget_exceeded = metrics.run_status === "budget_exhausted";
+    metrics.cancel_requested = metrics.budget_exceeded;
+    // Session shutdown records cancel outcome in metrics.shutdown; HTTP status is not always available.
+    metrics.cancel_http_status = null;
+    // Persist timeout attribution before delivery collection can throw.
+    if (metrics.budget_exceeded) metrics.integration = "timed_out";
     await save("team-metrics.json", metrics);
     const delivery = await collectFinalDelivery(page, fixture.session.id, runId, metrics.initial_run_id);
     metrics.delivery = delivery;
-    metrics.integration = metrics.run_status === "budget_exhausted" && delivery.status === "passed" ? "partial" : delivery.status;
+    if (metrics.budget_exceeded) {
+      // Budget exhaustion stays timed_out even if cancellation raced to a terminal delivery.
+      metrics.integration = "timed_out";
+    } else if (delivery.status === "passed") {
+      metrics.integration = "passed";
+    } else {
+      metrics.integration = delivery.status;
+    }
     const required = requiredArtifacts(delivery.artifacts, ["evidence_brief.md"]);
     metrics.required_outputs = { missing: required.missing };
     if (required.missing.length && delivery.status === "passed") {
@@ -153,6 +166,9 @@ test("TC-E2E-01 research team with custom Specialist and MCP signoff", { tag: ["
     await save("team-metrics.json", metrics);
     children = await api<any[]>(`${prefix}/subagents`).catch(() => children);
     await save("team-children.json", children); await save("signoff-calls.json", checker.calls);
+    expect(metrics.budget_exceeded,
+      `Team run exceeded ${budget}ms budget after ${metrics.generation_duration_ms}ms; cancel requested=${metrics.cancel_requested}, HTTP=${metrics.cancel_http_status}, observed delivery=${delivery.status}, run=${delivery.run_status}`
+    ).toBe(false);
     expect(metrics.run_status, "A budget-expired generation is not a passed E2E, even if partial artifacts exist").not.toBe("budget_exhausted");
     expect(delivery.status, deliveryFailureMessage(delivery)).toBe("passed");
     expect(required.missing, "The final handoff must include the audited evidence brief").toEqual([]);
@@ -193,6 +209,7 @@ test("TC-E2E-01 research team with custom Specialist and MCP signoff", { tag: ["
       metrics.usage = await api(`${prefix}/usage`).catch(() => null);
       children = await api<any[]>(`${prefix}/subagents`).catch(() => children);
     }
+    // timed_out must stay distinct from delivery failure; only remap leftover running.
     if (metrics.integration === "running") metrics.integration = "failed";
     await save("team-metrics.json", metrics); await save("team-children.json", children); await save("signoff-calls.json", checker.calls);
     await info.attach("team-metrics", { path: info.outputPath("team-metrics.json"), contentType: "application/json" });
