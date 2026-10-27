@@ -30,7 +30,6 @@ This skill writes and executes Python/R code to process, transform, and analyze 
 - User asks for code-level methodology documentation alongside results (method justification, data traceability, key function calls, limitations)
 - User wants a multi-step analysis pipeline with re-runnable code (Python or R scripts) rather than ad-hoc one-off answers
 
-
 ## Python Package Installation
 
 If you need to install new Python packages, install them through the Tsinghua PyPI mirror for reliability:
