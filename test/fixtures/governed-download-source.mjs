@@ -7,7 +7,21 @@ import { sourcePdf } from './literature-source.mjs';
 
 const FIXTURE_ID = 'offline-governed-download-v1';
 const ARXIV_IDENTIFIER = '2401.00001';
-const ARXIV_PDF_URL = `https://arxiv.org/pdf/${ARXIV_IDENTIFIER}`;
+const ARXIV_IDENTIFIER_PATTERN = /^\d{4}\.\d{4,5}$/;
+
+/**
+ * The identifier the tool was asked for, so one invocation can offer the
+ * candidate of one paper and another one the candidate of a different paper
+ * of the same source: a Session-scoped download grant matches on the source,
+ * not on the file, and only a second candidate can show that.
+ */
+function requestedIdentifier(input) {
+  const identifier = String(input.identifier ?? ARXIV_IDENTIFIER);
+  if (!ARXIV_IDENTIFIER_PATTERN.test(identifier)) {
+    throw new Error(`Unsupported fixture identifier ${identifier}`);
+  }
+  return identifier;
+}
 
 /**
  * An arXiv source whose transport and artifact bytes stay on this machine: the
@@ -38,7 +52,7 @@ export function governedDownloadSource() {
     events,
     fixture: FIXTURE_ID,
     identifier: ARXIV_IDENTIFIER,
-    pdfUrl: ARXIV_PDF_URL,
+    pdfUrl: `https://arxiv.org/pdf/${ARXIV_IDENTIFIER}`,
     mcpTransport: {
       catalog: async () => catalog,
       reload: async () => catalog,
@@ -48,19 +62,20 @@ export function governedDownloadSource() {
         if (!toolId) throw new Error(`Unconfigured fixture tool ${request.toolName}`);
         const input = request.arguments ?? request.input ?? {};
         events.push({ input, kind: 'invoke', sourceId: source.manifest.id, timestamp: Date.now(), toolId });
+        const identifier = requestedIdentifier(input);
         const result = {
           artifacts: [{
             attribution: 'Offline fixture',
             expectedBytes: sourcePdf().byteLength,
             format: 'pdf',
-            id: `pdf-${ARXIV_IDENTIFIER}`,
+            id: `pdf-${identifier}`,
             kind: 'paper',
             license: 'CC0',
-            logicalName: `${ARXIV_IDENTIFIER}.pdf`,
+            logicalName: `${identifier}.pdf`,
             mimeType: 'application/pdf',
             sourceId: source.manifest.id,
-            sourceRecordId: ARXIV_IDENTIFIER,
-            sourceUrl: ARXIV_PDF_URL,
+            sourceRecordId: identifier,
+            sourceUrl: `https://arxiv.org/pdf/${identifier}`,
           }],
           attribution: 'Offline fixture',
           license: 'CC0',
@@ -84,7 +99,12 @@ export function governedDownloadSource() {
     },
     connectorFetch: async (input) => {
       const url = String(input instanceof Request ? input.url : input);
-      if (url !== ARXIV_PDF_URL) throw new Error(`Unexpected outbound fixture download: ${url}`);
+      const identifier = url.startsWith('https://arxiv.org/pdf/')
+        ? url.slice('https://arxiv.org/pdf/'.length)
+        : undefined;
+      if (!identifier || !ARXIV_IDENTIFIER_PATTERN.test(identifier)) {
+        throw new Error(`Unexpected outbound fixture download: ${url}`);
+      }
       events.push({ kind: 'download', timestamp: Date.now(), url });
       return new Response(sourcePdf(), {
         headers: { 'content-length': String(sourcePdf().byteLength), 'content-type': 'application/pdf' },
