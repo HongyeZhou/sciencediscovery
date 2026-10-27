@@ -26,7 +26,14 @@
  * The rules stay narrow on purpose. A fault must carry a server status *and*
  * a provider context, or name one of the gateway's own routing failures
  * outright. An authentication or rate-limit answer is a decision, not an
- * outage, and a failure with no provider context is the product's own.
+ * outage, and a failure with no provider context is the product's own. The
+ * provider's context has to name the gateway itself: a product delivery
+ * failure that merely quotes a provider status is the product's failure, and
+ * stays one.
+ *
+ * Naming a fault is not a pass. The accounting keeps the two apart and
+ * reports the fault as such, but a planned case that only faulted is an
+ * unverified case: the gate does not pass on it.
  */
 
 /** The outcome a provider fault carries in the tagged accounting. */
@@ -73,8 +80,24 @@ const SERVER_STATUS = [
  */
 const ROUTING_FAILURE = /\bno available channel\b|\bmodel_not_found\b|\bnew_api_error\b/i;
 
-/** Anything that places the failure at the model gateway rather than in the product. */
-const GATEWAY_CONTEXT = /\b181001\b|\bmodel call failed\b|\bopenai api\b|\bchat\/completions\b|\bllm\b|\bmodel provider\b|\bprovider\b|\bgateway\b|\bupstream\b/i;
+/**
+ * A provider context strong enough to place a server status at the gateway.
+ *
+ * Bare words — "provider", "llm", "gateway", "upstream" — are not context on
+ * their own: a product failure that quotes a provider status says exactly
+ * those words, and must not be soft-classified because of them. What counts
+ * is the gateway naming itself: its model-call code, the wording of a failed
+ * model call, the API it answers on.
+ */
+const GATEWAY_CONTEXT = /\b181001\b|\bmodel call failed\b|\bopenai api\b|\bchat\/completions\b/i;
+
+/**
+ * The product's own report: a delivery miss or an assertion diff. Such a
+ * text says what the product did with the answer, not what the provider
+ * answered, so a provider status quoted inside it is the product's failure
+ * to keep. It never soft-classifies.
+ */
+const PRODUCT_REPORT = /\bdelivery[ _-]?(?:status|failed|missed)\b|\bdelivered[ _-]?artifacts\b|\bmain run must (?:complete|reference)\b|\bexpected\s*:|\breceived\s*:|\bassertion\b/i;
 
 /** A decision by the provider, not an outage: never a transient fault. */
 const UNAUTHORIZED = /\b(?:401|403)\b|unauthoriz|forbidden|invalid\s+api[\s_-]?key|authentication\s+(?:error|failed)|permission\s+denied/i;
@@ -104,6 +127,9 @@ export function detectProviderFault(text) {
   if (typeof text !== 'string' || !text.trim()) return null;
   // An authentication or rate-limit answer is a decision, not an outage.
   if (UNAUTHORIZED.test(text) || RATE_LIMITED.test(text)) return null;
+  // A delivery miss or an assertion diff is the product's own report, even
+  // when it quotes a provider status: the product ran and did not deliver.
+  if (PRODUCT_REPORT.test(text)) return null;
   const routing = ROUTING_FAILURE.test(text);
   const status = serverStatus(text);
   // A status alone belongs to the product until something places it at the
