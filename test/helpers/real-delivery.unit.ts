@@ -330,10 +330,28 @@ test("delivery diagnostics distinguish completed and running runs without output
     const fake = api(status, "", "report", 200, { outputs: [] });
     const result = await collectFinalDelivery(fake.page, "s", "r");
     assert.equal(result.run_error, null);
-    assert.equal(result.status, "failed");
+    assert.equal(result.status, status === "running" ? "running" : "failed");
     const message = deliveryFailureMessage(result);
-    assert.ok(message.includes(`run_status=${status}; delivered_artifacts=0; run_error=none`));
+    assert.ok(message.includes(`delivery_status=${result.status}; run_status=${status}; delivered_artifacts=0; run_error=none`));
     assert.ok(!message.includes("timed_out"));
+  }
+});
+
+test("an unfinished run is not a failed delivery, with or without declared artifacts", async () => {
+  for (const status of ["queued", "running", "blocked"]) {
+    for (const outputs of [[], undefined]) {
+      const fake = api(status, "", "report", 200, outputs === undefined ? {} : { outputs });
+      const result = await collectFinalDelivery(fake.page, "s", "r");
+      assert.equal(result.status, "running");
+      assert.equal(result.run_status, status);
+    }
+  }
+});
+
+test("terminal runs with no declared artifact remain failed deliveries", async () => {
+  for (const status of ["completed", "failed", "cancelled", "interrupted"]) {
+    const fake = api(status, "", "report", 200, { outputs: [] });
+    assert.equal((await collectFinalDelivery(fake.page, "s", "r")).status, "failed");
   }
 });
 
