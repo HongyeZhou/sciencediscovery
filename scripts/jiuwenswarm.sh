@@ -190,12 +190,12 @@ cmd_setup() {
     )
   fi
   mkdir -p "$jw_data_dir"
+  printf 'sciencediscovery\n' > "$JIUWENSWARM_HOME/.sciencediscovery-owned"
   if [[ ! -d "$(instance_workspace)" ]]; then
     echo "Creating instance $jw_instance..." >&2
     jw jiuwenswarm-init --name "$jw_instance" >/dev/null
   fi
   apply_config
-  printf 'sciencediscovery\n' > "$JIUWENSWARM_HOME/.sciencediscovery-owned"
   echo "Done. Start it with: scripts/jiuwenswarm.sh start" >&2
 }
 

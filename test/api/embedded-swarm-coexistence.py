@@ -21,6 +21,7 @@ import asyncio
 import json
 import os
 import re
+import socket
 from pathlib import Path
 import subprocess
 import sys
@@ -76,6 +77,13 @@ def wrapper(root, action, **kwargs):
         result = command(root, [str(SOURCE / ".venv/bin/jiuwenswarm-start"), "--" + action, NAME], check=False)
         if action == "status" and not re.search(r"^Status:\s+running$", result.stdout, re.M):
             result.returncode = 1
+        if action == "status" and result.returncode == 0:
+            try:
+                for service in ("agent_server", "web", "gateway"):
+                    with socket.create_connection(("127.0.0.1", ports(root)[service]), timeout=1):
+                        pass
+            except OSError:
+                result.returncode = 1
         if kwargs.get("check", True):
             assert result.returncode == 0, result.stdout + result.stderr
         return result
@@ -198,6 +206,9 @@ try:
     try:
         start("standalone")
         standalone_before = snapshot("standalone")
+        invalid = command("embedded", ["bash", "scripts/jiuwenswarm.sh", "setup"], check=False,
+                          environment={**custom_env, "JIUWENSWARM_CONTEXT_WINDOW_TOKENS": "invalid"})
+        assert invalid.returncode != 0 and "must be a positive integer" in invalid.stderr
         for action in ("setup", "setup", "start", "status", "env"):
             command("embedded", ["bash", "scripts/jiuwenswarm.sh", action], environment=custom_env)
         assert (custom / ".sciencediscovery-owned").read_text().strip() == "sciencediscovery"
