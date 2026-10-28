@@ -64,3 +64,21 @@ test("direct capability probes preserve target workspace scope and caller cancel
   await assert.rejects(client.directExecutionCapability(controller.signal, remote), /abort/i);
   assert.equal(requests.length, 3, "an aborted probe must not reach the target");
 });
+
+test("RunnerClient authenticates health and learns the clock before later requests", async (context) => {
+  const remoteNow = Date.now() + 120_000;
+  const server = createServer((request, response) => {
+    assert.equal(request.headers.authorization, "Bearer test-token");
+    assert.equal(request.url, "/health");
+    response.writeHead(200, { "content-type": "application/json", date: new Date(remoteNow).toUTCString() });
+    response.end(JSON.stringify({ status: "ok", platform: "linux", runnerVersion: "fixture" }));
+  });
+  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+  context.after(() => new Promise<void>((done) => {
+    server.close(() => done());
+    server.closeAllConnections();
+  }));
+  const client = new RunnerClient(`http://127.0.0.1:${(server.address() as AddressInfo).port}`, "test-token");
+  assert.equal((await client.health()).runnerVersion, "fixture");
+  assert.ok(Math.abs(client.clockOffsetMs - 120_000) < 5_000);
+});
