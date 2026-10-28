@@ -960,22 +960,23 @@ export async function assertSandboxWorkspaceLinks(
   readOnlyWorkspaceRoot?: string,
   signal?: AbortSignal,
 ): Promise<void> {
-  const links = new Set<string>();
+  const links: Buffer[] = [];
   const writablePath = workspaceBindArguments(workspaceRoot, readOnlyWorkspaceRoot).chdir;
-  async function visit(host: string, sandbox: string): Promise<void> {
-    for (const entry of await readdir(host, { withFileTypes: true })) {
-      const path = resolve(host, entry.name);
-      const visible = `${sandbox}/${entry.name}`;
-      if (entry.isSymbolicLink()) links.add(visible);
+  const slash = Buffer.from("/");
+  async function visit(host: Buffer, sandbox: Buffer): Promise<void> {
+    for (const entry of await readdir(host, { withFileTypes: true, encoding: "buffer" })) {
+      const path = Buffer.concat([host, slash, entry.name]);
+      const visible = Buffer.concat([sandbox, slash, entry.name]);
+      if (entry.isSymbolicLink()) links.push(visible);
       else if (entry.isDirectory()) await visit(path, visible);
     }
   }
-  await visit(workspaceRoot, launch.sandbox === "seatbelt" ? workspaceRoot : writablePath);
+  await visit(Buffer.from(workspaceRoot), Buffer.from(launch.sandbox === "seatbelt" ? workspaceRoot : writablePath));
   if (readOnlyWorkspaceRoot) {
-    await visit(readOnlyWorkspaceRoot, launch.sandbox === "seatbelt" ? readOnlyWorkspaceRoot
-      : writablePath === "/workspace" ? "/parent_workspace" : "/workspace");
+    await visit(Buffer.from(readOnlyWorkspaceRoot), Buffer.from(launch.sandbox === "seatbelt" ? readOnlyWorkspaceRoot
+      : writablePath === "/workspace" ? "/parent_workspace" : "/workspace"));
   }
-  if (!links.size) return;
+  if (!links.length) return;
   signal?.throwIfAborted();
   // NUL-separated stdin keeps arbitrary filenames out of shell source and argv.
   const script = `while IFS= read -r -d '' path; do
@@ -999,7 +1000,7 @@ export async function assertSandboxWorkspaceLinks(
       child.once("error", reject);
       child.once("close", done);
     });
-    child.stdin.end([...links].join("\0") + "\0");
+    child.stdin.end(Buffer.concat(links.flatMap((path) => [path, Buffer.from([0])])));
     const code = await closed;
     signal?.throwIfAborted();
     if (code !== 0) throw new Error(stderr.trim() || "Sandbox workspace symlink validation did not complete");

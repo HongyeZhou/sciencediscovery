@@ -61,6 +61,7 @@ test("sandbox-visible absolute, relative, chained and runtime links remain usabl
   await symlink("/workspace/relative/values", resolve(workspaceRoot, "absolute"));
   await symlink("absolute", resolve(workspaceRoot, "chain"));
   await symlink("/usr/bin/bash", resolve(workspaceRoot, "bash"));
+  await symlink("data/values", Buffer.concat([Buffer.from(`${workspaceRoot}/`), Buffer.from([0xff])]));
   const result = await executeShell(config, { ...request, code: "cat chain; ./bash -c 'printf runtime'" });
   assert.equal(result.exitCode, 0, result.stderr);
   assert.equal(result.stdout, "real dataruntime");
