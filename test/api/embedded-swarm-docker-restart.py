@@ -16,6 +16,7 @@
 """Verify the documented Docker bind mount survives a container restart.
 
 Run: SCIENCE_AGENT_IMAGE=sciencediscovery:local python3 test/api/embedded-swarm-docker-restart.py
+Repeat with SWARM_DOCKER_CUSTOM_HOME=1 to verify the explicit persisted override.
 
 E2E-META
 Purpose: Retain embedded Swarm identity/config/sessions across a Docker restart.
@@ -48,12 +49,16 @@ STANDALONE = REPORT / "standalone"
 DATA.mkdir()
 STANDALONE.mkdir()
 PROJECT = "sd-restart-" + REPORT.name.rsplit("-", 1)[-1]
+CUSTOM = os.environ.get("SWARM_DOCKER_CUSTOM_HOME") == "1"
+RUNTIME = "/app/data/custom-sd-runtime" if CUSTOM else "/app/data/.home"
 with socket.socket() as listener:
     listener.bind(("127.0.0.1", 0))
     PORT = listener.getsockname()[1]
 ENV = {**os.environ, "SCIENCE_AGENT_IMAGE": os.environ.get("SCIENCE_AGENT_IMAGE", "sciencediscovery:local"),
        "SCIENCE_AGENT_DATA_HOST_DIR": str(DATA), "SCIENCE_AGENT_UID": str(os.getuid()),
        "SCIENCE_AGENT_GID": str(os.getgid()), "SCIENCE_AGENT_PUBLISH_PORT": str(PORT), "SCIENTIFIC_ENVS": "0"}
+ENV.update(SCIENCE_AGENT_JIUWENSWARM_OVERRIDES="1" if CUSTOM else "0",
+           JIUWENSWARM_HOME=RUNTIME if CUSTOM else "/standalone")
 OVERRIDE = REPORT / "compose.json"
 OVERRIDE.write_text(json.dumps({"services": {"sciencediscovery": {
     "volumes": [f"{STANDALONE}:/standalone"],
@@ -86,7 +91,7 @@ def compose(*args, **kwargs):
 def inside(script):
     # docker exec does not inherit exports made by the entrypoint's shell.
     return compose("exec", "-T", "sciencediscovery", "bash", "-ec",
-                   'export HOME=/app/data/.home JIUWENSWARM_HOME=/app/data/.home '
+                   f'export HOME=/app/data/.home JIUWENSWARM_HOME={RUNTIME} '
                    'JIUWENSWARM_ROOT=/app/data/jiuwenswarm SCIENCE_AGENT_JIUWENSWARM_OVERRIDES=1; ' + script)
 
 
@@ -130,16 +135,17 @@ try:
     identity = inside("printf '%s\\n' \"$HOME\"; scripts/jiuwenswarm.sh env")
     assert identity.splitlines()[0] == "/app/data/.home", identity
     gateway = next(line.split("=", 1)[1] for line in identity.splitlines() if "GATEWAY_URL=" in line)
-    workspace = DATA / ".home/.jiuwenswarm-instances/sciencediscovery"
-    registry = DATA / ".home/.jiuwenswarm/instances.yaml"
+    runtime = DATA / Path(RUNTIME).relative_to("/app/data")
+    workspace = runtime / ".jiuwenswarm-instances/sciencediscovery"
+    registry = runtime / ".jiuwenswarm/instances.yaml"
     registry_before = registry.read_bytes()
-    assert b"/app/data/.home/.jiuwenswarm-instances/sciencediscovery" in registry_before
+    assert f"{RUNTIME}/.jiuwenswarm-instances/sciencediscovery".encode() in registry_before
     config = workspace / "config/config.yaml"
     marker = "# SD persisted-volume restart marker: " + PROJECT
     config.write_text(config.read_text() + "\n" + marker + "\n")
     created = rpc("session.create", {"mode": "react", "persist_session": True})["session_id"]
     assert created in json.dumps(rpc("session.list"))
-    steps.append("1. PASS: embedded registry/workspace use /app/data/.home; persisted session and config marker created.")
+    steps.append(f"1. PASS: embedded registry/workspace use {RUNTIME}; persisted session and config marker created.")
     inside('HOME=/standalone JIUWENSWARM_HOME=/standalone JIUWENSWARM_DATA_DIR=/standalone/.jiuwenswarm '
            '/opt/sciencediscovery/jiuwenswarm/src/.venv/bin/jiuwenswarm-init --name sciencediscovery >/dev/null')
     standalone_before = snapshot(STANDALONE)
@@ -165,6 +171,7 @@ finally:
     (REPORT / "report.md").write_text(f"# Docker embedded Swarm restart: {verdict}\n\nDriver SHA: {sha}\n\n"
         f"Product image source SHA: {os.environ.get('SWARM_IMAGE_REVISION', 'UNVERIFIED; exploratory run')}\n\n"
         f"Image: {ENV['SCIENCE_AGENT_IMAGE']} ({image_id})\n\nProject: {PROJECT}; published loopback port: {PORT}\n\n"
+        f"Runtime root: {RUNTIME}; explicit override: {CUSTOM}\n\n"
         "Command: SCIENCE_AGENT_IMAGE=<built image> python3 test/api/embedded-swarm-docker-restart.py\n\n"
         + "\n\n".join(steps) + "\n\nStandalone config/state were co-tested; a live standalone service was not started.\n")
     print(f"{verdict}: {REPORT / 'report.md'}", flush=True)
