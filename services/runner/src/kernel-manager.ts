@@ -31,6 +31,7 @@ import type { EgressGatewayRegistry } from "./egress-gateway.js";
 import {
   DEFAULT_MAX_OUTPUT_BYTES,
   DEFAULT_MAX_WORKSPACE_BYTES,
+  assertSandboxWorkspaceLinks,
   RESOURCE_LIMIT_MODE,
   RUNNER_VERSION,
   environmentPrefixBindArguments,
@@ -416,6 +417,7 @@ export class KernelManager {
       throw new Error("Persistent kernel Session-Agent identity cannot be reused with different workspace mounts");
     }
 
+    await assertSandboxWorkspaceLinks(this.config, kernel.launch, workspaceRoot, readOnlyWorkspaceRoot, signal);
     const before = await workspaceSnapshot(workspaceRoot);
     const startedAt = new Date().toISOString();
     let checkingQuota = false;
