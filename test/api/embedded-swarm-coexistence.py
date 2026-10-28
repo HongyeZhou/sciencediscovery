@@ -53,6 +53,7 @@ def command(root, arguments, *, check=True, environment=None):
         env.update(HOME=str(REPORT / "user"), SCIENCE_AGENT_JIUWENSWARM_OVERRIDES="0",
                    JIUWENSWARM_HOME=str(roots["standalone"]), JIUWENSWARM_SRC="/foreign/install",
                    JIUWENSWARM_ROOT="/foreign/data", JIUWENSWARM_DATA_DIR=str(roots["standalone"]),
+                   JIUWENSWARM_GATEWAY_URL="ws://foreign:1/tui", JIUWENSWARM_MGMT_URL="ws://foreign:2/ws",
                    JIUWENSWARM_CONTEXT_WINDOW_TOKENS="1234", AGENT_SERVER_URL="ws://foreign:1",
                    OPENAI_API_KEY="standalone-marker", JIUWENSWARM_CONFIG="/foreign/config.yaml")
     env.update(environment or {})
@@ -190,6 +191,25 @@ try:
         stop(first)
         record(f"3. PASS ({second} stopped first): sibling stays live; selected instance stops.")
     assert (roots["embedded"] / f"jiuwenswarm-{NAME}.log").is_file()
+    custom = REPORT / "custom-sd-runtime"
+    custom_env = {"SCIENCE_AGENT_JIUWENSWARM_OVERRIDES": "1", "JIUWENSWARM_HOME": str(custom),
+                  "JIUWENSWARM_SRC": str(SOURCE), "JIUWENSWARM_ROOT": str(REPORT / "install-state"),
+                  "JIUWENSWARM_CONTEXT_WINDOW_TOKENS": "32768"}
+    try:
+        start("standalone")
+        standalone_before = snapshot("standalone")
+        for action in ("setup", "setup", "start", "status", "env"):
+            command("embedded", ["bash", "scripts/jiuwenswarm.sh", action], environment=custom_env)
+        assert (custom / ".sciencediscovery-owned").read_text().strip() == "sciencediscovery"
+        config = yaml.safe_load((custom / ".jiuwenswarm-instances" / NAME / "config/config.yaml").read_text())
+        assert config["react"]["context_engine_config"]["context_window_tokens"] == 32768
+        command("embedded", ["bash", "scripts/jiuwenswarm.sh", "stop"], environment=custom_env)
+        wrapper("standalone", "status")
+        assert snapshot("standalone") == standalone_before
+        record("4. PASS: explicit fresh SD root supports repeated setup/start/status/env/stop and SD config changes without changing or stopping standalone.")
+    finally:
+        command("embedded", ["bash", "scripts/jiuwenswarm.sh", "stop"], environment=custom_env, check=False)
+        stop("standalone")
     verdict = "PASS"
 except (Exception, KeyboardInterrupt) as error:
     if "BLOCKED:" in str(error):
