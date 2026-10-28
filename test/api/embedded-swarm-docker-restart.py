@@ -84,7 +84,10 @@ def compose(*args, **kwargs):
 
 
 def inside(script):
-    return compose("exec", "-T", "sciencediscovery", "bash", "-ec", script)
+    # docker exec does not inherit exports made by the entrypoint's shell.
+    return compose("exec", "-T", "sciencediscovery", "bash", "-ec",
+                   'export HOME=/app/data/.home JIUWENSWARM_HOME=/app/data/.home '
+                   'JIUWENSWARM_ROOT=/app/data/jiuwenswarm; ' + script)
 
 
 def ready():
@@ -135,7 +138,7 @@ try:
     created = rpc("session.create", {"mode": "react", "persist_session": True})["session_id"]
     assert created in json.dumps(rpc("session.list"))
     steps.append("1. PASS: embedded registry/workspace use /app/data/.home; persisted session and config marker created.")
-    inside('HOME=/standalone JIUWENSWARM_HOME=/standalone '
+    inside('HOME=/standalone JIUWENSWARM_HOME=/standalone JIUWENSWARM_DATA_DIR=/standalone/.jiuwenswarm '
            '/opt/sciencediscovery/jiuwenswarm/src/.venv/bin/jiuwenswarm-init --name sciencediscovery >/dev/null')
     standalone_before = snapshot(STANDALONE)
     assert standalone_before, "Standalone fixture is empty"
