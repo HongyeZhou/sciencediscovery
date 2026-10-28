@@ -20,6 +20,7 @@ Reports: .tmp/embedded-swarm-*/report.md and per-command logs, preserved on all 
 import asyncio
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -72,7 +73,7 @@ def wrapper(root, action, **kwargs):
                 f"export JIUWENSWARM_GATEWAY_URL=ws://127.0.0.1:{ports(root)['gateway']}/tui\n"
                 f"export JIUWENSWARM_MGMT_URL=ws://127.0.0.1:{ports(root)['web']}/ws\n", "")
         result = command(root, [str(SOURCE / ".venv/bin/jiuwenswarm-start"), "--" + action, NAME], check=False)
-        if action == "status" and "Status: running" not in result.stdout:
+        if action == "status" and not re.search(r"^Status:\s+running$", result.stdout, re.M):
             result.returncode = 1
         if kwargs.get("check", True):
             assert result.returncode == 0, result.stdout + result.stderr
