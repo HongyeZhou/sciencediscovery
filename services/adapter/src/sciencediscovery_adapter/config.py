@@ -47,15 +47,19 @@ class Settings:
         env = dict(os.environ if env is None else env)
         port = int(env.get("SCIENCE_AGENT_PORT", "4310"))
         legacy_port = int(env.get("SCIENCE_AGENT_LEGACY_PORT", str(port + 100)))
+        overrides = env.get("SCIENCE_AGENT_JIUWENSWARM_OVERRIDES") == "1"
+        executor = "jiuwenswarm" if env.get("SCIENCE_AGENT_EXECUTOR", "").strip() == "jiuwenswarm" else "native"
+        if executor == "jiuwenswarm" and (not overrides or not env.get("JIUWENSWARM_GATEWAY_URL") or not env.get("JIUWENSWARM_MGMT_URL")):
+            raise ValueError("JiuwenSwarm requires explicit SD-owned endpoints; start with the SD launcher or set SCIENCE_AGENT_JIUWENSWARM_OVERRIDES=1 and both endpoint URLs")
         return cls(
             host=env.get("SCIENCE_AGENT_HOST", "127.0.0.1"),
             port=port,
             legacy_url=env.get("SCIENCE_AGENT_LEGACY_URL", f"http://127.0.0.1:{legacy_port}").rstrip("/"),
-            gateway_url=env.get("JIUWENSWARM_GATEWAY_URL", "ws://127.0.0.1:19001/tui"),
-            mgmt_url=env.get("JIUWENSWARM_MGMT_URL", "ws://127.0.0.1:19000/ws"),
+            gateway_url=env.get("JIUWENSWARM_GATEWAY_URL", "ws://127.0.0.1:19001/tui") if overrides else "ws://127.0.0.1:19001/tui",
+            mgmt_url=env.get("JIUWENSWARM_MGMT_URL", "ws://127.0.0.1:19000/ws") if overrides else "ws://127.0.0.1:19000/ws",
             public_url=env.get("SCIENCE_AGENT_ADAPTER_PUBLIC_URL", f"http://127.0.0.1:{port}").rstrip("/"),
             agent_token=env.get("SCIENCE_AGENT_ADAPTER_TOKEN", ""),
             tool_timeout_s=int(env.get("SCIENCE_AGENT_ADAPTER_TOOL_TIMEOUT_S", "3600")),
             api_token=env.get("SCIENCE_AGENT_AUTH_TOKEN", "").strip(),
-            executor="jiuwenswarm" if env.get("SCIENCE_AGENT_EXECUTOR", "").strip() == "jiuwenswarm" else "native",
+            executor=executor,
         )
