@@ -327,9 +327,13 @@ export function SetupWizard({
           getHealth(client),
           getSettings(client).catch(() => undefined),
         ]);
+        // Public health has no `runner`; treat that as unchecked (needs token),
+        // not failed. With a token the client already sends, map readiness.
         return {
           api: true,
-          runner: health.runner?.execution?.ready === true ? true : null,
+          runner: health.runner === undefined
+            ? null
+            : health.runner?.execution?.ready === true,
           model: Boolean(settings?.effective?.modelId),
           ok: true,
         };
