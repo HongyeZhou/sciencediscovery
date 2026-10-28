@@ -2151,7 +2151,7 @@ test("a runner started for an SSH tunnel listens on a private socket and opens n
   assert.equal(server.address(), socketPath);
   assert.equal((await stat(socketPath)).mode & 0o777, 0o600);
   const health = await new Promise<RunnerHealth>((resolveBody, reject) => {
-    const request = httpRequest({ path: "/health", socketPath }, (response) => {
+    const request = httpRequest({ path: "/health", socketPath, headers: { authorization: "Bearer runner-test-token" } }, (response) => {
       let body = "";
       response.on("data", (chunk: Buffer) => { body += chunk.toString("utf8"); });
       response.once("end", () => resolveBody(JSON.parse(body) as RunnerHealth));
@@ -2176,7 +2176,7 @@ test("a runner started with a deep data directory still offers network access", 
   context.after(() => rm(dirname(socketPath), { force: true, recursive: true }));
 
   const health = await new Promise<RunnerHealth>((resolveBody, reject) => {
-    const request = httpRequest({ path: "/health", socketPath }, (response) => {
+    const request = httpRequest({ path: "/health", socketPath, headers: { authorization: "Bearer runner-test-token" } }, (response) => {
       let body = "";
       response.on("data", (chunk: Buffer) => { body += chunk.toString("utf8"); });
       response.once("end", () => resolveBody(JSON.parse(body) as RunnerHealth));
