@@ -81,6 +81,10 @@ interface PythonRunResult {
   stderr: string;
 }
 
+function embeddedEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(baseEnv).filter(([key]) => !key.startsWith("JIUWENSWARM_")));
+}
+
 /** One entry-point call: `<bundled python> -c "<module>.main()"`, argv set to what the console script would have gotten. */
 function runEntryPoint(
   paths: JiuwenSwarmPaths,
@@ -97,8 +101,9 @@ sys.exit(main() or 0)
   return new Promise((resolveRun) => {
     const child = spawn(paths.pythonBinary, ["-c", script, ...args], {
       env: {
-        ...baseEnv,
+        ...embeddedEnv(baseEnv),
         HOME: paths.home,
+        JIUWENSWARM_HOME: paths.home,
         JIUWENSWARM_DATA_DIR: paths.dataDir,
         PYTHONPATH: paths.sitePackages,
       },
@@ -165,8 +170,9 @@ sys.exit(main() or 0)
     args: ["-c", script],
     cwd: paths.home,
     env: {
-      ...baseEnv,
+      ...embeddedEnv(baseEnv),
       HOME: paths.home,
+      JIUWENSWARM_HOME: paths.home,
       JIUWENSWARM_DATA_DIR: paths.dataDir,
       // Python loads sitecustomize from a PYTHONPATH entry itself. Point at the adapter package
       // directory so its guarded startup hook applies JiuwenSwarm's MCP timeout patch before
@@ -230,7 +236,7 @@ export function adapterServiceDefinition(
     args: ["-m", "sciencediscovery_adapter.server"],
     cwd: paths.home,
     env: {
-      ...baseEnv,
+      ...embeddedEnv(baseEnv),
       PYTHONPATH: paths.adapterSitePackages,
       SCIENCE_AGENT_HOST: settings.host,
       SCIENCE_AGENT_PORT: String(settings.publicPort),
