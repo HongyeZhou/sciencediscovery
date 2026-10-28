@@ -85,6 +85,12 @@ function embeddedEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return Object.fromEntries(Object.entries(baseEnv).filter(([key]) => !key.startsWith("JIUWENSWARM_")));
 }
 
+function runtimeEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const allowed = new Set(["PATH", "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"]);
+  return Object.fromEntries(Object.entries(baseEnv).filter(([key]) => allowed.has(key)));
+}
+
 /** One entry-point call: `<bundled python> -c "<module>.main()"`, argv set to what the console script would have gotten. */
 function runEntryPoint(
   paths: JiuwenSwarmPaths,
@@ -101,7 +107,7 @@ sys.exit(main() or 0)
   return new Promise((resolveRun) => {
     const child = spawn(paths.pythonBinary, ["-c", script, ...args], {
       env: {
-        ...embeddedEnv(baseEnv),
+        ...runtimeEnv(baseEnv),
         HOME: paths.home,
         JIUWENSWARM_HOME: paths.home,
         JIUWENSWARM_DATA_DIR: paths.dataDir,
@@ -170,7 +176,7 @@ sys.exit(main() or 0)
     args: ["-c", script],
     cwd: paths.home,
     env: {
-      ...embeddedEnv(baseEnv),
+      ...runtimeEnv(baseEnv),
       HOME: paths.home,
       JIUWENSWARM_HOME: paths.home,
       JIUWENSWARM_DATA_DIR: paths.dataDir,
@@ -241,6 +247,7 @@ export function adapterServiceDefinition(
       SCIENCE_AGENT_HOST: settings.host,
       SCIENCE_AGENT_PORT: String(settings.publicPort),
       SCIENCE_AGENT_LEGACY_PORT: String(settings.legacyPort),
+      SCIENCE_AGENT_JIUWENSWARM_OVERRIDES: "1",
       JIUWENSWARM_GATEWAY_URL: `ws://127.0.0.1:${settings.endpoints.gatewayPort}/tui`,
       JIUWENSWARM_MGMT_URL: `ws://127.0.0.1:${settings.endpoints.webPort}/ws`,
     },

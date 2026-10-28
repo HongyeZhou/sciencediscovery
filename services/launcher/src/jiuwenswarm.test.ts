@@ -67,7 +67,7 @@ describe("jiuwenswarmServiceDefinition", () => {
     });
     const service = jiuwenswarmServiceDefinition(paths, {
       JIUWENSWARM_HOME: "/standalone", JIUWENSWARM_CONFIG: "/standalone/config.yaml",
-      JIUWENSWARM_DATA_DIR: "/standalone/data", KEEP_ME: "retained",
+      JIUWENSWARM_DATA_DIR: "/standalone/data", OPENAI_API_KEY: "standalone-secret", PATH: "/usr/bin",
     });
     assert.equal(service.command, "/cache/payload/abc/python/bin/python3");
     assert.ok(service.args[0] === "-c" && service.args[1]?.includes("jiuwenswarm.start_services"));
@@ -79,7 +79,8 @@ describe("jiuwenswarmServiceDefinition", () => {
     assert.equal(service.env.HOME, "/data/jiuwenswarm-home");
     assert.equal(service.env.JIUWENSWARM_HOME, "/data/jiuwenswarm-home");
     assert.equal(service.env.JIUWENSWARM_CONFIG, undefined);
-    assert.equal(service.env.KEEP_ME, "retained");
+    assert.equal(service.env.OPENAI_API_KEY, undefined);
+    assert.equal(service.env.PATH, "/usr/bin");
     assert.equal(service.env.JIUWENSWARM_DATA_DIR, "/data/jiuwenswarm-data");
     assert.equal(service.healthUrl, undefined, "its ports are not known until it reports them");
   });

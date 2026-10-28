@@ -36,16 +36,27 @@ REPORT = Path(tempfile.mkdtemp(prefix="embedded-swarm-", dir=REPO / ".tmp"))
 SOURCE = Path(os.environ.get("JIUWENSWARM_SRC", REPO / ".sciencediscovery-data/jiuwenswarm/src")).resolve()
 NAME = "sciencediscovery"
 BASE = {**os.environ, "JIUWENSWARM_SRC": str(SOURCE), "JIUWENSWARM_INSTANCE": NAME,
+        "SCIENCE_AGENT_JIUWENSWARM_OVERRIDES": "1",
         "JIUWENSWARM_ROOT": str(REPORT / "install-state")}
 BASE.pop("JIUWENSWARM_DATA_DIR", None)
 roots = {name: REPORT / name for name in ("standalone", "embedded")}
+roots["embedded"] = REPORT / "user/.sciencediscovery/jiuwenswarm"
 steps = []
 children = []
 
 
-def command(root, arguments, *, check=True):
+def command(root, arguments, *, check=True, environment=None):
+    env = {**BASE, "JIUWENSWARM_HOME": str(roots[root])}
+    if root == "embedded":
+        # Default SD startup must ignore a complete inherited standalone setup.
+        env.update(HOME=str(REPORT / "user"), SCIENCE_AGENT_JIUWENSWARM_OVERRIDES="0",
+                   JIUWENSWARM_HOME=str(roots["standalone"]), JIUWENSWARM_SRC="/foreign/install",
+                   JIUWENSWARM_ROOT="/foreign/data", JIUWENSWARM_DATA_DIR=str(roots["standalone"]),
+                   JIUWENSWARM_CONTEXT_WINDOW_TOKENS="1234", AGENT_SERVER_URL="ws://foreign:1",
+                   OPENAI_API_KEY="standalone-marker", JIUWENSWARM_CONFIG="/foreign/config.yaml")
+    env.update(environment or {})
     result = subprocess.run(arguments, cwd=REPO,
-                            env={**BASE, "JIUWENSWARM_HOME": str(roots[root])},
+                            env=env,
                             capture_output=True, text=True, timeout=210)
     (REPORT / f"{len(list(REPORT.glob('*-command.log'))):03d}-command.log").write_text(
         f"{root}: {' '.join(arguments)}\nexit={result.returncode}\n{result.stdout}\n{result.stderr}")
@@ -55,6 +66,17 @@ def command(root, arguments, *, check=True):
 
 
 def wrapper(root, action, **kwargs):
+    if root == "standalone":
+        if action == "env":
+            return subprocess.CompletedProcess([], 0,
+                f"export JIUWENSWARM_GATEWAY_URL=ws://127.0.0.1:{ports(root)['gateway']}/tui\n"
+                f"export JIUWENSWARM_MGMT_URL=ws://127.0.0.1:{ports(root)['web']}/ws\n", "")
+        result = command(root, [str(SOURCE / ".venv/bin/jiuwenswarm-start"), "--" + action, NAME], check=False)
+        if action == "status" and "Status: running" not in result.stdout:
+            result.returncode = 1
+        if kwargs.get("check", True):
+            assert result.returncode == 0, result.stdout + result.stderr
+        return result
     return command(root, ["bash", "scripts/jiuwenswarm.sh", action], **kwargs)
 
 
@@ -113,15 +135,21 @@ def record(text):
 verdict = "FAIL"
 try:
     assert (SOURCE / ".venv/bin/jiuwenswarm-start").is_file(), "BLOCKED: missing pinned installation"
+    assert (REPO / ".sciencediscovery-data/jiuwenswarm/src/.venv/bin/jiuwenswarm-start").is_file(), "BLOCKED: default SD installation is required to verify inherited install overrides are ignored"
     command("standalone", [str(SOURCE / ".venv/bin/jiuwenswarm-init"), "--name", NAME])
     config = workspace("standalone") / "config/config.yaml"
     config.write_text(config.read_text().replace("progressive_tool_enabled: false", "progressive_tool_enabled: true"))
     before = snapshot("standalone")
+    refused = command("embedded", ["bash", "scripts/jiuwenswarm.sh", "setup"], check=False,
+                      environment={"SCIENCE_AGENT_JIUWENSWARM_OVERRIDES": "1", "JIUWENSWARM_SRC": str(SOURCE)})
+    assert refused.returncode != 0 and "Refusing unowned" in refused.stderr
+    assert snapshot("standalone") == before
     wrapper("embedded", "setup")
     wrapper("embedded", "setup")
     assert snapshot("standalone") == before
     assert "progressive_tool_enabled: false" in (workspace("embedded") / "config/config.yaml").read_text()
     record("1. PASS: repeated embedded setup leaves standalone registry/configuration unchanged.")
+    record("1a. PASS: inherited install/home/config controls are ignored; explicit adoption of unowned standalone data is refused.")
 
     # Both were initialized while stopped, so they may have selected identical
     # ports. Starting the second must detect occupancy and persist new ports.
@@ -145,6 +173,13 @@ try:
             assert created[root] in listing, listing
             other = "embedded" if root == "standalone" else "standalone"
             assert created[other] not in listing, listing
+        # A standalone settings edit must not change SD's active configuration,
+        # endpoint identity, or session visibility while both services are live.
+        embedded_before = snapshot("embedded")
+        standalone_config = workspace("standalone") / "config/config.yaml"
+        standalone_config.write_text(standalone_config.read_text() + "\n# standalone settings changed\n")
+        assert snapshot("embedded") == embedded_before
+        assert created["embedded"] in json.dumps(asyncio.run(session("embedded", "session.list")))
         record(f"2. PASS ({first} first): independent live PIDs, ports, endpoints and session lists.")
         wrapper("embedded", "start")  # idempotent while both are live
         stop(second)

@@ -87,7 +87,7 @@ def inside(script):
     # docker exec does not inherit exports made by the entrypoint's shell.
     return compose("exec", "-T", "sciencediscovery", "bash", "-ec",
                    'export HOME=/app/data/.home JIUWENSWARM_HOME=/app/data/.home '
-                   'JIUWENSWARM_ROOT=/app/data/jiuwenswarm; ' + script)
+                   'JIUWENSWARM_ROOT=/app/data/jiuwenswarm SCIENCE_AGENT_JIUWENSWARM_OVERRIDES=1; ' + script)
 
 
 def ready():
@@ -120,8 +120,10 @@ def snapshot(root):
 
 
 verdict = "FAIL"
+image_id = "unavailable"
 try:
-    command(["docker", "image", "inspect", ENV["SCIENCE_AGENT_IMAGE"]])
+    metadata = json.loads(command(["docker", "image", "inspect", ENV["SCIENCE_AGENT_IMAGE"]]))[0]
+    image_id = metadata["Id"]
     compose("up", "-d", "--no-build", "--pull", "never")
     ready()
     container = compose("ps", "-q", "sciencediscovery")
@@ -160,8 +162,9 @@ finally:
     compose("logs", "--no-color", check=False)
     compose("down", "--timeout", "30", check=False)
     sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()
-    (REPORT / "report.md").write_text(f"# Docker embedded Swarm restart: {verdict}\n\nSHA: {sha}\n\n"
-        f"Image: {ENV['SCIENCE_AGENT_IMAGE']}\n\nProject: {PROJECT}; published loopback port: {PORT}\n\n"
+    (REPORT / "report.md").write_text(f"# Docker embedded Swarm restart: {verdict}\n\nDriver SHA: {sha}\n\n"
+        f"Product image source SHA: {os.environ.get('SWARM_IMAGE_REVISION', 'UNVERIFIED; exploratory run')}\n\n"
+        f"Image: {ENV['SCIENCE_AGENT_IMAGE']} ({image_id})\n\nProject: {PROJECT}; published loopback port: {PORT}\n\n"
         "Command: SCIENCE_AGENT_IMAGE=<built image> python3 test/api/embedded-swarm-docker-restart.py\n\n"
         + "\n\n".join(steps) + "\n\nStandalone config/state were co-tested; a live standalone service was not started.\n")
     print(f"{verdict}: {REPORT / 'report.md'}", flush=True)
