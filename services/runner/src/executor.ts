@@ -952,6 +952,63 @@ export async function prepareSandboxLaunch(
   return launch;
 }
 
+/** Check link targets in the execution namespace, never by dereferencing host data. */
+export async function assertSandboxWorkspaceLinks(
+  config: SandboxRuntimeConfig,
+  launch: SandboxLaunch,
+  workspaceRoot: string,
+  readOnlyWorkspaceRoot?: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const links = new Set<string>();
+  const writablePath = workspaceBindArguments(workspaceRoot, readOnlyWorkspaceRoot).chdir;
+  async function visit(host: string, sandbox: string): Promise<void> {
+    for (const entry of await readdir(host, { withFileTypes: true })) {
+      const path = resolve(host, entry.name);
+      const visible = `${sandbox}/${entry.name}`;
+      if (entry.isSymbolicLink()) links.add(visible);
+      else if (entry.isDirectory()) await visit(path, visible);
+    }
+  }
+  await visit(workspaceRoot, launch.sandbox === "seatbelt" ? workspaceRoot : writablePath);
+  if (readOnlyWorkspaceRoot) {
+    await visit(readOnlyWorkspaceRoot, launch.sandbox === "seatbelt" ? readOnlyWorkspaceRoot
+      : writablePath === "/workspace" ? "/parent_workspace" : "/workspace");
+  }
+  if (!links.size) return;
+  signal?.throwIfAborted();
+  // NUL-separated stdin keeps arbitrary filenames out of shell source and argv.
+  const script = `while IFS= read -r -d '' path; do
+    if ! test -e "$path" || ! test -r "$path"; then
+      printf 'Workspace symlink %q is not readable in the sandbox. Copy or upload the real data into the workspace, or use workspace_transfer between managed workspaces; replace the link with a workspace-relative link to that data.\\n' "$path" >&2
+      exit 78
+    fi
+  done`;
+  const child = await spawnSandboxProcess(config, { ...launch, commandPrefix: [] },
+    [sandboxCommandPath(launch, "/usr/bin/bash", "/bin/bash"), "--noprofile", "--norc", "-c", script], "baseline");
+  let stderr = "";
+  child.stderr.on("data", (chunk: Buffer) => { stderr = truncateToBudget(stderr + chunk.toString(), 8192); });
+  child.stdout.resume();
+  child.stdin.on("error", () => { /* An early rejection can close stdin before all links are sent. */ });
+  const abort = () => { killSandboxProcess(child); };
+  const timer = setTimeout(abort, 30_000);
+  signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted) abort();
+  try {
+    const closed = new Promise<number | null>((done, reject) => {
+      child.once("error", reject);
+      child.once("close", done);
+    });
+    child.stdin.end([...links].join("\0") + "\0");
+    const code = await closed;
+    signal?.throwIfAborted();
+    if (code !== 0) throw new Error(stderr.trim() || "Sandbox workspace symlink validation did not complete");
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
+  }
+}
+
 /** Host path for a command or injected runtime, preserving Linux mount paths. */
 export function sandboxCommandPath(launch: SandboxLaunch, linuxPath: string, hostPath: string): string {
   return launch.sandbox === "seatbelt" ? hostPath : linuxPath;
@@ -1095,6 +1152,7 @@ export async function executePython(
     workspaceBindArgs: workspaceBinds.args,
     workspaceRoot,
   });
+  await assertSandboxWorkspaceLinks(config, launch, workspaceRoot, readOnlyWorkspaceRoot, signal);
   const commandArguments = [
     runtime
       ? sandboxCommandPath(
@@ -1230,6 +1288,7 @@ export async function executeShell(
     workspaceBindArgs: workspaceBinds.args,
     workspaceRoot,
   });
+  await assertSandboxWorkspaceLinks(config, launch, workspaceRoot, readOnlyWorkspaceRoot, signal);
   const commandArguments = [
     sandboxCommandPath(launch, "/usr/bin/bash", "/bin/bash"),
     "--noprofile",

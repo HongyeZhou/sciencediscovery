@@ -32,6 +32,21 @@ for later tracing; late record updates do not replace the latest saved file.
 
 `workspace_transfer` discovers permitted Workspace IDs and explicitly starts, lists, queries or cancels transfers. Copies retain their source snapshot and per-file outcomes. Cancellation or partial failure keeps successfully committed files; byte progress alone does not prove publication. Local↔remote and parent↔child copies share this mechanism. No automatic mirror or implicit handoff replay occurs. Only files present in the local owned Workspace may be declared as Artifacts; remote output must first be copied back. Copying alone does not declare an Artifact.
 
+## Importing task data
+
+Use workspace-relative paths for task data. On Linux, the sandbox mounts the Session workspace at
+`/workspace`; a host path such as `/workspace/NatureBench/data` refers to a different location inside
+that sandbox. An absolute host symlink does not grant access to its target. Before executing user code,
+the Runner rejects workspace symlinks whose targets are missing or unreadable inside the sandbox,
+with the link path and instructions for importing the data. This check also applies to reused kernels.
+
+Upload the real files, or copy them into a workspace-owned directory on the Runner host before starting
+the command. For example, an operator can copy the dataset to `<session-workspace>/nb_data/`, remove
+the external link, and use `nb_data/` directly or a relative link such as `naturebench_data -> nb_data`.
+The product does not automatically copy external symlink targets. Use `workspace_transfer` for files
+already in another managed Workspace; it does not import arbitrary host directories. After correcting
+the data, retry the computation and verify its real outputs instead of substituting synthetic data.
+
 ## Environment changes
 
 Use `environment_create`, `environment_install` and `environment_uninstall` to manage packages. The creation language selects initial tools, not a permanent restriction: conda can add Python or R, after which pip or CRAN/Bioconductor can operate in that same environment. Updates change the managed prefix in place without cloning every Revision. Execution resolves the latest state by environment ID and records the actual Revision used. Rebuilding a historical environment is not exposed to the Agent.
