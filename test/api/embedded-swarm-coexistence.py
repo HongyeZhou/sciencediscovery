@@ -103,7 +103,7 @@ def ports(root):
 def snapshot(root):
     return {str(p.relative_to(roots[root])): p.read_bytes() for p in (
         roots[root] / ".jiuwenswarm/instances.yaml", workspace(root) / "config/config.yaml",
-        workspace(root) / "config/.env")}
+        workspace(root) / "config/.env", *workspace(root).glob("agent/workspace/skills/standalone-marker/*"))}
 
 
 def start(root):
@@ -148,11 +148,21 @@ try:
     assert (REPO / ".sciencediscovery-data/jiuwenswarm/src/.venv/bin/jiuwenswarm-start").is_file(), "BLOCKED: default SD installation is required to verify inherited install overrides are ignored"
     command("standalone", [str(SOURCE / ".venv/bin/jiuwenswarm-init"), "--name", NAME])
     config = workspace("standalone") / "config/config.yaml"
-    config.write_text(config.read_text().replace("progressive_tool_enabled: false", "progressive_tool_enabled: true"))
+    standalone_settings = yaml.safe_load(config.read_text())
+    standalone_settings["progressive_tool_enabled"] = True
+    standalone_settings["react"]["agent_name"] = "standalone-marker-agent"
+    standalone_settings["react"]["max_iterations"] = 7
+    standalone_settings["models"]["defaults"][0]["model_client_config"].update(
+        model_name="standalone-marker-model", api_base="http://127.0.0.1:9/v1", api_key="disposable-marker")
+    config.write_text(yaml.safe_dump(standalone_settings, allow_unicode=True))
+    skill = workspace("standalone") / "agent/workspace/skills/standalone-marker/SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("---\nname: standalone-marker\ndescription: Disposable standalone-only marker.\n---\nStandalone marker.\n")
     before = snapshot("standalone")
-    refused = command("embedded", ["bash", "scripts/jiuwenswarm.sh", "setup"], check=False,
-                      environment={"SCIENCE_AGENT_JIUWENSWARM_OVERRIDES": "1", "JIUWENSWARM_SRC": str(SOURCE)})
-    assert refused.returncode != 0 and "Refusing unowned" in refused.stderr
+    for action in ("setup", "start", "status", "env", "stop"):
+        refused = command("embedded", ["bash", "scripts/jiuwenswarm.sh", action], check=False,
+                          environment={"SCIENCE_AGENT_JIUWENSWARM_OVERRIDES": "1", "JIUWENSWARM_SRC": str(SOURCE)})
+        assert refused.returncode != 0 and "Refusing unowned" in refused.stderr
     assert snapshot("standalone") == before
     wrapper("embedded", "setup")
     wrapper("embedded", "setup")
@@ -187,8 +197,14 @@ try:
         # endpoint identity, or session visibility while both services are live.
         embedded_before = snapshot("embedded")
         standalone_config = workspace("standalone") / "config/config.yaml"
-        standalone_config.write_text(standalone_config.read_text() + "\n# standalone settings changed\n")
+        standalone_settings = yaml.safe_load(standalone_config.read_text())
+        standalone_settings["react"]["agent_name"] = "changed-standalone-marker-agent"
+        standalone_settings["models"]["defaults"][0]["model_client_config"]["model_name"] = "changed-standalone-marker-model"
+        standalone_config.write_text(yaml.safe_dump(standalone_settings, allow_unicode=True))
+        skill.write_text(skill.read_text() + "\nChanged standalone skill.\n")
         assert snapshot("embedded") == embedded_before
+        assert not (workspace("embedded") / "agent/workspace/skills/standalone-marker").exists()
+        assert "standalone-marker" not in (workspace("embedded") / "config/config.yaml").read_text()
         assert created["embedded"] in json.dumps(asyncio.run(session("embedded", "session.list")))
         record(f"2. PASS ({first} first): independent live PIDs, ports, endpoints and session lists.")
         wrapper("embedded", "start")  # idempotent while both are live
