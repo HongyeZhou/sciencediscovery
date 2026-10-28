@@ -535,6 +535,7 @@ function compareSkillPaths(left: { path: string }, right: { path: string }): num
 export function validateSkillPackage(
   sourceFiles: ReadonlyMap<string, Buffer>,
   options: {
+    allowLegacyDescription?: boolean;
     directoryName?: string;
     readOnly?: boolean;
     revision?: number;
@@ -568,8 +569,8 @@ export function validateSkillPackage(
   if (options.directoryName !== undefined && name !== options.directoryName) {
     throw validationError(`SKILL.md name ${name} must match package directory ${options.directoryName}`);
   }
-  const description = parsed.frontmatter.description;
-  if (typeof description !== "string" || !description.trim()) {
+  const description = typeof parsed.frontmatter.description === "string" ? parsed.frontmatter.description : "";
+  if (!options.allowLegacyDescription && !description.trim()) {
     throw validationError("description must be a non-empty string");
   }
   const metadata = normalizeMetadata(parsed.frontmatter.metadata);
@@ -852,7 +853,7 @@ export class SkillCatalog {
   private async loadManaged(id: string, revision: number): Promise<ManagedPackage> {
     const root = this.revisionRoot(id, revision);
     const files = await readPackageDirectory(resolve(root, "package"));
-    const loaded = validateSkillPackage(files, { directoryName: id, revision });
+    const loaded = validateSkillPackage(files, { allowLegacyDescription: true, directoryName: id, revision });
     let createdAt = new Date(0).toISOString();
     let provenance: SkillVersionProvenance = { source: "manual" };
     try {
