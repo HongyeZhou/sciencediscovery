@@ -83,7 +83,7 @@ export function settledExecutionRuns<T extends RankedRun>(runs: readonly T[]): T
   for (const run of runs) {
     if (!isSettledExecutionStatus(run.status)) continue;
     const current = latest.get(run.id);
-    if (!current || later(current, run)) latest.set(run.id, run);
+    if (!current || isEarlierThan(current, run)) latest.set(run.id, run);
   }
   return [...latest.values()];
 }
