@@ -61,7 +61,6 @@ import { buildSeatbeltProfile, canonicalPath, seatbeltPwdShim, seatbeltWorkspace
 // [windows-desktop] Windows has no SIGKILL/process-group semantics; child
 // termination goes through the platform facade (posix: child.kill passthrough,
 // win32: taskkill /T /F). See #482.
-// termination goes through the platform facade (posix: child.kill passthrough,`n// win32: taskkill /T /F). See #482.
 import { terminateTree } from "./platform/index.js";
 import { RunnerSkillPackages } from "./skill-packages.js";
 
