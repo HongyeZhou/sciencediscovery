@@ -172,7 +172,15 @@ export async function workspaceSnapshot(workspaceRoot: string): Promise<Map<stri
   const snapshot = new Map<string, string>();
 
   async function visit(directory: string): Promise<void> {
-    for (const entry of await readdir(directory, { withFileTypes: true })) {
+    // This is a live metadata/quota scan, not the committed CAS snapshot. Writers
+    // may atomically rename files or remove a child directory after enumeration.
+    // A vanished child contributes no current bytes; genuine I/O/permission
+    // errors and an unavailable workspace root must still stop the execution.
+    const entries = await readdir(directory, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
+      if (directory !== workspaceRoot && error.code === "ENOENT") return [];
+      throw error;
+    });
+    for (const entry of entries) {
       const fullPath = resolve(directory, entry.name);
       if (entry.isSymbolicLink()) continue;
       if (entry.isDirectory()) {
@@ -180,12 +188,21 @@ export async function workspaceSnapshot(workspaceRoot: string): Promise<Map<stri
         continue;
       }
       if (!entry.isFile()) continue;
-      const metadata = await stat(fullPath);
+      const metadata = await stat(fullPath).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return undefined;
+        throw error;
+      });
+      if (!metadata) continue;
       snapshot.set(relative(workspaceRoot, fullPath).split(sep).join("/"), `${metadata.size}:${metadata.mtimeMs}`);
     }
   }
 
   await visit(workspaceRoot);
+  // Do not mistake removal of the whole workspace during the scan for an empty
+  // workspace merely because all of its enumerated children disappeared.
+  if (!(await stat(workspaceRoot)).isDirectory()) {
+    throw Object.assign(new Error("Workspace root must remain a directory during the scan"), { code: "ENOTDIR", path: workspaceRoot });
+  }
   return snapshot;
 }
 
@@ -815,6 +832,7 @@ export function buildSandboxLaunch(options: {
   const env: Record<string, string> = {
     HOME: "/tmp",
     PATH: options.npu ? `/usr/local/bin:${options.pathEnv}` : options.pathEnv,
+    PYTHONUNBUFFERED: "1",
   };
   // CANN's operator compiler is imported as ordinary Python, so its search path
   // has to join PYTHONPATH rather than replace whatever the environment set.
@@ -898,7 +916,7 @@ function launchEnvironment(options: {
   skillRoots?: SandboxSkillRoots;
   temp?: string;
 }): Record<string, string> {
-  const env: Record<string, string> = { HOME: options.home, PATH: options.pathEnv };
+  const env: Record<string, string> = { HOME: options.home, PATH: options.pathEnv, PYTHONUNBUFFERED: "1" };
   if (options.temp) {
     env.TMPDIR = options.temp;
     env.TMP = options.temp;
@@ -1549,7 +1567,7 @@ export async function executeDirectShell(
   const startedAt = new Date().toISOString();
   // Do not inject Runner service credentials into the process environment. Host
   // filesystem/network access is still unrestricted and is disclosed at consent.
-  const env = { PATH: "/usr/bin:/bin", HOME: userInfo().homedir, LANG: "C.UTF-8" };
+  const env = { PATH: "/usr/bin:/bin", HOME: userInfo().homedir, LANG: "C.UTF-8", PYTHONUNBUFFERED: "1" };
   const launch: SandboxLaunch = { args: [], chdir: cwd, commandPrefix: [], env };
   const result = await runSandboxed(config, launch, [], request.code,
     executionTimeoutMs(request.executionTimeoutMs, config.execTimeoutMs), workspaceRoot, signal,

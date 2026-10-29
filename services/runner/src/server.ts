@@ -79,7 +79,7 @@ import { KernelManager } from "./kernel-manager.js";
 import { SessionEnvProfileStore } from "./session-env-profile.js";
 import { ShellSessionManager } from "./shell-session-manager.js";
 import { agentExecutionKey, KeyedTaskQueue, requestAgentExecutionKey } from "./agent-execution.js";
-import { ExecutionManager } from "./execution-manager.js";
+import { ExecutionManager, ExecutionManagerError } from "./execution-manager.js";
 import { committedWorkspaceSnapshot, publishWorkspaceFile, RefStore, streamSnapshotFile, VersionStore, withWorkspaceMutation,
   workspaceSnapshotFiles, type AgentStateRef, type SnapshotFile } from "@sciencediscovery/cas";
 import { HostNpuJobBroker } from "./npu-broker.js";
@@ -464,7 +464,9 @@ export function createRunnerServer(
   });
   const executorConfig: RunnerConfig = { ...config, npuDeviceProbe: probeRequestedNpuDevices };
   const executionQueues = new KeyedTaskQueue();
-  const managedExecutions = new ExecutionManager(config.dataDir);
+  const managedExecutions = new ExecutionManager(config.dataDir, detail => {
+    logger.warn("execution_resources_quarantined", { ...detail });
+  });
   const workspaceVersions = new VersionStore(config.dataDir);
   const seenExecutions = new Map<string, number>();
   const activeExecutions = new Map<string, RunnerExecutionStatus>();
@@ -556,6 +558,8 @@ export function createRunnerServer(
           cgroupMode: RESOURCE_LIMIT_MODE,
           cgroupRoot: "",
           executionAuth: "bearer+hmac-sha256",
+          ...managedExecutions.identity,
+          capabilities: { executionRecoveryVersion: 1 },
           executionUser,
           executionTimeoutMs: config.execTimeoutMs,
           maxFileBytes: MAX_RUNNER_FILE_BYTES,
@@ -997,7 +1001,7 @@ export function createRunnerServer(
         if (direct !== Boolean(execution.directAuthorization)) throw new Error("Execution mode does not match endpoint");
         if (!direct) execution.executionTimeoutMs = 0; // waiting deadlines are a client concern, not process lifetime
         execution.maxOutputBytes ??= config.maxOutputBytes;
-        const accepted = managedExecutions.start(execution, (signal, log) => direct
+        const accepted = managedExecutions.submit(execution, (signal, log) => direct
           ? executeDirectShell(executorConfig, execution, signal, log)
           : execution.environmentId
           ? environmentStore?.withRuntime(execution.environmentId, (runtime) => {
@@ -1005,7 +1009,7 @@ export function createRunnerServer(
               return executeShell(executorConfig, execution, signal, undefined, gateways, runtime, log, environmentStore);
             }) ?? Promise.reject(new Error("Scientific environments are unavailable"))
           : executeShell(executorConfig, execution, signal, undefined, gateways, undefined, log, environmentStore));
-        sendJson(response, 202, accepted);
+        sendJson(response, accepted.accepted ? 202 : 200, accepted.execution);
         return;
       }
       if (request.method === "POST" && url.pathname === "/execute-shell") {
@@ -1019,6 +1023,7 @@ export function createRunnerServer(
         const execution = JSON.parse(body) as ShellExecutionRequest;
         requireEphemeralExecution(execution);
         await resolveExecutionWorkspace(config, execution);
+        managedExecutions.assertResourcesAvailable(execution);
         if ("directAuthorization" in execution) throw new Error("Direct execution requires its dedicated endpoint");
         const now = Date.now();
         for (const [id, seenAt] of seenExecutions) {
@@ -1054,6 +1059,7 @@ export function createRunnerServer(
         const execution = JSON.parse(body) as PythonExecutionRequest;
         requireEphemeralExecution(execution);
         await resolveExecutionWorkspace(config, execution);
+        managedExecutions.assertResourcesAvailable(execution);
         if ("directAuthorization" in execution) throw new Error("Direct execution requires its dedicated endpoint");
         const now = Date.now();
         for (const [id, seenAt] of seenExecutions) {
@@ -1081,7 +1087,10 @@ export function createRunnerServer(
         path: (request.url ?? "/").split("?", 1)[0] || "/",
       });
       if (response.headersSent) response.destroy();
-      else sendJson(response, 400, { error: error instanceof Error ? error.message : "Runner request failed" } satisfies ApiError);
+      else sendJson(response, error instanceof ExecutionManagerError ? error.statusCode : 400, {
+        error: error instanceof Error ? error.message : "Runner request failed",
+        ...(error instanceof ExecutionManagerError ? { code: error.code } : {}),
+      } satisfies ApiError);
     }
   });
   server.once("close", () => {
