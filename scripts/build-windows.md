@@ -1,11 +1,11 @@
-# Windows 构建指南（F1）
+# Windows 构建指南
 
 > 适用：在 Windows 10/11 原生环境（非 WSL）从 clone 到构建 ScienceDiscovery 后端。
 > 验证记录：2026-10-14，Windows 11 23H2（22631），Node v24.21.0 / pnpm 11.1.2，
 > 干净 worktree 副本三命令全绿 + `pnpm architecture:check` 通过。
 > 范围说明：本文只覆盖**构建层**（install / build / typecheck）。
-> 启动脚本 `start-stack.sh` 是 Linux/macOS 形态，Windows 启动链由
-> `scripts/start-stack.mjs` 承载（F2 阶段交付）。
+> 启动脚本（`run-local.sh` / `start-stack.sh`）是 Linux/macOS 形态；Windows 原生
+> 启动链（`scripts/start-stack.mjs` 等）由后续运行时 PR 交付，届时更新本文。
 
 ## 1. 前置条件
 
@@ -64,12 +64,15 @@ echo registry=https://registry.npmmirror.com >> .npmrc
 
 ## 5. 平台边界（当前 Windows 上**不可用**的命令）
 
-F2 已为启动链提供 Windows 原生等价物（`.mjs`），Linux/macOS 的 bash 脚本保持原样：
+启动链目前只有 Linux/macOS 的 bash 形态（`pnpm start` / `pnpm server` 实际执行
+`bash scripts/run-local.sh`，见 `package.json` 的 `scripts`）。Windows 原生等价物
+（`scripts/start-stack.mjs` / `scripts/jiuwenswarm.mjs`）由后续运行时 PR 交付，
+**本 PR 树内尚不存在**；在此之前请用 Git Bash 或 WSL 运行原命令。
 
-| 原命令（bash，Windows 不可用） | Windows 等价物（F2 新增） |
+| 原命令（bash） | Windows 现状 |
 | --- | --- |
-| `pnpm start` / `pnpm server`（`start-stack.sh --mode local`） | `node scripts/start-stack.mjs --mode local`（可选 `--no-build` `--no-node-build` `--no-jiuwenswarm`） |
-| `pnpm start:jiuwenswarm` / `pnpm jiuwenswarm:*`（`jiuwenswarm.sh`） | `node scripts/jiuwenswarm.mjs <setup\|start\|stop\|status\|env>` |
+| `pnpm start` / `pnpm server`（`run-local.sh`） | Git Bash / WSL 下可用；原生等价物（`start-stack.mjs`）后续 PR 交付 |
+| `pnpm start:jiuwenswarm` / `pnpm jiuwenswarm:*`（`start-stack.sh` / `jiuwenswarm.sh`） | 同上（`jiuwenswarm.mjs` 后续 PR 交付） |
 
 仍不可用（无 Windows 等价物）：
 
@@ -77,14 +80,10 @@ F2 已为启动链提供 Windows 原生等价物（`.mjs`），Linux/macOS 的 b
 | --- | --- |
 | `pnpm ci:e2e:legacy` | 调用 `.ci/run-e2e.sh` |
 | `pnpm runner:binary` | SEA 单文件打包，Linux-only（`.mjs` 在非 Linux 平台自动跳过该步） |
-| `start-stack.sh --mode docker` | `.mjs` 暂只移植 local 模式，docker 模式请用 WSL 跑原 bash 脚本 |
+| `start-stack.sh --mode docker` | 暂无 Windows 等价物；请用 WSL 运行原 bash 脚本 |
 
 Windows 侧已知行为差异：runner 沙箱依赖（bubblewrap/seatbelt）不存在，runner 以
-`ready:false` 优雅降级启动（Provider A 语义）；科学环境（micromamba）不可用，待 F4。
+`ready:false` 优雅降级启动（direct-execution provider 语义）；科学环境
+（micromamba）由后续运行时 PR 交付。
 
-Linux/WSL 侧回归说明：F1/F2 未改动任何 bash 启动脚本，双平台启动链不回归。
-F2 改动的三个存量文件均为平台中立修复且可上游：`swarm-patches.py` 显式
-`encoding="utf-8"`（Linux 行为不变）；openevolve vendor `runner.py` 的
-`import resource` 加 try/except（Linux 上正常导入，行为不变）；adapter
-`app.py` 两个 httpx.AsyncClient 加 `trust_env=False`（adapter 是纯 loopback
-服务，不读宿主代理变量在 Linux 下同样更正确，但属行为微调，上游沟通时注明）。
+Linux/macOS 侧回归说明：本 PR 未改动任何 bash 启动脚本，双平台启动链不回归。
