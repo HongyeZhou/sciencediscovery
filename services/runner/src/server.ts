@@ -38,6 +38,7 @@ import type {
   RunnerRuntimeStatus,
   RemoteWorkspaceFile,
   RemoteWorkspaceSnapshot,
+  SandboxKind,
   SandboxNetworkCapability,
   ScientificEnvsCapability,
   SetupScientificEnvironmentsRequest,
@@ -306,7 +307,7 @@ async function resolveExecutionWorkspace(
     execution.workspaceRoot = await remoteWorkspaceRoot(config.dataDir, execution.runnerWorkspaceKey);
     delete execution.readOnlyWorkspaceRoot;
   }
-  execution.workspaceRoot = await validatedWorkspace(config.dataDir, execution.workspaceRoot);
+  execution.workspaceRoot = await validatedWorkspace(config.dataDir, execution.workspaceRoot, config.extraWorkspaceRoots);
 }
 
 function currentExecutionUser(): string {
@@ -350,18 +351,28 @@ export function loadRunnerConfig(env: NodeJS.ProcessEnv = process.env, cwd = rep
     return value;
   };
   const requestedProvider = env.SCIENCE_AGENT_SANDBOX_PROVIDER?.trim() || "auto";
-  if (!["auto", "bubblewrap", "seatbelt"].includes(requestedProvider)) {
-    throw new Error("SCIENCE_AGENT_SANDBOX_PROVIDER must be auto, bubblewrap, or seatbelt");
+  if (!["auto", "bubblewrap", "seatbelt", "none"].includes(requestedProvider)) {
+    throw new Error("SCIENCE_AGENT_SANDBOX_PROVIDER must be auto, bubblewrap, seatbelt, or none");
   }
+  // [windows-desktop] Windows resolves to the direct-execution
+  // provider; the WSL sandbox (Provider B) stays an optional plugin.
   const sandboxProvider = requestedProvider === "auto"
-    ? (process.platform === "darwin" ? "seatbelt" : "bubblewrap")
-    : requestedProvider as "bubblewrap" | "seatbelt";
+    ? (process.platform === "darwin" ? "seatbelt" : process.platform === "win32" ? "none" : "bubblewrap")
+    : requestedProvider as "bubblewrap" | "seatbelt" | "none";
   return {
     authToken: env.SCIENCE_AGENT_RUNNER_TOKEN?.trim() || "sciencediscovery-runner-local",
     bwrapPath: env.SCIENCE_AGENT_BWRAP_PATH?.trim() || "bwrap",
     sandboxProvider,
     seatbeltPath: env.SCIENCE_AGENT_SEATBELT_PATH?.trim() || "/usr/bin/sandbox-exec",
     dataDir: resolve(cwd, env.SCIENCE_AGENT_DATA_DIR?.trim() || ".sciencediscovery-data"),
+    // [windows-desktop] `;`-separated operator-authorized workspace roots
+    // (direct-execution whitelist extension). Relative entries resolve against
+    // the runner cwd, exactly like SCIENCE_AGENT_DATA_DIR.
+    ...((() => {
+      const roots = (env.SCIENCE_RUNNER_EXTRA_WORKSPACE_ROOTS?.trim() || "")
+        .split(";").map((entry) => entry.trim()).filter(Boolean).map((entry) => resolve(cwd, entry));
+      return roots.length ? { extraWorkspaceRoots: roots } : {};
+    })()),
     execTimeoutMs,
     maxOutputBytes: parseByteQuota("SCIENCE_AGENT_MAX_OUTPUT_BYTES", DEFAULT_MAX_OUTPUT_BYTES),
     maxWorkspaceBytes: parseByteQuota("SCIENCE_AGENT_MAX_WORKSPACE_BYTES", DEFAULT_MAX_WORKSPACE_BYTES),
@@ -926,7 +937,7 @@ export function createRunnerServer(
         const environmentId = decodeURIComponent(installMatch[1]!);
         const workspaceRoot = input.runnerWorkspaceKey
           ? await validatedWorkspace(config.dataDir, await remoteWorkspaceRoot(config.dataDir, input.runnerWorkspaceKey))
-          : input.workspaceRoot ? await validatedWorkspace(config.dataDir, input.workspaceRoot) : undefined;
+          : input.workspaceRoot ? await validatedWorkspace(config.dataDir, input.workspaceRoot, config.extraWorkspaceRoots) : undefined;
         const previousRevisionId = environmentStore.list().find((environment) => environment.id === environmentId)?.currentRevisionId;
         const revision = await environmentStore.install(
           environmentId,
@@ -991,9 +1002,9 @@ export function createRunnerServer(
           : execution.environmentId
           ? environmentStore?.withRuntime(execution.environmentId, (runtime) => {
               if (signal.aborted) throw new Error("Execution cancelled before environment admission");
-              return executeShell(executorConfig, execution, signal, undefined, gateways, runtime, log);
+              return executeShell(executorConfig, execution, signal, undefined, gateways, runtime, log, environmentStore);
             }) ?? Promise.reject(new Error("Scientific environments are unavailable"))
-          : executeShell(executorConfig, execution, signal, undefined, gateways, undefined, log));
+          : executeShell(executorConfig, execution, signal, undefined, gateways, undefined, log, environmentStore));
         sendJson(response, 202, accepted);
         return;
       }
@@ -1026,9 +1037,9 @@ export function createRunnerServer(
           () => execution.environmentId
             ? environmentStore?.withRuntime(execution.environmentId, (runtime) => {
                 if (signal.aborted) throw new Error("Runner execution aborted before start");
-                return executeShell(executorConfig, execution, signal, undefined, gateways, runtime);
+                return executeShell(executorConfig, execution, signal, undefined, gateways, runtime, undefined, environmentStore);
               }) ?? Promise.reject(new Error("Scientific environments are unavailable"))
-            : executeShell(executorConfig, execution, signal, undefined, gateways),
+            : executeShell(executorConfig, execution, signal, undefined, gateways, undefined, undefined, environmentStore),
         )));
         return;
       }
@@ -1091,7 +1102,7 @@ export function createRunnerServer(
  * directory writes. Staging the bridge script stays on the launch path.
  */
 async function sandboxNetworkCapability(
-  sandbox: "bubblewrap" | "seatbelt",
+  sandbox: SandboxKind,
   gateways: Pick<EgressGatewayRegistry, "socketPath">,
 ): Promise<SandboxNetworkCapability> {
   try {
@@ -1106,7 +1117,10 @@ async function sandboxNetworkCapability(
       unavailableReason: error instanceof Error ? error.message : "The sandbox egress socket path is unavailable",
     };
   }
-  if (sandbox === "seatbelt") return { available: true, modes: ["none", "domain-allowlist", "open"] };
+  // [windows-desktop] "none" (Windows direct execution) filters through the
+  // same runner-owned TCP gateway as Seatbelt (env-injected proxy), so every
+  // mode stays available.
+  if (sandbox !== "bubblewrap") return { available: true, modes: ["none", "domain-allowlist", "open"] };
   try {
     await resolveEgressInterpreter();
     return { available: true, modes: ["none", "domain-allowlist", "open"] };
@@ -1220,7 +1234,7 @@ export async function startRunnerServer(config = loadRunnerConfig()): Promise<Se
     logger.info("service_started", { host: config.host, port });
     console.log(`ScienceDiscovery runner listening on http://${config.host}:${port}`);
   }
-  // Heartbeat. The runner is a single event loop; a field incident
+  // F10.6p: heartbeat. The runner is a single event loop; a field incident
   // (2026-10-19) left it listening but never answering — alive on the port,
   // frozen inside — and nothing in its log showed when it stopped making
   // progress. A periodic line timestamps the freeze for exactly that case.

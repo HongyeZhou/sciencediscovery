@@ -13,221 +13,410 @@
 // limitations under the License.
 
 import { createTest } from "../../../test/support/tagged/compat.mjs";
-const { test } = createTest(import.meta.url, { tags: ["category:ut", "os:linux", "arch:amd64", "arch:arm64"] });
+const { test } = createTest(import.meta.url, { tags: ["category:ut", "os:windows"] });
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, readFile, symlink, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { statSync } from "node:fs";
+import { copyFile, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { join, dirname, resolve, sep } from "node:path";
 import type { TestContext } from "node:test";
-import type { ShellExecutionRequest, DirectExecutionCapability, ManagedExecution, ExecutionLogPage, ExecutionOwner, RunnerExecutionCapability } from "@sciencediscovery/schema";
-import { createExecutionSignature, EXECUTION_SIGNATURE_HEADER, EXECUTION_TIMESTAMP_HEADER } from "./request-auth.js";
-import type { AddressInfo } from "node:net";
-import { startRunnerServer } from "./server.js";
-import { directExecutionCapability, executeDirectShell, type ExecutorConfig } from "./executor.js";
 
-async function fixture(t: TestContext) {
-  const dataDir = await mkdtemp(resolve(tmpdir(), "direct-shell-"));
-  t.after(() => rm(dataDir, { recursive: true, force: true }));
-  const workspaceRoot = resolve(dataDir, "projects", "workspace");
+import type { PermissionEpoch } from "@sciencediscovery/schema";
+
+import { executePython, executeShell, spawnSandboxProcess, validatedWorkspace } from "./executor.js";
+import { EgressGatewayRegistry } from "./egress-gateway.js";
+import type { EnvironmentStore } from "./environment-store.js";
+import { condaActivationPaths } from "./platform/index.js";
+import { RunnerReadiness } from "./readiness.js";
+
+function epoch(id = "epoch-test"): PermissionEpoch {
+  return {
+    createdAt: new Date().toISOString(),
+    environmentRevisionId: "rev-python",
+    id,
+    mounts: [{ mode: "read-write", source: "workspace" }],
+    networkPolicy: "none",
+    reason: "test",
+    secretRefs: [],
+    sessionId: "session-test",
+  };
+}
+
+/**
+ * the none-sandbox direct paths now fail closed even for the "none"
+ * network policy (deny-all loopback gateway), so executions need a real
+ * gateway registry in tests, exactly as the server always provides one.
+ */
+function gatewaysFor(context: TestContext, dataDir: string): EgressGatewayRegistry {
+  const gateways = new EgressGatewayRegistry(dataDir, () => undefined);
+  context.after(() => gateways.close());
+  return gateways;
+}
+
+/** A real interpreter for the direct-execution run; the test skips without one. */
+function hostPython(): string | undefined {
+  const override = process.env.SCIENCE_AGENT_PYTHON_PATH?.trim();
+  if (override) return override;
+  const result = spawnSync("where", ["python"], { encoding: "utf8" });
+  if (result.status !== 0) return undefined;
+  return result.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+}
+
+async function workspace(context: TestContext): Promise<{ dataDir: string; workspaceRoot: string }> {
+  const dataDir = await mkdtemp(join(tmpdir(), "sd-direct-exec-"));
+  context.after(() => rm(dataDir, { force: true, recursive: true }));
+  const workspaceRoot = resolve(dataDir, "projects", "project", "sessions", "session", "workspace");
   await mkdir(workspaceRoot, { recursive: true });
-  const capability = await directExecutionCapability();
-  const config: ExecutorConfig = { dataDir, bwrapPath: "/missing-bwrap", execTimeoutMs: 2000, maxWorkspaceBytes: 1000000, maxOutputBytes: 10000 };
-  const request: ShellExecutionRequest = { agentId: "main", code: "printf hello > result.txt; python3 -c 'print(6 * 7)'", executionId: "execution-1", workspaceRoot,
-    permissionEpoch: { id: "epoch", sessionId: "session", createdAt: new Date().toISOString(), environmentRevisionId: "", mounts: [{ source: "workspace", mode: "read-write" }], networkPolicy: "none", reason: "test", secretRefs: [] },
-    directAuthorization: { authorizationId: "consent", runId: "run", agentId: "main", target: capability.target, account: capability.account, cwd: "", workspaceRoot } };
-  return { config, request, workspaceRoot };
+  return { dataDir, workspaceRoot };
 }
 
-test("explicit direct shell and Python work with missing sandbox and retain output/artifacts/scope", async t => {
-  const { config, request, workspaceRoot } = await fixture(t);
-  const output: string[] = [];
-  const result = await executeDirectShell(config, request, new AbortController().signal, (_, chunk) => output.push(chunk.toString()));
-  assert.equal(result.exitCode, 0);
-  assert.equal(result.stdout.trim(), "42");
-  assert.match(output.join(""), /42/);
-  assert.equal(await readFile(resolve(workspaceRoot, "result.txt"), "utf8"), "hello");
-  assert.deepEqual(result.createdFiles, ["result.txt"]);
+test("readiness reports the none provider ready without probing a sandbox", async () => {
+  const capability = await new RunnerReadiness("none", "ignored-executable").get();
+  assert.equal(capability.sandbox, "none");
+  assert.equal(capability.ready, true);
+  assert.equal(capability.reason, "ready");
+  // sandboxUsable stays false: the UI/API must keep showing isolation is absent.
+  assert.equal(capability.sandboxUsable, false);
+});
+
+test("spawnSandboxProcess none branch runs the executable directly with the launch env", async (context) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "sd-direct-spawn-"));
+  context.after(() => rm(dataDir, { force: true, recursive: true }));
+  const env: Record<string, string> = {};
+  for (const [name, value] of Object.entries(process.env)) {
+    if (value !== undefined) env[name] = value;
+  }
+  env.SD_DIRECT_MARKER = "marker-value";
+  const child = await spawnSandboxProcess(
+    { bwrapPath: "unused", dataDir, sandboxProvider: "none" },
+    {
+      args: [],
+      chdir: dataDir,
+      commandPrefix: [],
+      env,
+      executable: process.execPath,
+      hostCwd: dataDir,
+      sandbox: "none",
+    },
+    ["-e", "process.stdout.write(process.env.SD_DIRECT_MARKER + '|' + process.cwd())"],
+    "baseline",
+  );
+  let stdout = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  const exitCode = await new Promise<number | null>((resolvePromise) => child.once("close", resolvePromise));
+  assert.equal(exitCode, 0);
+  assert.equal(stdout, `marker-value|${dataDir}`);
+});
+
+test("executeShell none fails closed without the scientific environment capability", async () => {
+  await assert.rejects(
+    executeShell(
+      { bwrapPath: "unused", dataDir: "unused", sandboxProvider: "none", execTimeoutMs: 1000, maxOutputBytes: 0, maxWorkspaceBytes: 0 },
+      { agentId: "main", code: "echo hi", executionId: "shell-none", permissionEpoch: epoch(), workspaceRoot: "unused" },
+    ),
+    /requires the scientific environment capability/,
+  );
+});
+
+test("executeShell none fails clearly when the environment lacks m2-bash", async (context) => {
+  const { dataDir, workspaceRoot } = await workspace(context);
+  // 前缀里没有任何 shell：报错必须点名 m2-bash 与修复动作，而不是裸 ENOENT。
+  const store = {
+    capability: { available: true },
+    resolveRuntime: () => ({
+      interpreterPath: resolve(dataDir, "managed-env", "python.exe"),
+      prefixPath: resolve(dataDir, "managed-env"),
+      revision: { id: "rev-python" },
+    }),
+  } as unknown as EnvironmentStore;
+  await assert.rejects(
+    executeShell(
+      { bwrapPath: "unused", dataDir, sandboxProvider: "none", execTimeoutMs: 1000, maxOutputBytes: 0, maxWorkspaceBytes: 0 },
+      { agentId: "main", code: "echo hi", executionId: "shell-none", permissionEpoch: epoch(), workspaceRoot },
+      undefined, undefined, undefined, undefined, undefined, store,
+    ),
+    /requires m2-bash.*Recreate or update the starter environment/s,
+  );
+});
+
+/** A real bash.exe for the direct-shell run; the test skips without one. */
+function hostBash(): string | undefined {
+  const result = spawnSync("where", ["bash"], { encoding: "utf8" });
+  if (result.status !== 0) return undefined;
+  const candidate = result.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+  // The WindowsApps WSL launcher is a zero-byte stub that cannot be copied
+  // into the fake conda prefix; treat it as "no host bash".
+  if (!candidate) return undefined;
+  if (candidate.toLowerCase().includes(`${sep}microsoft${sep}windowsapps${sep}`)) return undefined;
+  try { if (statSync(candidate).size === 0) return undefined; } catch { return undefined; }
+  return candidate;
+}
+
+test("executeShell none runs the agent's code through the environment's m2-bash", async (context) => {
+  const bash = hostBash();
+  if (!bash) {
+    context.skip("no bash.exe on PATH");
+    return;
+  }
+  const { dataDir, workspaceRoot } = await workspace(context);
+  // 复刻 m2-bash 的 conda 布局：<prefix>\Library\usr\bin\bash.exe（已实证）。
+  // 用 Git Bash 的真身充当环境内 bash，连同其 msys-*.dll 一起拷进假前缀。
+  const prefix = resolve(dataDir, "managed-env");
+  const shellDir = resolve(prefix, "Library", "usr", "bin");
+  await mkdir(shellDir, { recursive: true });
+  await copyFile(bash, resolve(shellDir, "bash.exe"));
+  const msysLibs = spawnSync("cmd", ["/c", "dir", "/b", resolve(dirname(bash), "msys-*.dll")], { encoding: "utf8" });
+  if (msysLibs.status === 0) {
+    for (const name of msysLibs.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)) {
+      await copyFile(resolve(dirname(bash), name), resolve(shellDir, name));
+    }
+  }
+  const store = {
+    capability: { available: true },
+    resolveRuntime: () => ({
+      interpreterPath: resolve(prefix, "python.exe"),
+      prefixPath: prefix,
+      revision: { id: "rev-python" },
+    }),
+  } as unknown as EnvironmentStore;
+  const result = await executeShell(
+    { bwrapPath: "unused", dataDir, sandboxProvider: "none", execTimeoutMs: 60_000, maxOutputBytes: 1_000_000, maxWorkspaceBytes: 0 },
+    {
+      agentId: "main",
+      code: [
+        "echo SHELL_OK",
+        "pwd",
+        "mkdir -p sub && echo text > sub/out.txt",
+      ].join("\n"),
+      executionId: "shell-none",
+      permissionEpoch: epoch(),
+      workspaceRoot,
+    },
+    undefined, undefined, gatewaysFor(context, dataDir), undefined, undefined, store,
+  );
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.ok(result.stdout.includes("SHELL_OK"), result.stdout);
+  // MSYS2 把 Windows cwd 翻成 /e/... 形态：断言它报告的是工作区即可。
+  assert.ok(result.stdout.includes("/"), result.stdout);
+  assert.ok(result.createdFiles.includes("sub/out.txt") || result.createdFiles.includes("sub\\out.txt"), result.createdFiles.join(","));
+  assert.equal(result.environmentRevisionId, "rev-python");
   assert.equal(result.sandbox, "none");
-  assert.equal(result.networkPolicy, "host");
-  assert.deepEqual(result.directAuthorization, request.directAuthorization);
-  // Node forwards its coverage directory into explicit spawn environments in CI.
-  const expectedKeys = ["HOME", "LANG", "PATH"];
-  if (process.env.NODE_V8_COVERAGE) {
-    expectedKeys.push("NODE_V8_COVERAGE");
-    assert.equal(result.environmentVariables.NODE_V8_COVERAGE, process.env.NODE_V8_COVERAGE);
+  assert.equal(result.kernelMode, "ephemeral");
+});
+
+test("executePython rejects R under the none provider", async (context) => {
+  const { dataDir, workspaceRoot } = await workspace(context);
+  const python = hostPython();
+  assert.ok(python, "a host python is required for this test");
+  const prefix = resolve(dataDir, "managed-env");
+  const store = {
+    capability: { available: true },
+    resolveRuntime: () => ({
+      interpreterPath: python,
+      prefixPath: prefix,
+      revision: { id: "rev-r" },
+    }),
+  } as unknown as EnvironmentStore;
+  await assert.rejects(
+    executePython(
+      { bwrapPath: "unused", dataDir, sandboxProvider: "none", execTimeoutMs: 60_000, maxOutputBytes: 1_000_000, maxWorkspaceBytes: 0 },
+      { agentId: "main", code: "print(1)", executionId: "r-none", language: "r", permissionEpoch: epoch(), workspaceRoot },
+      undefined,
+      store,
+    ),
+    /direct-execution provider \(Windows\) supports Python only/,
+  );
+});
+
+test("executePython none runs the interpreter directly with conda activation paths on PATH ", async (context) => {
+  const python = hostPython();
+  if (!python) {
+    context.skip("no host python on PATH");
+    return;
   }
-  assert.deepEqual(Object.keys(result.environmentVariables).sort(), expectedKeys.sort());
+  const { dataDir, workspaceRoot } = await workspace(context);
+  // The prefix is deliberately fake: the assertion is that its activation
+  // directories land at the head of PATH, not that they exist.
+  const prefix = resolve(dataDir, "managed-env");
+  const store = {
+    capability: { available: true },
+    resolveRuntime: () => ({
+      interpreterPath: python,
+      prefixPath: prefix,
+      revision: { id: "rev-python" },
+    }),
+  } as unknown as EnvironmentStore;
+  const result = await executePython(
+    { bwrapPath: "unused", dataDir, sandboxProvider: "none", execTimeoutMs: 60_000, maxOutputBytes: 1_000_000, maxWorkspaceBytes: 0 },
+    {
+      agentId: "main",
+      code: [
+        "import os, pathlib",
+        "head = os.environ['PATH'].split(os.pathsep)[:3]",
+        "print('PATH_HEAD=' + '|'.join(head))",
+        "print('PYTHONHOME=' + str(os.environ.get('PYTHONHOME')))",
+        "pathlib.Path('out.txt').write_text('ok')",
+      ].join("\n"),
+      environmentRevisionId: "rev-python",
+      executionId: "python-none",
+      language: "python",
+      permissionEpoch: epoch(),
+      workspaceRoot,
+    },
+    undefined,
+    store,
+    undefined,
+    gatewaysFor(context, dataDir),
+  );
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.stdout.includes(`PATH_HEAD=${condaActivationPaths(prefix).join("|")}`), true, result.stdout);
+  assert.equal(result.stdout.includes("PYTHONHOME=None"), true, result.stdout);
+  assert.ok(result.createdFiles.includes("out.txt"));
 });
 
-for (const scope of ["missing", "target", "account", "agentId", "workspaceRoot", "cwd"] as const) {
-  test(`direct execution rejects ${scope} scope before side effects`, async t => {
-    const { config, request, workspaceRoot } = await fixture(t);
-    if (scope === "missing") delete request.directAuthorization;
-    else request.directAuthorization![scope] = scope === "cwd" ? "../../" : "wrong";
-    await assert.rejects(executeDirectShell(config, request, new AbortController().signal));
-    await assert.rejects(readFile(resolve(workspaceRoot, "result.txt")), { code: "ENOENT" });
-  });
-}
 
-test("direct execution cancellation before dispatch has no side effects", async t => {
-  const { config, request, workspaceRoot } = await fixture(t);
-  const controller = new AbortController(); controller.abort();
-  await assert.rejects(executeDirectShell(config, request, controller.signal));
-  await assert.rejects(readFile(resolve(workspaceRoot, "result.txt")), { code: "ENOENT" });
-});
-
-for (const mode of ["timeout", "cancel"] as const) {
-  test(`direct execution ${mode} stops its process group and reports failure`, async t => {
-    const { config, request, workspaceRoot } = await fixture(t);
-    request.code = "printf started; sleep 10; printf late > result.txt";
-    request.executionTimeoutMs = mode === "timeout" ? 100 : 0;
-    const controller = new AbortController();
-    await assert.rejects(executeDirectShell(config, request, controller.signal, () => { if (mode === "cancel") controller.abort(); }), /timed out|aborted/);
-    await assert.rejects(readFile(resolve(workspaceRoot, "result.txt")), { code: "ENOENT" });
-  });
-}
-
-async function remoteFixture(t: TestContext, sandboxReady = false) {
-  const f = await fixture(t);
-  const server = await startRunnerServer({ ...f.config, ...(sandboxReady ? { bwrapPath: process.env.SCIENCE_AGENT_BWRAP_PATH || "bwrap" } : {}), authToken: "test-token", host: "127.0.0.1", port: 0,
-    scientificEnvsEnabled: false, npuBrokerEnabled: false });
-  t.after(async () => { server.closeAllConnections(); await new Promise<void>((done, reject) => server.close(error => error ? reject(error) : done())); });
-  const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-  const json = async <T>(path: string, input?: unknown, signed = false): Promise<T> => {
-    const body = input === undefined ? undefined : JSON.stringify(input);
-    const timestamp = String(Date.now());
-    const response = await fetch(`${origin}${path}`, { method: body ? "POST" : "GET", body,
-      headers: { authorization: "Bearer test-token", "content-type": "application/json",
-        ...(signed ? { [EXECUTION_TIMESTAMP_HEADER]: timestamp,
-          [EXECUTION_SIGNATURE_HEADER]: createExecutionSignature("test-token", timestamp, body!) } : {}) },
-      signal: AbortSignal.timeout(5000) });
-    const value = await response.json();
-    if (!response.ok) throw new Error((value as { error: string }).error);
-    return value as T;
-  };
-  const client = {
-    executionCapability: () => json<RunnerExecutionCapability>("/execution-capability"),
-    directExecutionCapability: (_signal: undefined, scope: { runnerWorkspaceKey: string; cwd: string }) =>
-      json<DirectExecutionCapability>(`/direct-execution-capability?${new URLSearchParams(scope)}`),
-    startShellExecution: (request: ShellExecutionRequest) => json<ManagedExecution>("/direct-shell-executions", request, true),
-    getShellExecution: (id: string, owner: ExecutionOwner) => json<ManagedExecution>(`/shell-executions/${id}?${new URLSearchParams({ ...owner })}`),
-    shellExecutionLogs: (id: string, owner: ExecutionOwner) => json<ExecutionLogPage>(`/shell-executions/${id}/logs?${new URLSearchParams({ ...owner })}`),
-    cancelShellExecution: (id: string, owner: ExecutionOwner) => json<ManagedExecution>(`/shell-executions/${id}/cancel?${new URLSearchParams({ ...owner })}`, {}),
-  };
-  const key = "session/main";
-  const scope = await client.directExecutionCapability(undefined, { runnerWorkspaceKey: key, cwd: "" });
-  assert.ok(scope.workspaceRoot);
-  const request: ShellExecutionRequest = { ...f.request, workspaceRoot: "control-plane-path-is-unused", runnerWorkspaceKey: key,
-    directAuthorization: { ...f.request.directAuthorization!, ...scope, workspaceRoot: scope.workspaceRoot, cwd: scope.cwd!, runnerWorkspaceKey: key } };
-  const owner = { agentId: request.agentId, sessionId: request.permissionEpoch.sessionId };
-  const wait = async (id: string) => {
-    const deadline = Date.now() + 5000;
-    while (true) {
-      const value = await client.getShellExecution(id, owner);
-      if (!["queued", "running"].includes(value.state)) return value;
-      if (Date.now() > deadline) throw new Error("Remote execution did not terminate");
-      await new Promise(done => setTimeout(done, 10));
-    }
-  };
-  return { ...f, client, request, owner, wait, remoteRoot: scope.workspaceRoot, json };
-}
-
-test("direct HTTP capability validates local roots, rejects ambiguous identity and requires directory cwd", async t => {
-  const f = await remoteFixture(t);
-  const unscoped = await f.json<DirectExecutionCapability>("/direct-execution-capability");
-  assert.equal(unscoped.available, true); assert.equal(unscoped.workspaceRoot, undefined);
-  const local = await f.json<DirectExecutionCapability>(`/direct-execution-capability?${new URLSearchParams({ workspaceRoot: f.workspaceRoot })}`);
-  assert.equal(local.workspaceRoot, f.workspaceRoot); assert.equal(local.cwd, "");
-  await assert.rejects(f.json(`/direct-execution-capability?${new URLSearchParams({ workspaceRoot: f.workspaceRoot, runnerWorkspaceKey: "session/main" })}`), /Choose one/);
-  await writeFile(resolve(f.remoteRoot, "file.txt"), "not a directory");
-  await assert.rejects(f.client.directExecutionCapability(undefined, { runnerWorkspaceKey: "session/main", cwd: "file.txt" }), /inside the approved workspace/);
-});
-
-test("remote direct Shell/Python retains durable output, workspace version and exact target audit", async t => {
-  const f = await remoteFixture(t);
-  assert.equal((await f.client.executionCapability()).ready, false);
-  await f.client.startShellExecution(f.request);
-  const execution = await f.wait(f.request.executionId);
-  assert.equal(execution.state, "completed");
-  assert.equal(execution.result!.stdout.trim(), "42");
-  assert.ok(execution.result!.workspaceSnapshot);
-  assert.ok(execution.version);
-  assert.equal(execution.result!.sandbox, "none");
-  assert.equal(execution.result!.networkPolicy, "host");
-  assert.deepEqual(execution.result!.directAuthorization, f.request.directAuthorization);
-  assert.equal(await readFile(resolve(f.remoteRoot, "result.txt"), "utf8"), "hello");
-  await assert.rejects(readFile(resolve(f.workspaceRoot, "result.txt")), { code: "ENOENT" });
-  assert.match((await f.client.shellExecutionLogs(execution.id, f.owner)).chunks.map(c => c.text).join(""), /42/);
-  await assert.rejects(f.client.startShellExecution(f.request), /already been used/);
-});
-
-test("ready sandbox accepts a separately authorized direct HTTP submission", async t => {
-  const f = await remoteFixture(t, true);
-  assert.equal((await f.client.executionCapability()).ready, true);
-  await f.client.startShellExecution(f.request);
-  const execution = await f.wait(f.request.executionId);
-  assert.equal(execution.state, "completed");
-  assert.equal(execution.result!.sandbox, "none");
-  assert.equal(execution.result!.stdout.trim(), "42");
-  assert.deepEqual(execution.result!.directAuthorization, f.request.directAuthorization);
-});
-
-for (const changed of ["key", "root", "account", "target", "agent"] as const) {
-  test(`remote direct execution rejects changed ${changed} without side effects`, async t => {
-    const f = await remoteFixture(t);
-    if (changed === "key") f.request.runnerWorkspaceKey = "session/other";
-    if (changed === "root") f.request.directAuthorization!.workspaceRoot = f.workspaceRoot;
-    if (changed === "account") f.request.directAuthorization!.account = "other";
-    if (changed === "target") f.request.directAuthorization!.target = "restarted-runner";
-    if (changed === "agent") f.request.directAuthorization!.agentId = "child";
-    await f.client.startShellExecution(f.request);
-    const execution = await f.wait(f.request.executionId);
-    assert.equal(execution.state, "failed");
-    await assert.rejects(readFile(resolve(f.remoteRoot, "result.txt")), { code: "ENOENT" });
-  });
-}
-
-test("remote direct probe rejects invalid workspace keys and escaping cwd before consent", async t => {
-  const f = await remoteFixture(t);
-  for (const key of ["../outside", "/absolute", "session//main"]) {
-    await assert.rejects(f.client.directExecutionCapability(undefined, { runnerWorkspaceKey: key, cwd: "" }));
+test("executePython none fails closed on network for the default none policy", async (context) => {
+  const python = hostPython();
+  if (!python) {
+    context.skip("no host python on PATH");
+    return;
   }
-  await symlink(f.workspaceRoot, resolve(f.remoteRoot, "escape"));
-  for (const cwd of ["/tmp", "..", "escape"]) {
-    await assert.rejects(f.client.directExecutionCapability(undefined, { runnerWorkspaceKey: "session/main", cwd }));
+  const { dataDir, workspaceRoot } = await workspace(context);
+  const prefix = resolve(dataDir, "managed-env");
+  const store = {
+    capability: { available: true },
+    resolveRuntime: () => ({
+      interpreterPath: python,
+      prefixPath: prefix,
+      revision: { id: "rev-python" },
+    }),
+  } as unknown as EnvironmentStore;
+  // 默认 epoch 的网络策略就是 none：无沙箱直跑必须拿到 deny-all 网关的代理
+  // 环境（而不是继承宿主机网络），且宿主代理槽位（含 NO_PROXY）不得残留。
+  const result = await executePython(
+    { bwrapPath: "unused", dataDir, sandboxProvider: "none", execTimeoutMs: 60_000, maxOutputBytes: 1_000_000, maxWorkspaceBytes: 0 },
+    {
+      agentId: "main",
+      code: [
+        "import os",
+        "for key in ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY'):",
+        "    print(f'{key}=' + str(os.environ.get(key)))",
+      ].join("\n"),
+      environmentRevisionId: "rev-python",
+      executionId: "python-none-egress",
+      language: "python",
+      permissionEpoch: epoch(),
+      workspaceRoot,
+    },
+    undefined,
+    store,
+    undefined,
+    gatewaysFor(context, dataDir),
+  );
+  assert.equal(result.exitCode, 0, result.stderr);
+  const httpProxy = result.environmentVariables.HTTP_PROXY ?? "";
+  assert.match(httpProxy, /^http:\/\/127\.0\.0\.1:\d+$/, `HTTP_PROXY=${httpProxy}`);
+  assert.equal(result.environmentVariables.HTTPS_PROXY, httpProxy);
+  assert.equal(result.environmentVariables.ALL_PROXY, httpProxy);
+  assert.equal(result.environmentVariables.NO_PROXY, "127.0.0.1,localhost");
+  assert.ok(result.stdout.includes(`HTTP_PROXY=${httpProxy}`), result.stdout);
+  assert.ok(result.stdout.includes("NO_PROXY=127.0.0.1,localhost"), result.stdout);
+});
+
+test("executePython none blocks an outbound request through the deny-all gateway", async (context) => {
+  const python = hostPython();
+  if (!python) {
+    context.skip("no host python on PATH");
+    return;
   }
-});
-
-for (const mode of ["timeout", "cancel"] as const) {
-  test(`remote direct ${mode} retains progress, final error and version without late effects`, async t => {
-    const f = await remoteFixture(t);
-    f.request.code = "printf started; sleep 10; printf late > result.txt";
-    f.request.executionTimeoutMs = mode === "timeout" ? 100 : 0;
-    await f.client.startShellExecution(f.request);
-    const deadline = Date.now() + 5000;
-    while (!(await f.client.shellExecutionLogs(f.request.executionId, f.owner)).chunks.length) {
-      if (Date.now() > deadline) throw new Error("Remote progress missing");
-      await new Promise(done => setTimeout(done, 5));
-    }
-    if (mode === "cancel") await f.client.cancelShellExecution(f.request.executionId, f.owner);
-    const execution = await f.wait(f.request.executionId);
-    assert.equal(execution.state, mode === "cancel" ? "cancelled" : "failed");
-    assert.match(execution.error!, /aborted|timed out/);
-    assert.ok(execution.version);
-    await assert.rejects(readFile(resolve(f.remoteRoot, "result.txt")), { code: "ENOENT" });
+  const { dataDir, workspaceRoot } = await workspace(context);
+  const prefix = resolve(dataDir, "managed-env");
+  const store = {
+    capability: { available: true },
+    resolveRuntime: () => ({
+      interpreterPath: python,
+      prefixPath: prefix,
+      revision: { id: "rev-python" },
+    }),
+  } as unknown as EnvironmentStore;
+  const denied: Array<{ host?: string; reason?: string }> = [];
+  const gateways = new EgressGatewayRegistry(dataDir, (event, detail) => {
+    if (event === "denied") denied.push(detail);
   });
-}
-
-test("remote direct execution rejects a cwd redirected after consent", async t => {
-  const f = await remoteFixture(t);
-  await mkdir(resolve(f.remoteRoot, "approved"));
-  await mkdir(resolve(f.remoteRoot, "other"));
-  const scope = await f.client.directExecutionCapability(undefined, { runnerWorkspaceKey: "session/main", cwd: "approved" });
-  f.request.cwd = scope.cwd!;
-  f.request.directAuthorization!.cwd = scope.cwd!;
-  await rm(resolve(f.remoteRoot, "approved"), { recursive: true });
-  await symlink(resolve(f.remoteRoot, "other"), resolve(f.remoteRoot, "approved"));
-  await f.client.startShellExecution(f.request);
-  assert.equal((await f.wait(f.request.executionId)).state, "failed");
-  await assert.rejects(readFile(resolve(f.remoteRoot, "other/result.txt")), { code: "ENOENT" });
+  context.after(() => gateways.close());
+  const result = await executePython(
+    { bwrapPath: "unused", dataDir, sandboxProvider: "none", execTimeoutMs: 60_000, maxOutputBytes: 1_000_000, maxWorkspaceBytes: 0 },
+    {
+      agentId: "main",
+      code: [
+        "import urllib.error, urllib.request",
+        "try:",
+        "    urllib.request.urlopen('http://example.com/', timeout=15)",
+        "    print('REQUEST_UNEXPECTEDLY_SUCCEEDED')",
+        "except urllib.error.HTTPError as error:",
+        "    body = error.read().decode('utf-8', 'replace').strip()",
+        "    print(f'HTTP_STATUS={error.code}')",
+        "    print(f'DENY_REASON={body}')",
+        "except Exception as error:  # noqa: BLE001",
+        "    print(f'OTHER_ERROR={error!r}')",
+      ].join("\n"),
+      environmentRevisionId: "rev-python",
+      executionId: "python-none-deny",
+      language: "python",
+      permissionEpoch: epoch(),
+      workspaceRoot,
+    },
+    undefined,
+    store,
+    undefined,
+    gateways,
+  );
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.ok(result.stdout.includes("HTTP_STATUS=403"), result.stdout);
+  assert.ok(result.stdout.includes("sandbox network access is disabled"), result.stdout);
+  assert.ok(!result.stdout.includes("REQUEST_UNEXPECTEDLY_SUCCEEDED"), result.stdout);
+  // 留痕：deny 事件带主机与原因落到注册表日志。
+  assert.ok(
+    denied.some((entry) => entry.host === "example.com" && /disabled/.test(entry.reason ?? "")),
+    JSON.stringify(denied),
+  );
 });
+
+
+test("workspace whitelist honors extra authorized roots and still rejects the rest", async (context) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "sd-extra-roots-"));
+  context.after(() => rm(dataDir, { force: true, recursive: true }));
+  const shared = resolve(dataDir, "shared-data");
+  const sharedSession = resolve(shared, "team", "session-workspace");
+  await mkdir(sharedSession, { recursive: true });
+  const extraRoots = [shared, resolve(dataDir, "does-not-exist")];
+  // 授权目录（含子目录）放行；不存在条目跳过不炸；白名单外依旧拒绝。
+  assert.equal(await validatedWorkspace(dataDir, sharedSession, extraRoots), sharedSession);
+  assert.equal(await validatedWorkspace(dataDir, shared, extraRoots), shared);
+  const outside = resolve(dataDir, "scientific-envs");
+  await mkdir(outside);
+  await assert.rejects(validatedWorkspace(dataDir, outside, extraRoots), /workspace must be inside/i);
+  // 不传 extraRoots 时授权目录不放行——默认白名单语义不变。
+  await assert.rejects(validatedWorkspace(dataDir, sharedSession), /workspace must be inside/i);
+});
+
+test("loadRunnerConfig parses SCIENCE_RUNNER_EXTRA_WORKSPACE_ROOTS", async () => {
+  const { loadRunnerConfig } = await import("./server.js");
+  const cwd = resolve(dataDirForConfig());
+  const config = loadRunnerConfig({
+    SCIENCE_AGENT_DATA_DIR: "data",
+    SCIENCE_RUNNER_EXTRA_WORKSPACE_ROOTS: `C:\\shared;relative-dir;; D:\\another `,
+  }, cwd);
+  assert.deepEqual(config.extraWorkspaceRoots, [
+    resolve(cwd, "C:\\shared"),
+    resolve(cwd, "relative-dir"),
+    resolve(cwd, "D:\\another"),
+  ]);
+  const unset = loadRunnerConfig({ SCIENCE_AGENT_DATA_DIR: "data" }, cwd);
+  assert.equal(unset.extraWorkspaceRoots, undefined);
+});
+
+function dataDirForConfig(): string {
+  return join(tmpdir(), "sd-load-config-");
+}
