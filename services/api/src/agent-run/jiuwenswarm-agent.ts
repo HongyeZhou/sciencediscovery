@@ -471,7 +471,7 @@ class JiuwenSwarmAgent implements NativeAgentHandle {
     const root = this.options.skillPackagesRoot;
     const wanted = (this.config.skills ?? "jiuwenswarm") === "jiuwenswarm" && allJiuwenSwarmTools
       && (this.config.prompt ?? "prepend") === "prepend";
-    if (!wanted || !tools.has("read_skill")) return;
+    if (!wanted || (skills.length > 0 && (!root || !tools.has("read_skill")))) return;
     const imported = skills.length && root
       ? await importSkillsToJiuwenSwarm(this.config, skills, root, this.controller.signal)
       : new Map<string, string>();

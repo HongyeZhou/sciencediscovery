@@ -2012,6 +2012,20 @@ test("with the desktop selection an empty staging switches everything we install
   }
 });
 
+test("with the desktop selection missing skill packages leaves existing switches untouched", async () => {
+  const adapter = await fakeAdapter(async (_request, response) => {
+    response.writeHead(200);
+    response.end(line({ done: { finalText: "ok" } }));
+  });
+  try {
+    const config = { ...jiuwenSwarmConfigFromEnv({ SCIENCE_AGENT_EXECUTOR: "jiuwenswarm", SCIENCE_AGENT_ADAPTER_URL: adapter.url, SCIENCE_AGENT_SKILL_SELECTION: "desktop" })! };
+    await createJiuwenSwarmAgentFactory(config)(skillOptions({ skillPackagesRoot: undefined })).execute("go");
+    assert.equal(adapter.requests.some((request) => request.url.startsWith("/agent/skills")), false);
+  } finally {
+    await adapter.close();
+  }
+});
+
 test("each tool carries what JiuwenSwarm's permission engine does before a call: ask for what executes, allow the rest", async () => {
   const adapter = await fakeAdapter(async (_request, response) => { response.writeHead(200); response.end(line({ done: { finalText: "ok" } })); });
   try {
