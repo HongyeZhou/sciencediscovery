@@ -169,17 +169,25 @@ export function listArtifactOutputs(
   );
 }
 
-/** Artifact bytes, already decoded by the server: the CAS hash is not part of
- *  the URL, and the response carries the version's own media type. */
+/** A document as it came off the wire: the bytes, and the type the server gave
+ *  them. The panel decides what to do with the two together — decode the bytes
+ *  as text, or hand them to a renderer as a data URL. */
+export interface DocumentBytes {
+  bytes: Uint8Array;
+  mediaType: string;
+}
+
+/** Artifact bytes, as the CAS stored them: the hash is not part of the URL, and
+ *  the response carries the version's own media type. */
 export async function readArtifactVersion(
   client: ApiClient,
   sessionId: string,
   versionId: string,
-): Promise<string> {
+): Promise<DocumentBytes> {
   const response = await client.fetchStream(
     `/api/sessions/${encodeURIComponent(sessionId)}/artifact-versions/${encodeURIComponent(versionId)}/content`,
   );
-  return response.text();
+  return { bytes: new Uint8Array(await response.arrayBuffer()), mediaType: response.headers.get("content-type") ?? "" };
 }
 
 /** One workspace file's bytes, addressed by its workspace-relative path. The
@@ -188,11 +196,11 @@ export async function readWorkspaceFile(
   client: ApiClient,
   sessionId: string,
   path: string,
-): Promise<string> {
+): Promise<DocumentBytes> {
   const response = await client.fetchStream(
     `/api/sessions/${encodeURIComponent(sessionId)}/file?path=${encodeURIComponent(path)}`,
   );
-  return response.text();
+  return { bytes: new Uint8Array(await response.arrayBuffer()), mediaType: response.headers.get("content-type") ?? "" };
 }
 
 /** The server requires the id repeated back as confirmation, so a stray call
@@ -201,6 +209,26 @@ export function deleteSession(client: ApiClient, sessionId: string): Promise<{ d
   return client.request<{ deleted: string }>(`/api/sessions/${encodeURIComponent(sessionId)}`, {
     body: JSON.stringify({ confirmationId: sessionId }),
     method: "DELETE",
+  });
+}
+
+/** A Project the user made goes away whole — its Sessions, their transcripts
+ *  and their workspaces. The inbox is not a Project the user made: the service
+ *  refuses it with a 409, so the sidebar never offers this for 最近会话. The id
+ *  is repeated back as confirmation, the same gate a Session has. */
+export function deleteProject(client: ApiClient, projectId: string): Promise<{ deleted: string }> {
+  return client.request<{ deleted: string }>(`/api/projects/${encodeURIComponent(projectId)}`, {
+    body: JSON.stringify({ confirmationId: projectId }),
+    method: "DELETE",
+  });
+}
+
+/** The name is the only field this sends, and the service answers with the
+ *  Project as stored — which is what the row should show, not what was typed. */
+export function renameProject(client: ApiClient, projectId: string, name: string): Promise<Project> {
+  return client.request<Project>(`/api/projects/${encodeURIComponent(projectId)}`, {
+    body: JSON.stringify({ name }),
+    method: "PATCH",
   });
 }
 
@@ -238,6 +266,21 @@ export function setProjectRunnerIds(
  * each file actually landed on — the path, not the name, is what the caller
  * has to report, since that is the only one that is true.
  */
+/**
+ * The name a file travels under, or nothing when it has none worth sending.
+ *
+ * Only the last segment may go: a directory selection, and a drop a page
+ * crafted, both hand over names like `../outside.csv`, and the route stores the
+ * part under the name it is given. This is also the string the answer echoes
+ * back as `originalName`, so the composer's cards are matched against it rather
+ * than against the file the browser held — see `mergeUpload`. Kept here, beside
+ * the request that names the part, so the two cannot disagree.
+ */
+export function uploadFileName(name: string): string | undefined {
+  const base = name.split(/[/\\]/u).at(-1);
+  return base === undefined || base === "" || base === "." || base === ".." ? undefined : base;
+}
+
 export function uploadWorkspaceFiles(
   client: ApiClient,
   sessionId: string,
@@ -245,7 +288,11 @@ export function uploadWorkspaceFiles(
   conflict: WorkspaceConflictPolicy = "rename",
 ): Promise<WorkspaceUploadResult> {
   const body = new FormData();
-  for (const file of files) body.append("files", file, file.name);
+  for (const file of files) {
+    const name = uploadFileName(file.name);
+    if (name === undefined) throw new Error("Choose a file with a valid name.");
+    body.append("files", file, name);
+  }
   return client.request<WorkspaceUploadResult>(
     `/api/sessions/${encodeURIComponent(sessionId)}/workspace/upload?conflict=${conflict}`,
     { body, method: "POST" },

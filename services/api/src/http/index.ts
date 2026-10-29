@@ -1569,6 +1569,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         if (status.hostKeyChallenge) {
           throw hostKeyError(new SshHostKeyUntrustedError(status.hostKeyChallenge, host.alias), host.id);
         }
+        if (status.state === "ready") void store.shellExecutions.reconcilePending(host.id).catch(() => undefined);
         sendJson(response, status.state === "ready" ? 200 : 503, status);
         return;
       }
@@ -3440,7 +3441,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         return;
       }
 
-      const activityMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/agent-activity(?:\/(executions|transfers|timers)\/([^/]+)\/(logs|cancel))?$/);
+      const activityMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/agent-activity(?:\/(executions|transfers|timers)\/([^/]+)\/(logs|cancel|reconcile))?$/);
       if (activityMatch) {
         const sessionId = decodeURIComponent(activityMatch[1]!);
         if (!store.getSession(sessionId)) return sendError(response, 404, `Session not found: ${sessionId}`);
@@ -3474,6 +3475,13 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
           if (kind === "executions") sendJson(response, 200, await store.shellExecutions.cancel(id, owner, runner));
           else if (kind === "transfers") sendJson(response, 200, await store.transfers.cancel(id, owner));
           else { store.notifications.cancelTimer(owner, id); sendJson(response, 200, { cancelled: true }); }
+          return;
+        }
+        if (operation === "reconcile" && request.method === "POST") {
+          // Ask the Runner for the same Execution ID and settle via wait/reconcile.
+          // The command is never resubmitted.
+          if (kind !== "executions") return sendError(response, 405, "Only executions can be reconciled");
+          sendJson(response, 200, await store.shellExecutions.wait(id, owner, 0, undefined, runner));
           return;
         }
         return sendError(response, 405, "Unsupported activity operation");

@@ -22,7 +22,7 @@ import {
   type ArtifactVersionInput,
 } from "@sciencediscovery/artifact-manager";
 import { normalizeWorkspaceRelativePath, resolveWorkspaceFile } from "@sciencediscovery/workspace";
-import { CasStore, VersionStore, workspaceSnapshotFiles, type AgentStateRef } from "@sciencediscovery/cas";
+import { canonicalize, CasStore, VersionStore, workspaceSnapshotFiles, type AgentStateRef } from "@sciencediscovery/cas";
 import type {
   ArtifactDerivation,
   ArtifactOrigin,
@@ -54,6 +54,7 @@ import {
 
 import { RunnerClient } from "@sciencediscovery/executor";
 import type { MemoryGraphSink, ObserveExecutionPayload } from "@sciencediscovery/memory";
+import { settledExecutionRun, type SettledExecutionStatus } from "./execution-outcome.js";
 import {
   DEFAULT_ENVIRONMENT_PACKAGE_SPEC,
   DEFAULT_ENVIRONMENT_PACKAGE_SPEC_HASH,
@@ -130,14 +131,37 @@ export interface ProvenanceStore {
 }
 
 /**
- * An in-flight Runner execution only ends early because the surrounding agent
- * run was aborted (user Stop, run timeout) or because the Runner itself broke.
- * Recording the aborted case as `cancelled` keeps a stopped run distinguishable
- * from a genuine execution failure in the provenance record.
+ * A dispatch that ended without a result proves nothing about the command:
+ * the Runner may never have received it, or it may have run to completion
+ * while the status read was lost. Only an abort of the surrounding agent run
+ * is a known outcome — `cancelled`. Everything else stays `unconfirmed`:
+ * neither a success nor a failure, so no reader can mistake a lost
+ * observation for a broken command.
  */
-function interruptedExecutionStatus(signal: AbortSignal | undefined): "cancelled" | "failed" {
-  return signal?.aborted ? "cancelled" : "failed";
+function lostOutcomeStatus(signal: AbortSignal | undefined): "cancelled" | "unconfirmed" {
+  return signal?.aborted ? "cancelled" : "unconfirmed";
 }
+
+/**
+ * The outcome of an execution that produced a committed result. The exit code
+ * settles it; the caller's report only overrides it with another settled
+ * outcome (an abort reports `cancelled`). An `unconfirmed` report is ignored
+ * here — a committed result is proof, not a lost observation.
+ */
+function settledOutcome(
+  result: { exitCode: number },
+  completionStatus?: () => ExecutionRun["status"],
+): SettledExecutionStatus {
+  const reported = completionStatus?.();
+  if (reported && reported !== "unconfirmed") return reported;
+  return result.exitCode === 0 ? "succeeded" : "failed";
+}
+
+/** A permanent provenance conflict: the existing immutable result cannot be
+ * replaced. Carries a structured code so recovery layers can map it to a
+ * non-retryable block instead of treating it as a transient storage failure. */
+const executionResultConflict = (message: string) =>
+  Object.assign(new Error(message), { code: "EXECUTION_RESULT_CONFLICT" as const });
 
 async function runnerSandboxKind(runnerClient: RunnerClient): Promise<SandboxKind> {
   try {
@@ -196,8 +220,37 @@ export type RecordShellExecutionOptions = Omit<RecordExecutionOptions, "environm
   executionId?: string;
   dispatch?: RunnerClient["executeShell"];
   directAuthorization?: import("@sciencediscovery/schema").DirectExecutionAuthorization;
-  completionStatus?: () => "succeeded" | "failed" | "cancelled";
+  /**
+   * The caller's authoritative outcome for this execution. `unconfirmed` means
+   * the outcome was never observed — the command may have run, but no
+   * committed result proves how it ended.
+   */
+  completionStatus?: () => ExecutionRun["status"];
 };
+
+/** Restart-safe audit context. Runtime transports, callbacks and proxy credentials
+ * are deliberately excluded; recovering this context never grants a new launch. */
+export type ShellExecutionContext = Omit<RecordShellExecutionOptions,
+  "runnerClient" | "signal" | "dispatch" | "completionStatus" | "sandboxEgressProxy" | "executionId"
+> & { executionId: string };
+
+/** Only an authoritative terminal Runner receipt may authorize this audit.
+ * These timestamps and details must be pinned by the coordinator before retry. */
+export interface ShellExecutionFailure {
+  state: "failed" | "cancelled";
+  error?: string;
+  startedAt?: string;
+  finishedAt: string;
+}
+
+/** Freeze the authorized execution context before its first dispatch. */
+export function prepareShellExecutionContext(
+  options: RecordShellExecutionOptions & { executionId: string },
+): ShellExecutionContext {
+  const { runnerClient: _runnerClient, signal: _signal, dispatch: _dispatch,
+    completionStatus: _completionStatus, sandboxEgressProxy: _sandboxEgressProxy, ...context } = options;
+  return structuredClone(context);
+}
 
 export class ProvenanceRecorder {
   readonly cas: CasStore;
@@ -386,8 +439,12 @@ export class ProvenanceRecorder {
       .filter((item) => item.path === normalisedSourcePath)
       .toSorted((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
     const executionId = derivation?.executionRunIds.at(-1);
+    const recordedRuns = executionId ? await this.store.listExecutionRuns(options.sessionId) : [];
+    // Runs are append-only: a later reconciliation appends the real outcome
+    // under the same Execution ID, so the settled row wins over an
+    // unconfirmed observation of the same execution.
     const run = executionId
-      ? (await this.store.listExecutionRuns(options.sessionId)).find((item) => item.id === executionId)
+      ? settledExecutionRun(recordedRuns, executionId) ?? recordedRuns.find((item) => item.id === executionId)
       : undefined;
     const code = run ? (await this.cas.read(run.code.hash)).toString("utf8") : "";
     const inputs = this.inferredArtifactInputs(options.sessionId, options.name, code, run?.id);
@@ -617,7 +674,11 @@ export class ProvenanceRecorder {
         content,
         createdAt: options.finishedAt,
         executionRunIds: [options.executionId],
-        id: randomUUID(),
+        // One immutable derivation per execution/path, including retries after a
+        // process restart or a write whose acknowledgement was lost.
+        id: `execution-output:${createHash("sha256").update(JSON.stringify([
+          options.sessionId, options.executionId, logicalPath,
+        ])).digest("hex")}`,
         path: logicalPath,
         sessionId: options.sessionId,
         sourceType: "generated",
@@ -646,6 +707,10 @@ export class ProvenanceRecorder {
 
   /** Fire-and-forget mirror of one execution to the memory graph. Never throws. */
   private observeExecution(payload: Omit<ObserveExecutionPayload, "toolType"> & { toolType?: string }): void {
+    // An unconfirmed observation is not a job outcome: the graph must not
+    // report it as a success or as a failure. A later reconciliation mirrors
+    // the real outcome for the same Execution ID.
+    if (payload.status === "unconfirmed") return;
     this.memoryGraphSink?.observeExecution({
       toolType: "execution",
       ...payload,
@@ -818,6 +883,9 @@ export class ProvenanceRecorder {
         ...(options.explicitHandoff ? { explicitHandoff: true } : {}),
       }, options.signal);
     } catch (error) {
+      // A managed dispatch joins an independently running execution. Losing
+      // that observation records uncertainty, never a terminal verdict. The
+      // coordinator can later append its verified receipt under the same ID.
       const timestamp = new Date().toISOString();
       await this.store.appendExecutionRun({
         cgroupMode: "unavailable",
@@ -842,7 +910,9 @@ export class ProvenanceRecorder {
         ...(options.directAuthorization ? { directAuthorization: options.directAuthorization } : {}),
         sessionId: options.sessionId,
         startedAt: timestamp,
-        status: options.completionStatus?.() ?? interruptedExecutionStatus(options.signal),
+        // A dispatch that threw may still have run the command to completion;
+        // only the caller's committed outcome (or an abort) is a verdict.
+        status: options.dispatch && options.executionId ? "unconfirmed" : options.completionStatus?.() ?? lostOutcomeStatus(options.signal),
         stderr: await this.cas.put(error instanceof Error ? error.message : "Runner shell execution failed"),
         stdout: await this.cas.put(""),
         tool: options.directAuthorization ? "run_direct_shell" : "run_shell",
@@ -854,22 +924,113 @@ export class ProvenanceRecorder {
       throw error;
     }
 
+    return await this.commitExistingShellExecutionResult(
+      prepareShellExecutionContext({ ...options, executionId }), result,
+      options.runnerClient, settledOutcome(result, options.completionStatus),
+    );
+  }
+
+  /** Record a verified terminal failure with no execution result. This is not
+   * an observation-error handler: the caller must first verify the original
+   * Runner, owner and terminal evidence. No environment or execution is read. */
+  async commitExistingShellExecutionFailure(
+    options: ShellExecutionContext,
+    failure: ShellExecutionFailure,
+  ): Promise<void> {
+    options = structuredClone(options);
+    failure = structuredClone(failure);
+    if ((failure.state !== "failed" && failure.state !== "cancelled")
+      || !failure.finishedAt || Number.isNaN(Date.parse(failure.finishedAt))) {
+      throw new Error("Authoritative shell failure requires a terminal state and stable completion time");
+    }
+    const resultDigest = createHash("sha256").update(canonicalize(JSON.parse(JSON.stringify({
+      context: options, failure,
+    })))).digest("hex");
+    const existing = settledExecutionRun(await this.store.listExecutionRuns(options.sessionId), options.executionId);
+    if (existing?.resultDigest && existing.resultDigest !== resultDigest) {
+      throw executionResultConflict("EXECUTION_RESULT_CONFLICT: existing result digest differs");
+    }
+    // A missing result provides no measured exit code, runtime environment,
+    // sandbox or kernel identity. Keep those unknown, not fabricated success.
+    await this.store.appendExecutionRun({
+      cgroupMode: "unavailable",
+      code: await this.cas.put(options.code),
+      createdFiles: [],
+      environmentRevisionId: null,
+      envSnapshot: null,
+      exitCode: null,
+      finishedAt: failure.finishedAt,
+      id: options.executionId,
+      kernelId: `unavailable:${options.executionId}`,
+      kernelMode: null,
+      language: "shell",
+      modifiedFiles: [],
+      networkAccessRevision: epochSandboxNetworkAccess(options.permissionEpoch).revision,
+      networkPolicy: options.directAuthorization ? "host" : options.permissionEpoch.networkPolicy,
+      permissionEpochId: options.permissionEpoch.id,
+      ...(options.remoteHostAlias ? { remoteHostAlias: options.remoteHostAlias } : {}),
+      ...(options.runnerId ? { runnerId: options.runnerId } : {}),
+      resultDigest,
+      runnerVersion: "unavailable",
+      sandbox: "unavailable",
+      ...(options.directAuthorization ? { directAuthorization: options.directAuthorization } : {}),
+      sessionId: options.sessionId,
+      // Before admission there is no start timestamp; a zero-duration audit is
+      // anchored to the verified rejection/cancellation receipt instead.
+      startedAt: failure.startedAt ?? failure.finishedAt,
+      status: failure.state,
+      stderr: await this.cas.put(failure.error ?? `Runner execution ${failure.state} without a result`),
+      stdout: await this.cas.put(""),
+      tool: options.directAuthorization ? "run_direct_shell" : "run_shell",
+      ...(options.toolCallId ? { toolCallId: options.toolCallId } : {}),
+      toolVersion: "1.1.0",
+      turnId: options.turnId,
+      workingDirectory: "unavailable",
+    });
+  }
+
+  /** Archive an already completed execution without submit/start/execute access.
+   * All writes are content-addressed or use stable execution/path keys. A failed
+   * environment/artifact sync can be retried with the same immutable receipt. */
+  async commitExistingShellExecutionResult(
+    options: ShellExecutionContext,
+    result: ShellExecutionResult,
+    runnerClient: Pick<RunnerClient, "listEnvironments" | "listEnvironmentRevisions" | "environmentSnapshot">,
+    status: ExecutionRun["status"] = result.exitCode === 0 ? "succeeded" : "failed",
+  ): Promise<ShellExecutionResult> {
+    options = structuredClone(options);
+    result = structuredClone(result);
+    const executionId = options.executionId;
+    if (result.executionId !== executionId) throw executionResultConflict("EXECUTION_RESULT_CONFLICT: execution identity mismatch");
+    // JSON round-tripping matches the persisted context and strips optional
+    // undefined properties; canonical ordering makes restarts/order irrelevant.
+    const resultDigest = createHash("sha256").update(canonicalize(JSON.parse(JSON.stringify({
+      context: options, result, status,
+    })))).digest("hex");
+    const existing = settledExecutionRun(await this.store.listExecutionRuns(options.sessionId), executionId);
+    if (existing?.resultDigest && existing.resultDigest !== resultDigest) {
+      throw executionResultConflict("EXECUTION_RESULT_CONFLICT: existing result digest differs");
+    }
+    const shellSpec = await this.cas.put(DEFAULT_SHELL_ENVIRONMENT_PACKAGE_SPEC);
+    if (shellSpec.hash !== DEFAULT_SHELL_ENVIRONMENT_PACKAGE_SPEC_HASH) {
+      throw new Error("Shell environment package spec hash is inconsistent");
+    }
+    const code = await this.cas.put(options.code);
     const stdout = await this.cas.put(result.stdout);
     const stderr = await this.cas.put(result.stderr);
-    let environmentSyncError: unknown;
+    // Resolve only the revision named by the immutable result. Never use the
+    // environment's latest revision when recovering an older execution.
     if (options.environmentId) {
-      try {
-        const [environments, revisions] = await Promise.all([
-          options.runnerClient.listEnvironments(), options.runnerClient.listEnvironmentRevisions(),
-        ]);
-        const revision = revisions.find((candidate) => candidate.id === result.environmentRevisionId);
-        if (!revision || revision.environmentId !== options.environmentId) throw new Error("Runner environment identity mismatch");
-        const reference = await this.cas.put(await options.runnerClient.environmentSnapshot(revision.id));
-        if (reference.hash !== revision.snapshot.hash || reference.size !== revision.snapshot.size) {
-          throw new Error("Environment revision snapshot mismatch");
-        }
-        await this.store.replaceScientificEnvironmentCatalog(environments, revisions, options.runnerId);
-      } catch (error) { environmentSyncError = error; }
+      const [environments, revisions] = await Promise.all([
+        runnerClient.listEnvironments(), runnerClient.listEnvironmentRevisions(),
+      ]);
+      const revision = revisions.find((candidate) => candidate.id === result.environmentRevisionId);
+      if (!revision || revision.environmentId !== options.environmentId) throw new Error("Runner environment identity mismatch");
+      const reference = await this.cas.put(await runnerClient.environmentSnapshot(revision.id));
+      if (reference.hash !== revision.snapshot.hash || reference.size !== revision.snapshot.size) {
+        throw new Error("Environment revision snapshot mismatch");
+      }
+      await this.store.replaceScientificEnvironmentCatalog(environments, revisions, options.runnerId);
     }
     await this.store.appendExecutionRun({
       cgroupMode: result.cgroupMode,
@@ -889,12 +1050,13 @@ export class ProvenanceRecorder {
       permissionEpochId: options.permissionEpoch.id,
       ...(options.remoteHostAlias ? { remoteHostAlias: options.remoteHostAlias } : {}),
       ...(options.runnerId ? { runnerId: options.runnerId } : {}),
+      resultDigest,
       runnerVersion: result.runnerVersion,
       sandbox: result.sandbox,
       ...(options.directAuthorization ? { directAuthorization: options.directAuthorization } : {}),
       sessionId: options.sessionId,
       startedAt: result.startedAt,
-      status: options.completionStatus?.() ?? (result.exitCode === 0 ? "succeeded" : "failed"),
+      status,
       stderr,
       stdout,
       tool: options.directAuthorization ? "run_direct_shell" : "run_shell",
@@ -933,7 +1095,7 @@ export class ProvenanceRecorder {
       language: null,
       codeHash: code.hash,
       exitCode: result.exitCode,
-      status: options.completionStatus?.() ?? (result.exitCode === 0 ? "succeeded" : "failed"),
+      status,
       startedAt: result.startedAt,
       finishedAt: result.finishedAt,
       producedArtifacts: [],
@@ -945,8 +1107,106 @@ export class ProvenanceRecorder {
       parentSubagentId: options.parentSubagentId,
       inputSourceFiles: shellSourceFileInputs,
     });
-    if (environmentSyncError) throw environmentSyncError;
     return options.explicitHandoff ? { ...result, createdFiles: [], modifiedFiles: [] } : result;
+  }
+
+  /**
+   * Adopt a Runner's committed result for an execution whose outcome was left
+   * unconfirmed. The command is never replayed: the caller supplies the result
+   * the Runner already committed for that Execution ID.
+   *
+   * Runs are append-only, so this appends a NEW ExecutionRun carrying the
+   * real outcome. The original unconfirmed row stays as history; readers
+   * resolve the latest settled row for the Execution ID.
+   */
+  async adoptShellOutcome(options: {
+    agentId: string;
+    executionId: string;
+    permissionEpoch: PermissionEpoch;
+    /** The Runner's committed result. Fields an older Runner omits are absent. */
+    result: Partial<ShellExecutionResult>;
+    sessionId: string;
+    status: SettledExecutionStatus;
+    turnId: string;
+    runnerId?: string;
+    remoteHostAlias?: string;
+    toolCallId?: string;
+  }): Promise<void> {
+    const runs = await this.store.listExecutionRuns(options.sessionId);
+    const settled = settledExecutionRun(runs, options.executionId);
+    if (settled) {
+      if (settled.status !== options.status
+        || (options.result.exitCode !== undefined && settled.exitCode !== options.result.exitCode)
+        || (options.result.stdout !== undefined && settled.stdout.hash !== (await this.cas.put(options.result.stdout)).hash)
+        || (options.result.stderr !== undefined && settled.stderr.hash !== (await this.cas.put(options.result.stderr)).hash)) {
+        throw executionResultConflict("EXECUTION_RESULT_CONFLICT: adopted outcome differs");
+      }
+      return;
+    }
+    const recorded = runs.findLast((run) => run.id === options.executionId);
+    const result = options.result;
+    const timestamp = new Date().toISOString();
+    const stdout = await this.cas.put(result.stdout ?? "");
+    const stderr = await this.cas.put(result.stderr ?? "");
+    const adopted: ExecutionRun = {
+      ...(recorded?.accelerator !== undefined ? { accelerator: recorded.accelerator } : {}),
+      cgroupMode: result.cgroupMode ?? recorded?.cgroupMode ?? "unavailable",
+      code: recorded?.code ?? await this.cas.put(""),
+      createdFiles: result.createdFiles ?? recorded?.createdFiles ?? [],
+      environmentRevisionId: result.environmentRevisionId ?? recorded?.environmentRevisionId ?? null,
+      envSnapshot: result.environmentVariables
+        ? await this.putEnvSnapshot(result.environmentVariables)
+        : recorded?.envSnapshot ?? null,
+      exitCode: result.exitCode ?? recorded?.exitCode ?? null,
+      finishedAt: result.finishedAt ?? recorded?.finishedAt ?? timestamp,
+      id: options.executionId,
+      kernelId: result.kernelId ?? recorded?.kernelId ?? `ephemeral:${options.executionId}`,
+      kernelMode: result.kernelMode ?? recorded?.kernelMode ?? "ephemeral",
+      language: "shell",
+      modifiedFiles: result.modifiedFiles ?? recorded?.modifiedFiles ?? [],
+      ...(result.networkAccessRevision ?? recorded?.networkAccessRevision
+        ? { networkAccessRevision: result.networkAccessRevision ?? recorded?.networkAccessRevision } : {}),
+      networkPolicy: result.networkPolicy ?? recorded?.networkPolicy ?? options.permissionEpoch.networkPolicy,
+      permissionEpochId: recorded?.permissionEpochId ?? options.permissionEpoch.id,
+      ...(options.remoteHostAlias ?? recorded?.remoteHostAlias
+        ? { remoteHostAlias: options.remoteHostAlias ?? recorded?.remoteHostAlias } : {}),
+      ...(options.runnerId ?? recorded?.runnerId
+        ? { runnerId: options.runnerId ?? recorded?.runnerId } : {}),
+      runnerVersion: result.runnerVersion ?? recorded?.runnerVersion ?? "unavailable",
+      sandbox: result.sandbox ?? recorded?.sandbox ?? "none",
+      ...(recorded?.directAuthorization ? { directAuthorization: recorded.directAuthorization } : {}),
+      sessionId: options.sessionId,
+      startedAt: result.startedAt ?? recorded?.startedAt ?? timestamp,
+      status: options.status,
+      stderr,
+      stdout,
+      tool: recorded?.tool ?? "run_shell",
+      ...(options.toolCallId ?? recorded?.toolCallId
+        ? { toolCallId: options.toolCallId ?? recorded?.toolCallId } : {}),
+      toolVersion: recorded?.toolVersion ?? "1.1.0",
+      turnId: recorded?.turnId ?? options.turnId,
+      workingDirectory: result.workingDirectory ?? recorded?.workingDirectory ?? "unavailable",
+    };
+    await this.store.appendExecutionRun(adopted);
+    this.observeExecution({
+      executionId: adopted.id,
+      sessionId: adopted.sessionId,
+      turnId: adopted.turnId,
+      tool: adopted.tool,
+      toolName: adopted.tool,
+      language: null,
+      codeHash: adopted.code.hash,
+      exitCode: adopted.exitCode,
+      status: adopted.status,
+      startedAt: adopted.startedAt,
+      finishedAt: adopted.finishedAt,
+      producedArtifacts: [],
+      stdoutHash: adopted.stdout.hash,
+      stderrHash: adopted.stderr.hash,
+      envHash: adopted.environmentRevisionId
+        ? this.store.listEnvironmentRevisions().find((revision) => revision.id === adopted.environmentRevisionId)?.snapshot.hash ?? null
+        : null,
+    });
   }
 
   async executeScientific(options: RecordExecutionOptions): Promise<PythonExecutionResult> {
@@ -1010,7 +1270,9 @@ export class ProvenanceRecorder {
         sandbox,
         sessionId: options.sessionId,
         startedAt: timestamp,
-        status: interruptedExecutionStatus(options.signal),
+        // The Runner call failed, so the outcome was never observed: the
+        // command may have run. Only an abort is a known outcome.
+        status: lostOutcomeStatus(options.signal),
         stderr,
         stdout,
         tool: language === "python" ? "run_python" : "run_r",

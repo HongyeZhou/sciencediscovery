@@ -535,9 +535,44 @@ export async function initializePlatformServices(
   }
   store.shellExecutions.describeRunnerConnections((runnerId) =>
     runnerId === "local" ? "local" : remoteCompute.runnerStatus(runnerId).state);
+  // Wire after load: shell execution storage exists only once the session store
+  // has opened its database. Lost observations stay `unconfirmed`; settle()
+  // adopting a committed Runner result appends the real provenance outcome.
+  store.shellExecutions.setOutcomeAdopter(async ({ execution, observed, status }) => {
+    const permissionEpoch = store.getSessionPermissionEpoch(execution.sessionId);
+    if (!permissionEpoch) {
+      apiLog.warn("shell_execution_outcome_not_recorded", { executionId: execution.id, reason: "missing_permission_epoch" });
+      return;
+    }
+    try {
+      await provenanceRecorder.adoptShellOutcome({
+        agentId: execution.agentId,
+        executionId: execution.id,
+        permissionEpoch,
+        result: observed.result ?? {},
+        sessionId: execution.sessionId,
+        status,
+        turnId: execution.turnId,
+        ...(execution.runnerId ? { runnerId: execution.runnerId } : {}),
+      });
+    } catch (error) {
+      apiLog.warn("shell_execution_outcome_not_recorded", { executionId: execution.id, errorMessage: shortErrorMessage(error) });
+    }
+  });
   await mcpCatalog.refresh().catch((error) => {
     apiLog.warn("mcp_catalog_startup_failed", { errorMessage: shortErrorMessage(error) });
     console.warn("MCP catalog was unavailable during API startup:", error);
+  });
+  store.shellExecutions.configureRecovery({
+    runner: (execution) => {
+      try {
+        store.assertSessionWritable(execution.sessionId);
+        store.assertSessionAllowsRunner(execution.sessionId, execution.runnerId);
+      } catch { throw Object.assign(new Error("Execution observation is no longer authorized"), { statusCode: 403 }); }
+      return execution.runnerId === "local" ? runnerClient : remoteCompute.runnerClient(execution.runnerId);
+    },
+    finalize: (context, result, runner, status) => provenanceRecorder.commitExistingShellExecutionResult(context, result, runner, status),
+    finalizeFailure: (context, failure) => provenanceRecorder.commitExistingShellExecutionFailure(context, failure),
   });
   await initializeComponent("artifact_recovery", () => artifactManager.resumeInterrupted());
   await initializeComponent("run_recovery", () => recoverSessionRuns(store, memoryGraphClient));

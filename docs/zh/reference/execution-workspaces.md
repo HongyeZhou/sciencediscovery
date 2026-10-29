@@ -27,6 +27,19 @@ Session 文件面板的 **Executions & reminders** 展示执行、日志、复�
 
 `workspace_transfer` 可发现有权访问的 Workspace，显式启动、查询、列出和取消复制。记录源快照和逐文件结果；部分失败或取消保留已提交文件，传输字节数不等于发布成功。本地↔远端、主↔子交接使用同一机制，不自动镜像、不重放交接。仅本地所属 Workspace 中的文件可以声明 Artifact；远端产物必须先显式复制回本地，复制本身也不会自动声明 Artifact。
 
+## 导入任务数据
+
+任务数据使用 Workspace 相对路径。Linux 沙箱将 Session 工作区挂载到 `/workspace`，宿主上的
+`/workspace/NatureBench/data` 在沙箱中指向另一个位置；指向宿主绝对路径的软链不会授予目标访问权。
+执行用户代码前，Runner 会在实际沙箱中检查工作区软链，目标不存在或不可读时明确报错，指出软链路径
+并提示如何导入数据。复用已有内核时也会重新检查。
+
+请上传真实文件，或由操作人员在 Runner 宿主侧先将真实数据复制进工作区目录。例如复制到
+`<session-workspace>/nb_data/`，删除原来的外部软链，然后直接使用 `nb_data/`，或创建
+`naturebench_data -> nb_data` 这样的相对软链。产品不会自动复制外部软链的目标。
+`workspace_transfer` 用于受管 Workspace 之间的文件复制，不导入任意宿主目录。
+修正数据后重新执行计算并核对真实产物，不应以合成数据替代被阻塞的数据。
+
 ## 环境管理
 
 用 `environment_create`、`environment_install`、`environment_uninstall` 管理依赖。创建时的语言只是初始工具；之后可用 conda 增加 Python 或 R，再在同一环境用 pip、CRAN/Bioconductor 安装包。更新在原前缀进行，不为每个 Revision clone 环境；执行按环境 ID 使用最新版并记录实际 Revision。历史重建不开放给 Agent。

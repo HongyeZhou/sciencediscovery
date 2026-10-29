@@ -162,7 +162,15 @@ export async function workspaceSnapshot(workspaceRoot: string): Promise<Map<stri
   const snapshot = new Map<string, string>();
 
   async function visit(directory: string): Promise<void> {
-    for (const entry of await readdir(directory, { withFileTypes: true })) {
+    // This is a live metadata/quota scan, not the committed CAS snapshot. Writers
+    // may atomically rename files or remove a child directory after enumeration.
+    // A vanished child contributes no current bytes; genuine I/O/permission
+    // errors and an unavailable workspace root must still stop the execution.
+    const entries = await readdir(directory, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
+      if (directory !== workspaceRoot && error.code === "ENOENT") return [];
+      throw error;
+    });
+    for (const entry of entries) {
       const fullPath = resolve(directory, entry.name);
       if (entry.isSymbolicLink()) continue;
       if (entry.isDirectory()) {
@@ -170,12 +178,21 @@ export async function workspaceSnapshot(workspaceRoot: string): Promise<Map<stri
         continue;
       }
       if (!entry.isFile()) continue;
-      const metadata = await stat(fullPath);
+      const metadata = await stat(fullPath).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return undefined;
+        throw error;
+      });
+      if (!metadata) continue;
       snapshot.set(relative(workspaceRoot, fullPath).split(sep).join("/"), `${metadata.size}:${metadata.mtimeMs}`);
     }
   }
 
   await visit(workspaceRoot);
+  // Do not mistake removal of the whole workspace during the scan for an empty
+  // workspace merely because all of its enumerated children disappeared.
+  if (!(await stat(workspaceRoot)).isDirectory()) {
+    throw Object.assign(new Error("Workspace root must remain a directory during the scan"), { code: "ENOTDIR", path: workspaceRoot });
+  }
   return snapshot;
 }
 
@@ -772,6 +789,7 @@ export function buildSandboxLaunch(options: {
   const env: Record<string, string> = {
     HOME: "/tmp",
     PATH: options.npu ? `/usr/local/bin:${options.pathEnv}` : options.pathEnv,
+    PYTHONUNBUFFERED: "1",
   };
   // CANN's operator compiler is imported as ordinary Python, so its search path
   // has to join PYTHONPATH rather than replace whatever the environment set.
@@ -855,7 +873,7 @@ function launchEnvironment(options: {
   skillRoots?: SandboxSkillRoots;
   temp?: string;
 }): Record<string, string> {
-  const env: Record<string, string> = { HOME: options.home, PATH: options.pathEnv };
+  const env: Record<string, string> = { HOME: options.home, PATH: options.pathEnv, PYTHONUNBUFFERED: "1" };
   if (options.temp) {
     env.TMPDIR = options.temp;
     env.TMP = options.temp;
@@ -950,6 +968,64 @@ export async function prepareSandboxLaunch(
   });
   launch.executable = config.bwrapPath;
   return launch;
+}
+
+/** Check link targets in the execution namespace, never by dereferencing host data. */
+export async function assertSandboxWorkspaceLinks(
+  config: SandboxRuntimeConfig,
+  launch: SandboxLaunch,
+  workspaceRoot: string,
+  readOnlyWorkspaceRoot?: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const links: Buffer[] = [];
+  const writablePath = workspaceBindArguments(workspaceRoot, readOnlyWorkspaceRoot).chdir;
+  const slash = Buffer.from("/");
+  async function visit(host: Buffer, sandbox: Buffer): Promise<void> {
+    for (const entry of await readdir(host, { withFileTypes: true, encoding: "buffer" })) {
+      const path = Buffer.concat([host, slash, entry.name]);
+      const visible = Buffer.concat([sandbox, slash, entry.name]);
+      if (entry.isSymbolicLink()) links.push(visible);
+      else if (entry.isDirectory()) await visit(path, visible);
+    }
+  }
+  await visit(Buffer.from(workspaceRoot), Buffer.from(launch.sandbox === "seatbelt" ? workspaceRoot : writablePath));
+  if (readOnlyWorkspaceRoot) {
+    await visit(Buffer.from(readOnlyWorkspaceRoot), Buffer.from(launch.sandbox === "seatbelt" ? readOnlyWorkspaceRoot
+      : writablePath === "/workspace" ? "/parent_workspace" : "/workspace"));
+  }
+  if (!links.length) return;
+  signal?.throwIfAborted();
+  // NUL-separated stdin keeps arbitrary filenames out of shell source and argv.
+  const script = `while IFS= read -r -d '' path; do
+    if ! test -e "$path" || ! test -r "$path"; then
+      printf 'Workspace symlink %q is not readable in the sandbox. Copy or upload the real data into the workspace, or use workspace_transfer between managed workspaces; replace the link with a workspace-relative link to that data.\\n' "$path" >&2
+      exit 78
+    fi
+  done`;
+  const child = await spawnSandboxProcess(config, { ...launch, commandPrefix: [] },
+    [sandboxCommandPath(launch, "/usr/bin/bash", "/bin/bash"), "--noprofile", "--norc", "-c", script], "baseline");
+  let stderr = "";
+  child.stderr.on("data", (chunk: Buffer) => { stderr = truncateToBudget(stderr + chunk.toString(), 8192); });
+  child.stdout.resume();
+  child.stdin.on("error", () => { /* An early rejection can close stdin before all links are sent. */ });
+  const abort = () => { killSandboxProcess(child); };
+  const timer = setTimeout(abort, 30_000);
+  signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted) abort();
+  try {
+    const closed = new Promise<number | null>((done, reject) => {
+      child.once("error", reject);
+      child.once("close", done);
+    });
+    child.stdin.end(Buffer.concat(links.flatMap((path) => [path, Buffer.from([0])])));
+    const code = await closed;
+    signal?.throwIfAborted();
+    if (code !== 0) throw new Error(stderr.trim() || "Sandbox workspace symlink validation did not complete");
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
+  }
 }
 
 /** Host path for a command or injected runtime, preserving Linux mount paths. */
@@ -1095,6 +1171,7 @@ export async function executePython(
     workspaceBindArgs: workspaceBinds.args,
     workspaceRoot,
   });
+  await assertSandboxWorkspaceLinks(config, launch, workspaceRoot, readOnlyWorkspaceRoot, signal);
   const commandArguments = [
     runtime
       ? sandboxCommandPath(
@@ -1230,6 +1307,7 @@ export async function executeShell(
     workspaceBindArgs: workspaceBinds.args,
     workspaceRoot,
   });
+  await assertSandboxWorkspaceLinks(config, launch, workspaceRoot, readOnlyWorkspaceRoot, signal);
   const commandArguments = [
     sandboxCommandPath(launch, "/usr/bin/bash", "/bin/bash"),
     "--noprofile",
@@ -1335,7 +1413,7 @@ export async function executeDirectShell(
   const startedAt = new Date().toISOString();
   // Do not inject Runner service credentials into the process environment. Host
   // filesystem/network access is still unrestricted and is disclosed at consent.
-  const env = { PATH: "/usr/bin:/bin", HOME: userInfo().homedir, LANG: "C.UTF-8" };
+  const env = { PATH: "/usr/bin:/bin", HOME: userInfo().homedir, LANG: "C.UTF-8", PYTHONUNBUFFERED: "1" };
   const launch: SandboxLaunch = { args: [], chdir: cwd, commandPrefix: [], env };
   const result = await runSandboxed(config, launch, [], request.code,
     executionTimeoutMs(request.executionTimeoutMs, config.execTimeoutMs), workspaceRoot, signal,

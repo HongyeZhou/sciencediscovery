@@ -61,6 +61,9 @@ export const ZH = {
     /** The `+` on a Project fold; the name is in it because a row of several
      *  identical buttons is not distinguishable to a screen reader. */
     newSessionInProject: (name: string) => `在「${name}」中新建会话`,
+    /** The `⋯` on a Project fold: rename and delete, the same two the session
+     *  row offers. */
+    projectMenu: "项目菜单",
     noTasks: "暂无会话",
     showMore: "显示更多",
     collapseSidebar: "收起侧栏",
@@ -129,8 +132,22 @@ export const ZH = {
     unlimited: "不限",
     busy: "上传中…",
     tooLarge: (name: string, limit: string) => `${name} 超过 ${limit}，没有上传。`,
-    uploaded: (path: string) => `已上传 ${path}`,
+    tooMany: (max: number) => `单次对话最多上传${max}个附件。`,
     failed: (name: string, reason: string) => `${name}：${reason}`,
+  },
+
+  /** The cards the composer holds: one per file, from the moment it is chosen
+   *  until the message that carries it is sent. */
+  attachment: {
+    uploading: "上传中…",
+    failed: "上传失败",
+    retry: "重试",
+    remove: (name: string) => `移除 ${name}`,
+    delete: "删除",
+    clear: "清空附件",
+    /** The line under the name once the upload landed. */
+    detail: (type: string, size: string) => (type === "" ? size : `${type} ${size}`),
+    tray: "已选择的附件",
   },
 
   conversation: {
@@ -276,6 +293,31 @@ export const ZH = {
     },
   },
 
+  /** The first-run guide over the task page: three cards, one per part a new
+   *  user has to find. It is read once and can be replayed from 设置 › 通用. */
+  guide: {
+    label: "新手引导",
+    step: (index: number, total: number) => `第 ${index} / ${total} 步`,
+    skip: "跳过",
+    back: "上一步",
+    next: "下一步",
+    done: "开始使用",
+    steps: {
+      composer: {
+        title: "对话框",
+        body: "在中间的输入框里写研究需求，按 Enter 发送。左边的 + 可以上传文件，右边的下拉可以选择模型和权限模式，输入 / 可以直接引用技能和指令。第一句话发出去，这里就变成一段对话。",
+      },
+      settings: {
+        title: "设置",
+        body: "左侧窄栏里的「设置」打开配置面板：模型、技能、MCP 服务器、专家和网络都在这里，改完立即生效，不需要保存。",
+      },
+      panel: {
+        title: "右侧栏",
+        body: "右侧的工作区面板列出这次会话产生的产物和文件，点开即可预览；拖动它左边的分隔线可以调整宽度，顶部的按钮可以收起。",
+      },
+    },
+  },
+
   permission: {
     required: "需要权限",
     allowOnce: "仅允许一次",
@@ -403,6 +445,14 @@ export const ZH = {
         english: "English",
         chinese: "简体中文",
       },
+      /** The row that plays the first-run guide again. It is here rather than
+       *  behind a help menu because 设置 › 通用 is where a user looks when the
+       *  interface is the problem. */
+      guide: {
+        heading: "新手引导",
+        field: "界面导览",
+        action: "重新查看",
+      },
     },
     loading: "正在读取…",
     retry: "重试",
@@ -518,6 +568,7 @@ export const ZH = {
         cpuCores: (count: number) => `${count} 核`,
         credentials: {
           cancel: "取消",
+          forget: "忘记已存的密码、私钥和口令",
           heading: "登录凭据",
           keyKeep: "留空则沿用已存的私钥",
           note: "凭据只写不读：存进去之后接口不会再返回它们，这里留空就是沿用已存的那一份。",
@@ -1016,6 +1067,9 @@ export const ZH = {
     /** The control that appears on an edge the divider closed. */
     expand: "展开",
     collapsePanel: "收起面板",
+    /** The way out of a subagent's record or a tool's text, back to the
+     *  panel's own groups. */
+    backToGroups: "返回产物和文件",
     allArtifacts: "所有产物",
     download: "下载",
     /** The picker beside an open document that chooses which version of the
@@ -1025,6 +1079,21 @@ export const ZH = {
     searchFiles: "搜索文件",
     /** A search that matched nothing, as opposed to a list that was empty. */
     searchEmpty: "没有匹配的内容。",
+    /** The caption under a table that holds all of the document's rows. */
+    tableRows: (count: number) => `共 ${count} 行`,
+    /** The same caption when the panel holds only the head of a larger table. */
+    tableRowsShown: (shown: number, total: number) => `显示前 ${shown} 行，共 ${total} 行`,
+    /** A column whose first cell named nothing, named by where it sits. */
+    tableColumn: (index: number) => `列 ${index}`,
+    tableEmpty: "这个表格没有数据。",
+    workbookUnreadable: "这个工作簿无法读取，请下载后查看。",
+    worksheets: "工作表",
+    imageAlt: (name: string) => `${name} 的预览`,
+    imageActual: "按原始尺寸显示",
+    imageFit: "适应面板宽度",
+    pdfFallback: "页面没有显示时可以下载后查看：",
+    tooLarge: "文件太大，暂时无法在面板内预览，请下载后查看。",
+    sourceTruncated: "文件较长，这里只显示了开头部分。",
   },
 
   /** The 三维 structure view that opens for structure files. */
@@ -1049,6 +1118,10 @@ export const ZH = {
     modelRequired: "还没有可用的模型，请先在设置里配置。",
     rename: "重命名失败",
     deleteWarning: (title: string) => `删除「${title}」会连同它的工作区数据一起清掉，且无法恢复。`,
+    /** A Project takes its Sessions with it, so the sentence has to say so —
+     *  deleting one Session is not what the reader is agreeing to. */
+    deleteProjectWarning: (name: string) =>
+      `删除项目「${name}」会连同它下面的所有会话、工作区和产物一起清掉，且无法恢复。`,
   },
 
   status: {

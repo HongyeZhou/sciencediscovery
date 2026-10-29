@@ -25,6 +25,7 @@ import {
 import { ApiClient } from "./api/client.js";
 import { listSubagents } from "./api/sessions.js";
 import type { Subagent } from "./api/types.js";
+import type { GuideStep } from "./app/guide.js";
 import { isEmptyTranscript, landingKey } from "./app/landing.js";
 import type { ToolDetail } from "./app/tool-io.js";
 import { useFileDrop } from "./app/use-file-drop.js";
@@ -34,6 +35,7 @@ import { useWorkspace } from "./app/use-workspace.js";
 import { formatByteLimit } from "./app/upload.js";
 import { allSubagents } from "./run-stream/model.js";
 import {
+  GUIDE_STORAGE_KEY,
   RIGHT_PANEL_STORAGE_KEY,
   TOKEN_STORAGE_KEY,
   readStoredFlag,
@@ -44,6 +46,7 @@ import { AuthScreen } from "./views/AuthScreen.js";
 import { Composer } from "./views/Composer.js";
 import { ConfirmDialog } from "./views/ConfirmDialog.js";
 import { Conversation } from "./views/Conversation.js";
+import { Guide } from "./views/Guide.js";
 import { Landing } from "./views/Landing.js";
 import { OfflineScreen } from "./views/OfflineScreen.js";
 import { Rail } from "./views/Rail.js";
@@ -118,6 +121,73 @@ export function App({ initialToken }: Props) {
     writeStoredFlag(localStorage, RIGHT_PANEL_STORAGE_KEY, workspaceOpen);
   }, [workspaceOpen]);
 
+  /** The first-run guide: three cards over the composer, 设置 and the panel. */
+  const [guideOpen, setGuideOpen] = useState(false);
+  /** Whether the guide has been dealt with — shown, dismissed, or never shown
+   *  because it had been read. A ref, not state: it only decides whether the
+   *  timer below may still fire, and a state change would re-run the effect
+   *  that started it.
+   *
+   *  It also covers storage that refuses to keep the flag: without it, a
+   *  dismissed guide would reopen on the next render forever. */
+  const guideHandled = useRef(false);
+  /** The panel as the user left it. The guide opens the panel for its last card
+   *  and 结束 puts back what was there, so reading three cards does not
+   *  rearrange the window. */
+  const panelBeforeGuide = useRef(false);
+  /** What the page was on the last render. The guide is opened from a timer and
+   *  from a settings button, neither of which may close over the page as it was
+   *  when the handler was built. */
+  const pageRef = useRef({ landing: false, running: false });
+  const workspaceOpenRef = useRef(workspaceOpen);
+  useEffect(() => {
+    workspaceOpenRef.current = workspaceOpen;
+  }, [workspaceOpen]);
+
+  const openGuide = useCallback(() => {
+    panelBeforeGuide.current = workspaceOpenRef.current;
+    // The welcome page is where a conversation starts, so that is the page the
+    // first card describes. Switched here, before the cards are drawn, so the
+    // card is placed against the composer it is about rather than jumping to
+    // it once the page changes underneath. Nothing is written: a draft is what
+    // the app shows before the first message, and it is where the reader is
+    // left — the tour is for someone who has not started yet.
+    const page = pageRef.current;
+    if (!page.landing && !page.running) actions.startDraft();
+    setGuideOpen(true);
+  }, [actions]);
+
+  // Shown on the first arrival at the task page, which is also the first
+  // moment it is true: `setup` replaces the shell with the wizard, and the
+  // cards describe a page that is not there yet. The pause is for the paint —
+  // a card that lands before the page has drawn measures nothing.
+  useEffect(() => {
+    if (boot !== "ready" || guideHandled.current) return;
+    if (readStoredFlag(localStorage, GUIDE_STORAGE_KEY)) {
+      guideHandled.current = true;
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      guideHandled.current = true;
+      openGuide();
+    }, 400);
+    return () => window.clearTimeout(timer);
+  }, [boot, openGuide]);
+
+  const closeGuide = useCallback(() => {
+    setGuideOpen(false);
+    // Written on every exit, including a skip: the guide has had its one
+    // chance, and 设置 › 通用 › 重新查看 is the way back.
+    writeStoredFlag(localStorage, GUIDE_STORAGE_KEY, true);
+    setWorkspaceOpen(panelBeforeGuide.current);
+  }, []);
+
+  /** 右侧栏 is a card about something that may be closed, so the guide opens
+   *  it; the other two put the panel back the way the user had it. */
+  const guideStep = useCallback((step: GuideStep) => {
+    setWorkspaceOpen(step.key === "panel" ? true : panelBeforeGuide.current);
+  }, []);
+
   /** A subagent may be in the live run or in any replayed one; both are the
    *  same view of the session, so the lookup spans both. */
   const foundSubagent = useMemo(() => {
@@ -190,27 +260,31 @@ export function App({ initialToken }: Props) {
     setSubagentCatalog([]);
   }, [state.sessionId]);
 
-  // The line that opens a child is also the way out: pressing the open line
-  // again returns the panel to its groups. The panel has no back arrow of its
-  // own, so the toggle is the only way back.
+  // Pressing a line opens the child it belongs to, and pressing the same line
+  // again keeps it open: the reader pressed a row to read it, and a row that
+  // took the record away on a second press would look like a misread rather
+  // than a decision. The panel draws its own way back.
   const openSubagentDetails = useCallback((id: string) => {
-    setOpenSubagentId((current) => (current === id ? undefined : id));
+    setOpenSubagentId(id);
     setOpenTool(undefined);
     setWorkspaceOpen(true);
   }, []);
 
   /**
-   * The same gesture for a tool's input or result: the block opens it, and a
-   * second press on the same block closes it. Pressing another block swaps the
-   * panel's content, because the panel is where the reader is already looking.
+   * The same gesture for a tool's input or result: the block opens it, and
+   * pressing another block swaps the panel's content, because the panel is
+   * where the reader is already looking.
    */
   const openToolDetails = useCallback((detail: ToolDetail) => {
-    setOpenTool((current) =>
-      current !== undefined && current.toolId === detail.toolId && current.id === detail.id
-        ? undefined
-        : detail);
+    setOpenTool(detail);
     setOpenSubagentId(undefined);
     setWorkspaceOpen(true);
+  }, []);
+
+  /** Back from a child's record or a tool's text to the panel's own groups. */
+  const closePanelDetail = useCallback(() => {
+    setOpenSubagentId(undefined);
+    setOpenTool(undefined);
   }, []);
 
   /**
@@ -245,6 +319,21 @@ export function App({ initialToken }: Props) {
    *  than pinned to the bottom of a page with nothing above it. A run that is
    *  still going keeps the transcript, even before its first event lands. */
   const landing = !state.loadingSession && !state.running && isEmptyTranscript(state);
+
+  useEffect(() => {
+    pageRef.current = { landing, running: state.running };
+  }, [landing, state.running]);
+
+  // The tour is a tour of the page a new conversation starts on, so while it is
+  // on screen the page stays there. Switching once when the guide opens is not
+  // enough: the Session the boot listing resumes can finish opening after the
+  // cards are already up. A run in progress is left alone — it is not a page
+  // the tour may discard, and the composer card is true of it as it stands. The
+  // overlay takes the clicks, so nothing else can move the page in between.
+  useEffect(() => {
+    if (!guideOpen || landing || state.running) return;
+    actions.startDraft();
+  }, [actions, guideOpen, landing, state.running]);
 
   const acceptToken = (next: string) => {
     try {
@@ -350,11 +439,15 @@ export function App({ initialToken }: Props) {
     approvalMode: state.detail?.approvalMode,
     attachBlocked: canUpload ? undefined : TEXT.composer.attachArchived,
     attachLimit,
+    attachments: state.attachments,
     client,
     models: state.models,
     onApprovalMode: (mode) => void actions.setApprovalMode(mode),
+    onClearAttachments: actions.clearAttachments,
     onCreateProject: (name) => void actions.createProject(name),
     onOpenSettings: () => openSettings("models"),
+    onRemoveAttachment: actions.removeAttachment,
+    onRetryAttachment: actions.retryAttachment,
     onSelectModel: (modelId) => void actions.selectModel(modelId),
     onSelectProject: (projectId) => actions.selectProject(projectId),
     onSelectSpecialist: (specialistId) => void actions.selectSpecialist(specialistId),
@@ -455,6 +548,7 @@ export function App({ initialToken }: Props) {
           actions={actions}
           activeGroup={panelGroup}
           files={state.panelFiles}
+          onCloseDetail={closePanelDetail}
           onCollapse={collapsePanel}
           onSelectGroup={setPanelGroup}
           outputs={state.outputs}
@@ -475,9 +569,18 @@ export function App({ initialToken }: Props) {
           group={settingsGroup}
           onClose={() => setSettingsOpen(false)}
           onGroupChange={setSettingsGroup}
+          // 设置 is where a user looks when the interface is what they cannot
+          // find, so the guide's one replay lives there. The dialog has to go
+          // first: the cards point at the page behind it.
+          onShowGuide={() => {
+            setSettingsOpen(false);
+            openGuide();
+          }}
           state={state}
         />
       ) : null}
+
+      {guideOpen ? <Guide onClose={closeGuide} onStep={guideStep} /> : null}
 
       {/* The whole window is the drop target, so the whole window is what has
           to say so. It is drawn only while a file is actually over the app,

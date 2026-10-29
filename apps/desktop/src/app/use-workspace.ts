@@ -15,11 +15,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { artifactName } from "./artifact-labels.js";
+import {
+  MAX_ATTACHMENTS,
+  failUpload,
+  mergeUpload,
+  takeWithinLimit,
+  type Attachment,
+} from "./attachments.js";
 import { resolveCatalog, resolveConnection } from "./bootstrap.js";
+import { documentPayload } from "./document-payload.js";
 import { changedFiles } from "./file-changes.js";
 import { changesPanel, createPanelRefresh, type PanelRefresh } from "./panel-refresh.js";
 import { fileName } from "./paths.js";
-import { byRecency, reusableDraft, resumeOnBoot } from "./session-order.js";
+import { byRecency, reusableDraft, resumeOnBoot, withConversation } from "./session-order.js";
 import { sessionTitle } from "./session-title.js";
 import { formatByteLimit, splitBySize } from "./upload.js";
 import {
@@ -37,6 +45,7 @@ import {
   cancelCurrentRun,
   createProject as createProjectRequest,
   createSession,
+  deleteProject as deleteProjectRequest,
   deleteSession,
   ensureInbox,
   getSession,
@@ -48,6 +57,8 @@ import {
   listWorkspaceFiles,
   readArtifactVersion,
   readWorkspaceFile,
+  type DocumentBytes,
+  renameProject as renameProjectRequest,
   updateSession,
   uploadWorkspaceFiles,
 } from "../api/sessions.js";
@@ -112,6 +123,9 @@ export interface WorkspaceState {
   /** Its name, which the composer and the Session bar show. The inbox is titled
    *  with the interface's own word for it, never with the stored name. */
   activeProjectName?: string;
+  /** The files in the composer, oldest first. Cleared when the open Session
+   *  changes, and emptied of what it sent by a send. */
+  attachments: Attachment[];
   connection: Connection;
   confirm: ConfirmRequest | undefined;
   defaultModelId?: string;
@@ -169,10 +183,15 @@ export interface WorkspaceActions {
   /** Opens the confirmation dialog. Exposed so a settings row can route its own
    *  destructive action through the same dialog instead of growing a second one. */
   confirmAction: (request: ConfirmRequest) => void;
+  /** Take every card out of the composer. The tray's 清空附件. */
+  clearAttachments: () => void;
   /** Answer one authorization request raised by the running turn. */
   decidePermission: (requestId: string, decision: PermissionDecision) => Promise<void>;
   /** Opens the confirmation dialog; the deletion itself happens on accept. */
   deleteSession: (session: Session) => void;
+  /** The same gate for a Project: accepting removes it with every Session it
+   *  holds, and the open conversation if it was one of them. */
+  deleteProject: (project: Project) => void;
   dismissConfirm: () => void;
   dismissToast: (id: number) => void;
   finishSetup: () => void;
@@ -195,9 +214,20 @@ export interface WorkspaceActions {
   /** `projectId` is the Project the row came from: naming it lets the app file
    *  later writes under it before the Session read comes back. */
   openSession: (sessionId: string, projectId?: string) => Promise<void>;
+  renameProject: (project: Project, name: string) => Promise<void>;
   renameSession: (session: Session, title: string) => Promise<void>;
   /** Re-read the model catalog after the wizard or settings changed it. */
   refreshCatalog: () => Promise<void>;
+  /** Take one card out of the composer. The file stays in the workspace: the
+   *  upload has already happened, and this is the tray, not the workspace. */
+  removeAttachment: (id: string) => void;
+  /** Send one failed card again, keeping its place in the tray. */
+  retryAttachment: (id: string) => void;
+  /** Clear the view back to an empty draft, writing nothing. Used by 新增会话
+   *  before it creates, by a deletion that removed the open Session, and by the
+   *  first-run guide, which is about the welcome page and puts the conversation
+   *  it interrupted back through `openSession` when it ends. */
+  startDraft: () => void;
   retryBoot: () => void;
   selectModel: (modelId: string) => Promise<void>;
   send: (content: string) => Promise<void>;
@@ -294,6 +324,17 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
   /** The per-file ceiling `/api/health` reported. `undefined` means the service
    *  did not say, which is not the same as "no limit" — see `splitBySize`. */
   const [uploadLimit, setUploadLimit] = useState<number | undefined>(undefined);
+  /** The files in the composer, in the order they were chosen. They belong to
+   *  the open Session — a draft has its own — and to the turn being written,
+   *  which is why sending takes them away. */
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  /** The same list, for the reads that happen in a callback rather than a
+   *  render: a second drop has to count what the first one added. */
+  const attachmentsRef = useRef<Attachment[]>([]);
+  const commitAttachments = useCallback((update: (current: Attachment[]) => Attachment[]) => {
+    attachmentsRef.current = update(attachmentsRef.current);
+    setAttachments(attachmentsRef.current);
+  }, []);
 
   // Mirrors for the async paths. A run's own callbacks outlive the render that
   // started them, so they cannot close over the state they need to read.
@@ -704,7 +745,11 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
         // its answer is newer than this listing is.
         if (tab.source !== "file" || tab.loading || !changed.has(tab.path)) continue;
         void readWorkspaceFile(client, target, tab.path)
-          .then((content) => settleTab(tab.id, { content, error: undefined, loading: false }))
+          .then((document) => settleTab(tab.id, {
+            ...documentPayload(document.bytes, tab.path, document.mediaType),
+            error: undefined,
+            loading: false,
+          }))
           .catch(() => {
             // The document keeps what it had; the next write reads it again.
           });
@@ -771,9 +816,64 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
    * compare against, and a local guess that refuses a file the server would have
    * accepted is a dead end the user cannot get around.
    */
+  /** How the next card is named. The id only has to be unique among the cards
+   *  on screen; nothing outside this window ever sees it. */
+  const attachmentSeq = useRef(0);
+
+  /**
+   * Put a batch of cards on the wire.
+   *
+   * The cards are already in the tray when this starts — they are what the user
+   * sees while the upload is happening — and the answer settles their status.
+   * One request for the batch rather than one per file: the server counts the
+   * batch against its request-size quota, and a batch is what the user did.
+   */
+  const sendAttachments = useCallback(
+    async (sent: readonly Attachment[]): Promise<boolean> => {
+      if (sent.length === 0) return false;
+      const ids = sent.map((item) => item.id);
+      setUploading(true);
+      let target: string | undefined;
+      try {
+        // Only now, after the local checks: a drop that is going to be refused
+        // must not leave an empty session behind.
+        target = await ensureSession();
+        if (target === undefined) {
+          commitAttachments((current) => failUpload(current, ids, TEXT.errors.generic));
+          return false;
+        }
+        const result = await uploadWorkspaceFiles(client, target, sent.map((item) => item.file));
+        commitAttachments((current) => mergeUpload(current, ids, result));
+        await refreshPanel(target);
+        // The card carries the outcome, so the toast is only for what the card
+        // cannot say: the reason. A name already reported by its own entry is
+        // not repeated from `errors`, which lists the same failures.
+        const reported = new Set<string>();
+        for (const item of result.uploaded) {
+          if (item.status !== "failed") continue;
+          reported.add(item.originalName);
+          toast(TEXT.upload.failed(item.originalName, item.error ?? TEXT.errors.generic));
+        }
+        for (const entry of result.errors) {
+          if (!reported.has(entry.name)) toast(TEXT.upload.failed(entry.name, entry.error));
+        }
+        return result.uploaded.some((item) => item.status !== "failed");
+      } catch (reason) {
+        commitAttachments((current) => failUpload(current, ids, errorMessage(reason)));
+        report(reason);
+        return false;
+      } finally {
+        setUploading(false);
+      }
+    },
+    [client, commitAttachments, ensureSession, refreshPanel, report, toast],
+  );
+
   const uploadFiles = useCallback(
     async (files: File[]): Promise<boolean> => {
       if (files.length === 0) return false;
+      // Both limits are local decisions, made before anything is drawn: a file
+      // the route would refuse must not appear as a card that is uploading.
       const { accepted, oversized } = uploadLimit === undefined
         ? { accepted: files, oversized: [] as File[] }
         : splitBySize(files, uploadLimit);
@@ -783,35 +883,49 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
       for (const file of oversized) {
         if (ceiling !== undefined) toast(TEXT.upload.tooLarge(file.name, ceiling));
       }
-      if (accepted.length === 0) return false;
-      setUploading(true);
-      try {
-        // Only now, after the local checks: a drop that is going to be refused
-        // for its size must not leave an empty session behind.
-        const target = await ensureSession();
-        if (target === undefined) return false;
-        const result = await uploadWorkspaceFiles(client, target, accepted);
-        await refreshPanel(target);
-        let landed = false;
-        for (const item of result.uploaded) {
-          // The path, not the name: a collision is renamed on the server, and
-          // the name the user chose is then not where the file is.
-          if (item.status === "failed") toast(TEXT.upload.failed(item.originalName, item.error ?? TEXT.errors.generic));
-          else {
-            landed = true;
-            toast(TEXT.upload.uploaded(item.path ?? item.originalName), "info");
-          }
-        }
-        for (const entry of result.errors) toast(TEXT.upload.failed(entry.name, entry.error));
-        return landed;
-      } catch (reason) {
-        report(reason);
-        return false;
-      } finally {
-        setUploading(false);
-      }
+      const room = MAX_ATTACHMENTS - attachmentsRef.current.length;
+      const fitting = takeWithinLimit(accepted, room);
+      if (fitting.overflow > 0) toast(TEXT.upload.tooMany(MAX_ATTACHMENTS));
+      if (fitting.accepted.length === 0) return false;
+      const batch: Attachment[] = fitting.accepted.map((file) => {
+        attachmentSeq.current += 1;
+        return {
+          file,
+          id: `attachment-${attachmentSeq.current}`,
+          name: file.name,
+          size: file.size,
+          status: "uploading",
+        };
+      });
+      commitAttachments((current) => [...current, ...batch]);
+      return sendAttachments(batch);
     },
-    [client, ensureSession, refreshPanel, report, toast, uploadLimit],
+    [commitAttachments, sendAttachments, toast, uploadLimit],
+  );
+
+  const removeAttachment = useCallback(
+    (id: string) => {
+      commitAttachments((current) => current.filter((item) => item.id !== id));
+    },
+    [commitAttachments],
+  );
+
+  const clearAttachments = useCallback(() => {
+    commitAttachments(() => []);
+  }, [commitAttachments]);
+
+  /** Re-send one card that failed. The file is still in the browser, so this is
+   *  the same upload with the same card rather than a second one. */
+  const retryAttachment = useCallback(
+    (id: string) => {
+      const card = attachmentsRef.current.find((item) => item.id === id);
+      if (card === undefined) return;
+      commitAttachments((current) => current.map((item) => (
+        item.id === id ? { ...item, error: undefined, status: "uploading" } : item
+      )));
+      void sendAttachments([{ ...card, error: undefined, status: "uploading" }]);
+    },
+    [commitAttachments, sendAttachments],
   );
 
   // ── run stream ───────────────────────────────────────────────────────────
@@ -824,6 +938,12 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
       (event, sequence) => {
         if (sessionRef.current !== target) return;
         updateRun((current) => reduceRunStream(current, event, sequence));
+        // The first message names its Session, and the name is what puts the
+        // row in the sidebar. The service publishes that rename on this stream,
+        // ahead of the run's own events, so the row appears with the message
+        // rather than at the end of its first answer. A later rename lands in
+        // the same list; the read is shared and rare.
+        if (event?.type === "session.updated") void refreshSessionLists();
         // 产物 and the workspace tree are read back from the service rather
         // than folded in from the event: the artifact list spans Sessions and
         // every version, and a read is what keeps it agreeing with the
@@ -835,7 +955,7 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
           panelRefresh.current?.request();
         }
       },
-    [updateRun],
+    [refreshSessionLists, updateRun],
   );
 
   /**
@@ -935,6 +1055,11 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
         return;
       }
       resetRun();
+      // The tray was what this message carried. The files it managed to send
+      // are in the session's workspace now, and the card has done its job; a
+      // failed one stays, because the only way to put it right is to retry it
+      // and a card that vanished would take that away.
+      commitAttachments((current) => current.filter((item) => item.status !== "uploaded"));
       runningRef.current = true;
       setRunning(true);
       const controller = new AbortController();
@@ -965,7 +1090,7 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
         }
       }
     },
-    [applyEvent, client, ensureSession, onAuthRejected, report, resetRun, settle, toast, updateRun],
+    [applyEvent, client, commitAttachments, ensureSession, onAuthRejected, report, resetRun, settle, toast, updateRun],
   );
 
   /**
@@ -1031,6 +1156,10 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
     // that Session's group — the others keep their rows without a re-read.
     publishArtifacts();
     setPanelFiles([]);
+    // Attachments belong to the Session that received them; the next one has
+    // its own workspace, and a card for a file that is not in it would be a
+    // receipt for something the user cannot find.
+    commitAttachments(() => []);
     // The listing belonged to the Session being left, so the next one starts
     // with nothing to compare against rather than reading its documents as
     // rewritten because the paths happen to collide.
@@ -1041,7 +1170,7 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
     panelRefresh.current?.cancel();
     panelRefreshTarget.current = undefined;
     resetRun();
-  }, [publishArtifacts, resetRun]);
+  }, [commitAttachments, publishArtifacts, resetRun]);
 
   /** Clear the view back to an empty draft, writing nothing. Used by 新增会话
    *  before it creates, and by a deletion that removed the open Session (there
@@ -1312,7 +1441,7 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
   }, []);
 
   const openPreview = useCallback(
-    async (request: DocumentRequest, read: (target: string) => Promise<string>) => {
+    async (request: DocumentRequest, read: (target: string) => Promise<DocumentBytes>) => {
       // An artifact carries the Session its version was written in: the list
       // shows every Session's output, so the open one is only the fallback.
       const target = request.sessionId ?? sessionRef.current;
@@ -1337,8 +1466,13 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
         else settleVersion(openedId, versionId, patch);
       };
       setTabs(placed);
+      const name = request.path === "" ? request.label : request.path;
       try {
-        settle({ content: await read(target), loading: false });
+        const document = await read(target);
+        // Text for a document that is read, a data URL for one that is drawn;
+        // which of the two is `documentPayload`'s decision, from the name and
+        // the type the server gave the bytes.
+        settle({ ...documentPayload(document.bytes, name, document.mediaType), loading: false });
       } catch (reason) {
         settle({ error: errorMessage(reason), loading: false });
       }
@@ -1398,6 +1532,7 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
             ? {
                 ...tab,
                 content: undefined,
+                dataUrl: undefined,
                 error: undefined,
                 loading: true,
                 // A version may have been written elsewhere than the one before
@@ -1408,8 +1543,11 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
             : tab),
       }));
       try {
-        const content = await readArtifactVersion(client, target, versionId);
-        settleVersion(tabId, versionId, { content, loading: false });
+        const document = await readArtifactVersion(client, target, versionId);
+        const name = output.version.sourcePath === undefined || output.version.sourcePath === ""
+          ? artifactName(output)
+          : output.version.sourcePath;
+        settleVersion(tabId, versionId, { ...documentPayload(document.bytes, name, document.mediaType), loading: false });
       } catch (reason) {
         settleVersion(tabId, versionId, { error: errorMessage(reason), loading: false });
       }
@@ -1508,11 +1646,22 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
     [],
   );
 
+  // What the sidebar lists: the raw listing keeps the drafts as well, because
+  // 新建会话 reuses one and a draft is what a new Project opens on, but a
+  // Session nobody has written in is not a row the reader asked for.
+  const listedByProject = useMemo(() => {
+    const listed: Record<string, Session[]> = {};
+    for (const [projectId, sessions] of Object.entries(sessionsByProject)) {
+      listed[projectId] = withConversation(sessions);
+    }
+    return listed;
+  }, [sessionsByProject]);
+
   // 最近会话 is the inbox's own list, not every Session in the workspace: the
   // user's Projects show their Sessions under their own fold.
   const recent = useMemo(
-    () => (inboxProject === undefined ? [] : byRecency(sessionsByProject[inboxProject.id] ?? [])),
-    [inboxProject, sessionsByProject],
+    () => (inboxProject === undefined ? [] : byRecency(listedByProject[inboxProject.id] ?? [])),
+    [inboxProject, listedByProject],
   );
 
   // Which Project the open Session is in, or the inbox while none is open. The
@@ -1532,9 +1681,40 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
 
   const actions: WorkspaceActions = useMemo(
     () => ({
+      clearAttachments,
       closeTab,
       confirmAction,
       createProject: createProjectAndOpen,
+      deleteProject: (project) =>
+        confirmAction({
+          accept: TEXT.menu.delete,
+          // The Project's own name, because the row is the only place the user
+          // named it — unlike a Session, whose title the service may have
+          // chosen from the first message.
+          body: TEXT.errors.deleteProjectWarning(project.name),
+          eyebrow: TEXT.menu.delete,
+          onAccept: async () => {
+            try {
+              await deleteProjectRequest(client, project.id);
+            } catch (reason) {
+              // A Project with a run still going is refused with a 409 saying
+              // so; the toast carries that, and nothing is removed here.
+              report(reason);
+              return;
+            }
+            // The conversation on screen was inside the Project that just went
+            // away. It cannot stay: its Session no longer exists, and the next
+            // send has to land in the inbox rather than in a Project that is
+            // gone.
+            if (projectRef.current === project.id) {
+              projectRef.current = inboxRef.current?.id;
+              setActiveProjectId(inboxRef.current?.id);
+              startDraft();
+            }
+            await refreshSessionLists();
+          },
+          title: project.name,
+        }),
       deleteSession: (session) =>
         confirmAction({
           accept: TEXT.menu.delete,
@@ -1555,9 +1735,21 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
       openArtifact,
       openFile,
       openSession,
+      renameProject: async (project, name) => {
+        try {
+          const updated = await renameProjectRequest(client, project.id, name);
+          // The server's answer, not the typed name: it trims, and it is the
+          // one that refused a duplicate.
+          setProjects((current) => current.map((item) => (item.id === updated.id ? updated : item)));
+        } catch (reason) {
+          report(reason);
+        }
+      },
       renameSession: (session, title) =>
         mutate({ id: session.id, operation: () => updateSession(client, session.id, { title }) }),
       refreshCatalog,
+      removeAttachment,
+      retryAttachment,
       retryBoot,
       selectArtifactVersion,
       selectModel,
@@ -1567,11 +1759,13 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
       send,
       setApprovalMode,
       setDefaultModel,
+      startDraft,
       stop,
       toast,
       uploadFiles,
     }),
     [
+      clearAttachments,
       closeTab,
       confirmAction,
       createProjectAndOpen,
@@ -1585,6 +1779,10 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
       openFile,
       openSession,
       refreshCatalog,
+      refreshSessionLists,
+      removeAttachment,
+      report,
+      retryAttachment,
       retryBoot,
       selectArtifactVersion,
       selectModel,
@@ -1594,6 +1792,7 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
       send,
       setApprovalMode,
       setDefaultModel,
+      startDraft,
       stop,
       toast,
       uploadFiles,
@@ -1604,6 +1803,7 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
     activeProject,
     activeProjectId,
     activeProjectName,
+    attachments,
     connection,
     confirm,
     defaultModelId,
@@ -1624,7 +1824,7 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
     running,
     selectedModelId,
     sessionId,
-    sessionsByProject,
+    sessionsByProject: listedByProject,
     tabs,
     toasts,
     uploadLimit,

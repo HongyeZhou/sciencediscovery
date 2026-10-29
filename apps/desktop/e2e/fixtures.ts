@@ -29,8 +29,12 @@ import type { Page, Route } from "@playwright/test";
 
 export const TOKEN = "e2e-token";
 export const TOKEN_STORAGE_KEY = "sciencediscovery-token";
+/** `GUIDE_STORAGE_KEY` in `src/state/storage.ts`. Spelled out rather than
+ *  imported because these specs do not load the app's module graph; the
+ *  string is the contract between them. */
+export const GUIDE_STORAGE_KEY = "sciencediscovery-desktop:guide";
 
-const CREATED_AT = "2026-10-01T08:00:00.000Z";
+export const CREATED_AT = "2026-10-01T08:00:00.000Z";
 const UPDATED_AT = "2026-10-01T09:30:00.000Z";
 
 export interface ProjectRecord {
@@ -44,6 +48,14 @@ export interface ProjectRecord {
   updatedAt: string;
 }
 
+/** A file body the mock serves as-is. A picture, a PDF or a workbook is not
+ *  text, so the spec says both the bytes and the type the server would send —
+ *  which for these extensions is the type the app has to trust. */
+export interface FileContent {
+  body: Buffer | string;
+  contentType: string;
+}
+
 export interface SessionRecord {
   archivedAt?: string;
   createdAt: string;
@@ -55,6 +67,9 @@ export interface SessionRecord {
   updatedAt: string;
 }
 
+/** The title the service stores for a Session nobody has written in yet. */
+const UNTITLED_TITLE = "Untitled session";
+
 export interface ModelRecord {
   id: string;
   model: string;
@@ -65,6 +80,18 @@ export interface ModelRecord {
 /** The settings records are read whole by their page; a fixture supplies the
  *  fields that page prints and leaves the rest to the component's defaults. */
 export type JsonRecord = Record<string, any>;
+
+/** One run a Session already took: the row `GET .../runs` lists, and the event
+ *  bodies its log holds in the order the server wrote them.
+ *
+ *  The `run` row is what makes the app replay the log at all — it is listed,
+ *  found terminal, and then read back whole with `?after=0`. The wrapper fields
+ *  a `SessionRunEvent` also carries (`runId`, `sessionId`, `sequence`) are the
+ *  fixture's to add, because the order of `events` already says the sequence. */
+export interface ReplayRecord {
+  events: JsonRecord[];
+  run: JsonRecord;
+}
 
 export interface MockOptions {
   /** Fail the health probe, for the offline screen. */
@@ -83,9 +110,19 @@ export interface MockOptions {
    *  id. A version with no entry reads as empty. */
   artifactContents?: Record<string, string>;
   files?: unknown[];
+  /** The runs each Session already took, keyed by Session id. A Session with no
+   *  entry has taken none, which is the fresh workspace every other spec opens
+   *  on. The transcript is rebuilt from these alone — the stored messages stay
+   *  as they were listed. */
+  runsBySession?: Record<string, ReplayRecord[]>;
+  /** The catalog behind `GET .../subagents`, keyed by Session id. It is the only
+   *  place a replayed child's steps live, so a spec that opens one needs both
+   *  the snapshot in the run's log and the row here. */
+  subagentsBySession?: Record<string, JsonRecord[]>;
   /** The bytes behind `GET .../file?path=`, keyed by workspace path. A path
-   *  with no entry reads as the fixture's small CSV. */
-  fileContents?: Record<string, string>;
+   *  with no entry reads as the fixture's small CSV. A string is served as
+   *  `text/plain`; `FileContent` carries bytes of its own type. */
+  fileContents?: Record<string, FileContent | string>;
   runners?: unknown[];
   connectors?: JsonRecord[];
   skills?: JsonRecord[];
@@ -112,6 +149,19 @@ export interface MockOptions {
   mcpTest?: "error" | "ok";
   /** What `POST /api/models/:id/test` answers. */
   modelTest?: { category?: string; latencyMs?: number; message?: string; ok: boolean };
+  /** The sandbox network policy behind 设置 › 网络. 开放网络 by default, so a
+   *  spec can save something by moving to 无网络 — the only info-tone notice the
+   *  app raises now that an upload is reported by its card. */
+  sandboxNetwork?: { allowedDomains: string[]; mode: string };
+  /** File names the upload route refuses per file, with a reason of its own.
+   *  Mutable through `Mock.state` so a spec can watch the tray's 重试 succeed on
+   *  the second attempt — the route answering "no" once is the only way to get
+   *  a failed card without also failing the request. */
+  uploadRejects?: string[];
+  /** Whether the browser has already read the first-run guide. Every spec but
+   *  the guide's own is about a returning user, and the guide covers the page
+   *  it would otherwise have to click through. Set `false` to get the guide. */
+  guideSeen?: boolean;
 }
 
 export interface RecordedCall {
@@ -135,10 +185,15 @@ export interface MockState {
   runners: JsonRecord[];
   /** Which NPU cards each Runner may hand to a sandbox. */
   npuSelections: Record<string, number[]>;
+  /** 设置 › 网络's sandbox policy. A `PUT` replaces it, so a spec can read back
+   *  what the page wrote. */
+  sandboxNetwork: { allowedDomains: string[]; mode: string };
   sessions: SessionRecord[];
   skills: JsonRecord[];
   specialists: JsonRecord[];
   timeouts: Record<string, number>;
+  /** Names the upload route refuses, per file. See `MockOptions.uploadRejects`. */
+  uploadRejects: string[];
 }
 
 export interface Mock {
@@ -196,6 +251,16 @@ function json(route: Route, status: number, body: unknown): Promise<void> {
 }
 
 export async function installMockApi(page: Page, options: MockOptions = {}): Promise<Mock> {
+  // Seeded before the app's first script runs, which is the only moment the
+  // guide's decision is made. A spec that wants the guide passes `guideSeen:
+  // false`; the rest get the page without it.
+  if (options.guideSeen !== false) {
+    await page.addInitScript(
+      ([key, value]) => localStorage.setItem(key, value),
+      [GUIDE_STORAGE_KEY, "1"] as const,
+    );
+  }
+
   const state: MockState = {
     artifacts: [...(options.artifacts ?? [])],
     connectors: [...(options.connectors ?? [])],
@@ -213,9 +278,11 @@ export async function installMockApi(page: Page, options: MockOptions = {}): Pro
     providers: [],
     runners: structuredClone(options.runners ?? []) as JsonRecord[],
     npuSelections: {},
+    sandboxNetwork: structuredClone(options.sandboxNetwork ?? { allowedDomains: [], mode: "open" }),
     sessions: [...(options.sessions ?? [])],
     skills: [...(options.skills ?? [])],
     specialists: [...(options.specialists ?? [])],
+    uploadRejects: [...(options.uploadRejects ?? [])],
     timeouts: {
       gatewayIdleTimeoutMs: 240_000,
       gatewayTurnTimeoutMs: 0,
@@ -471,6 +538,15 @@ export async function installMockApi(page: Page, options: MockOptions = {}): Pro
         return json(route, 200, state.timeouts);
       }
 
+      if (path === "/api/sandbox-network-settings" && method === "GET") {
+        return json(route, 200, state.sandboxNetwork);
+      }
+
+      if (path === "/api/sandbox-network-settings" && method === "PUT") {
+        state.sandboxNetwork = JSON.parse(body ?? "{}") as MockState["sandboxNetwork"];
+        return json(route, 200, state.sandboxNetwork);
+      }
+
       if (path === "/api/projects" && method === "GET") {
         return json(route, 200, state.projects);
       }
@@ -490,7 +566,16 @@ export async function installMockApi(page: Page, options: MockOptions = {}): Pro
           updatedAt: UPDATED_AT,
         };
         state.projects.push(project);
-        return json(route, 201, { firstSession: makeSession({ projectId: project.id }), project });
+        // The server writes a Project's first Session with it, and that Session
+        // is untitled until a message names it. A spec can then tell a row the
+        // reader asked for from one a button made.
+        const firstSession = makeSession({
+          id: `session-${state.sessions.length + 1}`,
+          projectId: project.id,
+          title: UNTITLED_TITLE,
+        });
+        state.sessions.push(firstSession);
+        return json(route, 201, { firstSession, project });
       }
 
       const projectSessions = /^\/api\/projects\/([^/]+)\/sessions$/.exec(path);
@@ -503,7 +588,7 @@ export async function installMockApi(page: Page, options: MockOptions = {}): Pro
           const created = makeSession({
             id: `session-${state.sessions.length + 1}`,
             projectId,
-            title: "新会话",
+            title: UNTITLED_TITLE,
           });
           state.sessions.push(created);
           return json(route, 201, created);
@@ -543,6 +628,11 @@ export async function installMockApi(page: Page, options: MockOptions = {}): Pro
           role: "assistant",
         };
         session.messages = [...(session.messages ?? []), userMessage, assistantMessage];
+        // The service names a Session from its first message and publishes the
+        // rename ahead of the run; the mock does both, so a spec can watch the
+        // sidebar row appear with the message.
+        const renamed = session.title === UNTITLED_TITLE;
+        if (renamed) session.title = prompt.trim().slice(0, 24) || session.title;
         const run = {
           createdAt: CREATED_AT,
           finishedAt: CREATED_AT,
@@ -554,6 +644,7 @@ export async function installMockApi(page: Page, options: MockOptions = {}): Pro
         };
         return route.fulfill({
           body: sse([
+            ...(renamed ? [{ session, type: "session.updated" }] : []),
             { run, type: "run.queued" },
             { model: { name: "Qwen Max" }, runId: "run-1", settings: {}, type: "run.started" },
             { responseId: "response-1", turn: 1, type: "assistant.response.started" },
@@ -567,10 +658,27 @@ export async function installMockApi(page: Page, options: MockOptions = {}): Pro
       }
 
       const runs = /^\/api\/sessions\/([^/]+)\/runs$/.exec(path);
-      if (runs && method === "GET") return json(route, 200, []);
+      if (runs && method === "GET") {
+        return json(route, 200, (options.runsBySession?.[runs[1]!] ?? []).map((entry) => entry.run));
+      }
+
+      const runEvents = /^\/api\/sessions\/([^/]+)\/runs\/([^/]+)\/events$/.exec(path);
+      if (runEvents && method === "GET") {
+        const [sessionId, runId] = [runEvents[1]!, runEvents[2]!];
+        const entry = (options.runsBySession?.[sessionId] ?? []).find((candidate) => candidate.run.id === runId);
+        return json(route, 200, (entry?.events ?? []).map((event, index) => ({
+          createdAt: String(entry?.run.createdAt ?? CREATED_AT),
+          event,
+          runId,
+          sequence: index + 1,
+          sessionId,
+        })));
+      }
 
       const subagents = /^\/api\/sessions\/([^/]+)\/subagents$/.exec(path);
-      if (subagents && method === "GET") return json(route, 200, []);
+      if (subagents && method === "GET") {
+        return json(route, 200, options.subagentsBySession?.[subagents[1]!] ?? []);
+      }
 
       const artifacts = /^\/api\/sessions\/([^/]+)\/artifacts$/.exec(path);
       if (artifacts && method === "GET") return json(route, 200, []);
@@ -600,23 +708,32 @@ export async function installMockApi(page: Page, options: MockOptions = {}): Pro
         // The filenames live in the multipart framing; reading them back is what
         // lets the result carry the path the server says each file landed on.
         const raw = request.postDataBuffer()?.toString("latin1") ?? "";
-        const names = [...raw.matchAll(/name="files"; filename="([^"]*)"/g)].map((match) => match[1]!);
+        // One match per part, decoded back to UTF-8: the browser writes the
+        // filename's bytes as they are, and reading the whole body as latin1 —
+        // which is the only way to keep the file bytes intact — would turn
+        // 报告.pdf into mojibake on the way out.
+        const names = [...raw.matchAll(/name="files"; filename="([^"]*)"/g)]
+          .map((match) => Buffer.from(match[1]!, "latin1").toString("utf8"));
+        const errors: { error: string; name: string }[] = [];
         const uploaded = names.map((name) => {
+          if (state.uploadRejects.includes(name)) {
+            errors.push({ error: "refused by the fixture", name });
+            return { error: "refused by the fixture", originalName: name, status: "failed" as const };
+          }
           const file = { modifiedAt: CREATED_AT, path: name, size: 16 };
           state.files.push(file);
           return { originalName: name, path: name, status: "stored" as const };
         });
-        return json(route, 200, { errors: [], uploaded });
+        return json(route, 200, { errors, uploaded });
       }
 
       const file = /^\/api\/sessions\/([^/]+)\/file$/.exec(path);
       if (file && method === "GET") {
         const wanted = url.searchParams.get("path") ?? "";
-        return route.fulfill({
-          body: options.fileContents?.[wanted] ?? "a,b\n1,2\n",
-          contentType: "text/plain",
-          status: 200,
-        });
+        const entry = options.fileContents?.[wanted];
+        const body = typeof entry === "string" ? entry : entry?.body ?? "a,b\n1,2\n";
+        const contentType = typeof entry === "string" ? "text/plain" : entry?.contentType ?? "text/plain";
+        return route.fulfill({ body, contentType, status: 200 });
       }
 
       const cancel = /^\/api\/sessions\/([^/]+)\/runs\/([^/]+)\/cancel$/.exec(path);
@@ -727,8 +844,8 @@ export async function installMockApi(page: Page, options: MockOptions = {}): Pro
         state.runners[index] = {
           ...record,
           ...(input.username === undefined ? {} : { username: input.username }),
-          ...(input.password === undefined ? {} : { hasPassword: true }),
-          ...(input.privateKeyPath === undefined ? {} : { hasPrivateKey: true }),
+          ...(input.password === undefined ? {} : { hasPassword: input.password !== null }),
+          ...(input.privateKeyPath === undefined ? {} : { hasPrivateKey: input.privateKeyPath !== null }),
           updatedAt: UPDATED_AT,
         };
         // The route answers with a fresh probe, so the card shows the new login
@@ -787,12 +904,27 @@ export async function installMockApi(page: Page, options: MockOptions = {}): Pro
       }
 
       const project = /^\/api\/projects\/([^/]+)$/.exec(path);
-      if (project && method === "PATCH") {
-        const index = state.projects.findIndex((entry) => entry.id === project[1]);
+      if (project) {
+        const id = project[1]!;
+        const index = state.projects.findIndex((entry) => entry.id === id);
         if (index === -1) return json(route, 404, { error: "project not found" });
-        const patch = JSON.parse(body ?? "{}") as JsonRecord;
-        state.projects[index] = { ...state.projects[index]!, ...patch, updatedAt: UPDATED_AT };
-        return json(route, 200, state.projects[index]);
+        if (method === "PATCH") {
+          const patch = JSON.parse(body ?? "{}") as JsonRecord;
+          state.projects[index] = { ...state.projects[index]!, ...patch, updatedAt: UPDATED_AT };
+          return json(route, 200, state.projects[index]);
+        }
+        if (method === "DELETE") {
+          // The server refuses a delete whose body does not repeat the id; a
+          // mock that accepted anything would let a broken client pass.
+          const { confirmationId } = JSON.parse(body ?? "{}") as { confirmationId?: string };
+          if (confirmationId !== id) {
+            return json(route, 400, { error: "Project deletion confirmation does not match the target" });
+          }
+          state.projects.splice(index, 1);
+          // A Project takes its Sessions with it.
+          state.sessions = state.sessions.filter((session) => session.projectId !== id);
+          return json(route, 200, { deleted: id });
+        }
       }
 
       return json(route, 404, { error: `not mocked: ${method} ${path}` });

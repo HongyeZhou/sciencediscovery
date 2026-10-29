@@ -48,8 +48,11 @@ function scoreDocument(doc, name) {
     return out;
   }
   if (name === "summary.json") {
-    const out = pick(doc, ["status", "exitCode", "planDigest", "planned", "reported", "executed", "passed", "failed", "skipped"]);
-    if (Array.isArray(doc.results)) out.results = doc.results.map(result => pick(result, ["key", "outcome", "actualTarget", "actualBackend"]));
+    const out = pick(doc, ["status", "exitCode", "planDigest", "planned", "reported", "executed", "passed", "failed", "skipped",
+      "providerFaults", "providerFaultRetries"]);
+    // The provider fault is published as its classification, never as the
+    // provider's own words: those may carry model output or credentials.
+    if (Array.isArray(doc.results)) out.results = doc.results.map(result => pick(result, ["key", "outcome", "actualTarget", "actualBackend", "providerFault", "retriedAfterProviderFault"]));
     return out; // Assertion errors/problems may contain model output or credentials.
   }
   // Frozen plan and structured preflight contain source identities/requirements,
