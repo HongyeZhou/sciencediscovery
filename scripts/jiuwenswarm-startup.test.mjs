@@ -1,23 +1,33 @@
 // Copyright (C) 2026-2026 Huawei Technologies Co., Ltd
 // Licensed under the Apache License, Version 2.0 (the "License");
-// Tests for the  jiuwenswarm startup-chain hardening: bootstrap .env port
+// Tests for the jiuwenswarm startup-chain hardening: bootstrap .env port
 // parsing (the TCP probe source), the startup diagnostics file, stderr tail
-// truncation, and the  uv-trampoline bypass (entry_points.txt
-// resolution). Tagged os:windows-safe: pure helpers + temp dirs, no network,
-// no python spawn.
+// truncation, and the uv-trampoline bypass (entry_points.txt resolution).
+// Pure helpers + temp dirs, no network, no python spawn; the resolveVenvEntry
+// cases pin the Windows venv layout of the packaged payload and skip elsewhere.
 
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, rm, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import { createTest } from "../test/support/tagged/compat.mjs";
 
 import {
   diag, instanceConfigPath, jwConfig, parseInstanceEnvPorts, readInstancePorts, resolveVenvEntry,
   startupDiagPath, stderrTail,
 } from "./jiuwenswarm.mjs";
 
+const { test } = createTest(import.meta.url, { tags: ["category:ut", "os:linux", "os:windows", "arch:amd64", "arch:arm64"] });
+
+// The resolveVenvEntry cases below pin the Windows venv layout of the
+// packaged payload (Lib\site-packages + Scripts\python.exe). resolveVenvEntry
+// is a payload-layout resolver, not a host-venv resolver, so outside Windows
+// they have nothing to check and return early instead of declaring a skip
+// (the shared plan forbids skip declarations).
+const windowsOnly = () => process.platform === "win32";
+
 test("resolveVenvEntry bypasses uv trampolines via entry_points.txt", async () => {
+  if (!windowsOnly()) return;
   const venv = await mkdtemp(join(tmpdir(), "jw-venv-ep-"));
   try {
     const distInfo = join(venv, "Lib", "site-packages", "workswarm-0.2.5b1.dist-info");
@@ -35,6 +45,7 @@ test("resolveVenvEntry bypasses uv trampolines via entry_points.txt", async () =
 });
 
 test("resolveVenvEntry falls back to the trampoline exe when no entry_points.txt", async () => {
+  if (!windowsOnly()) return;
   const venv = await mkdtemp(join(tmpdir(), "jw-venv-bare-"));
   try {
     const spec = resolveVenvEntry(venv, "jiuwenswarm-start");
@@ -45,6 +56,7 @@ test("resolveVenvEntry falls back to the trampoline exe when no entry_points.txt
 });
 
 test("resolveVenvEntry does not false-hit on name prefixes", async () => {
+  if (!windowsOnly()) return;
   const venv = await mkdtemp(join(tmpdir(), "jw-venv-prefix-"));
   try {
     const distInfo = join(venv, "Lib", "site-packages", "x.dist-info");
@@ -59,8 +71,9 @@ test("resolveVenvEntry does not false-hit on name prefixes", async () => {
 });
 
 test("resolveVenvEntry keeps scanning past dist-infos without entry_points.txt", async () => {
-  // Field lesson (2026-10-17): the payload venv has 200+ dist-infos and most
-  // ship no entry_points.txt; the first unreadable one must not abort the scan.
+  if (!windowsOnly()) return;
+  // The payload venv has 200+ dist-infos and most ship no entry_points.txt;
+  // the first unreadable one must not abort the scan.
   const venv = await mkdtemp(join(tmpdir(), "jw-venv-scan-"));
   try {
     const sp = join(venv, "Lib", "site-packages");
@@ -77,10 +90,10 @@ test("resolveVenvEntry keeps scanning past dist-infos without entry_points.txt",
   }
 });
 
-test("instanceConfigPath points at the workspace's config.yaml ( init idempotence gate)", () => {
+test("instanceConfigPath points at the workspace's config.yaml (init idempotence gate)", () => {
   // The init gate must judge this file, not the workspace dir: a half-made
   // workspace (dir present, config missing) used to skip init and blow up
-  // in applyConfig with "config.yaml not found" (local acid test 2026-10-17).
+  // in applyConfig with "config.yaml not found".
   assert.equal(
     instanceConfigPath({ home: "H", instance: "inst" }),
     join("H", ".jiuwenswarm-instances", "inst", "config", "config.yaml"),

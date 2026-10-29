@@ -1,7 +1,9 @@
 // Copyright (C) 2026-2026 Huawei Technologies Co., Ltd
 // Licensed under the Apache License, Version 2.0 (the "License");
-// Tests for the cross-platform stack helpers (F2) and the JiuwenSwarm
-// config applicator. Tagged os:windows-safe: everything here runs on any host.
+// Copyright (C) 2026-2026 Huawei Technologies Co., Ltd
+// Tests for the cross-platform stack helpers and the JiuwenSwarm
+// config applicator. Pure helpers + temp dirs, no network; every case
+// asserts its platform branches and runs on any host.
 
 import assert from "node:assert/strict";
 import { createServer } from "node:net";
@@ -9,13 +11,15 @@ import { createServer as createHttpServer } from "node:http";
 import { mkdtemp, mkdir, rm, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import { createTest } from "../test/support/tagged/compat.mjs";
 
 import {
   absoluteFromRepository, findHostPython, isWindows, loadDotEnv,
   portAvailability, probeTcp, venvEntry, venvPython, waitHealthy,
 } from "./lib/stack-platform.mjs";
 import { applyConfig } from "./jiuwenswarm.mjs";
+
+const { test } = createTest(import.meta.url, { tags: ["category:ut", "os:linux", "os:windows", "arch:amd64", "arch:arm64"] });
 
 test("absoluteFromRepository recognises posix, drive-letter and UNC absolutes", () => {
   const root = isWindows ? "C:\\repo" : "/repo";

@@ -7,7 +7,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { createServer, Socket } from "node:net";
-import { existsSync, openSync } from "node:fs";
+import { closeSync, existsSync, openSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { delimiter, join, sep } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -225,6 +225,10 @@ export function spawnDetached(command, args, { env, cwd, logFile }) {
     stdio: ["ignore", out, out],
     windowsHide: true,
   });
+  // The child owns its dup'd handles from here on; the parent closing its own
+  // descriptor does not disturb the child's logging and stops the parent from
+  // leaking one fd per detached start.
+  closeSync(out);
   child.unref();
   return child;
 }
