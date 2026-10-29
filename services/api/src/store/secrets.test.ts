@@ -19,8 +19,9 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { TestContext } from "node:test";
 
-// F9 —— loadOrCreateModelSecretKey 的落盘格式分支用注入的 fake protector
-// 驱动（真 DPAPI 往返由 platform/os/win32.test.ts 覆盖），与宿主平台无关。
+// loadOrCreateModelSecretKey's at-rest format branches are driven with an
+// injected fake protector (the real DPAPI round trip is covered by
+// platform/os/win32.test.ts), keeping these tests host-platform-agnostic.
 import type { SecretProtector } from "../platform/os/types.js";
 import { loadOrCreateModelSecretKey } from "./secrets.js";
 
