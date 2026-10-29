@@ -27,8 +27,12 @@ export const posixAdaptation: OsAdaptation = {
       await handle.close();
     }
   },
-  // Matches win32 exactly: lock names must follow one rule on every platform.
+  // Posix keeps the historical full-length sha256 name so coordination and
+  // lease files already on disk — including `<digest>.failed` poison markers
+  // — stay readable across upgrades; only win32 shortens it (MAX_PATH
+  // headroom, see win32.ts). The coordination directory is machine-local, so
+  // lock names never need to match across platforms.
   lockFileName(key) {
-    return createHash("sha256").update(key).digest("hex").slice(0, 32);
+    return createHash("sha256").update(key).digest("hex");
   },
 };
