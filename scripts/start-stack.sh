@@ -506,6 +506,14 @@ prepare_docker() {
   # default scripts/jiuwenswarm.sh otherwise assumes.
   export JIUWENSWARM_ROOT="${JIUWENSWARM_ROOT:-$data_dir/jiuwenswarm}"
   export JIUWENSWARM_SRC="${JIUWENSWARM_SRC:-/opt/sciencediscovery/jiuwenswarm/src}"
+  # The image bakes the pinned installation read-only under /opt, and the image
+  # itself exports JIUWENSWARM_SRC; the default above only covers a host that
+  # runs this mode without that image. Say so plainly when neither exists,
+  # instead of letting the failure surface later as a missing-python error.
+  if [[ "$use_jiuwenswarm" -eq 1 && ! -d "$JIUWENSWARM_SRC" ]]; then
+    echo "The JiuwenSwarm installation is missing at $JIUWENSWARM_SRC. Rebuild the image, or set JIUWENSWARM_SRC to the pinned installation." >&2
+    exit 1
+  fi
 
   # Docker includes the sidecar, while the System Settings toggle still
   # controls whether the API mirrors any application data into it.
