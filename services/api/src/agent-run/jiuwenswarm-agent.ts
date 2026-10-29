@@ -22,7 +22,7 @@ import { TOOL_SEARCH_NAME, TOOL_SEARCH_SPEC, requiredArgumentsOf, type AgentTool
 import { DurableContextStore } from "@sciencediscovery/context";
 
 import { startModelGateway, withoutWithheldNotice, type ModelGateway } from "./jiuwenswarm-model-gateway.js";
-import { importSkillsToJiuwenSwarm, skillLoadedBy } from "./jiuwenswarm-skills.js";
+import { importSkillsToJiuwenSwarm, reconcileJiuwenSwarmSkills, skillLoadedBy } from "./jiuwenswarm-skills.js";
 import { JiuwenSwarmTrajectory, stateProvider } from "./jiuwenswarm-trajectory.js";
 import { waitForRecording } from "./recording-wait.js";
 import { RunDeadlines } from "./run-deadlines.js";
@@ -88,6 +88,14 @@ export interface JiuwenSwarmAgentConfig {
    * `read_skill_resource` remain as fallbacks. `ours`: ScienceDiscovery's catalog and tools.
    */
   skills?: "jiuwenswarm" | "ours";
+  /**
+   * Whose switches decide which skills are on. `desktop` (SCIENCE_AGENT_SKILL_SELECTION=desktop, the desktop
+   * app): the UI's selection in project settings — each run stages just what it enabled, installs that in
+   * JiuwenSwarm and aligns its on/off switches to it (skills installed earlier but no longer selected are
+   * switched off; JiuwenSwarm's builtin skills are never touched). Unset (default, server deployments):
+   * every installed skill is staged for every run and JiuwenSwarm's own switches are the user's.
+   */
+  skillSelection?: "desktop";
   /**
    * How the model delegates. `jiuwenswarm` (explicit opt-in, with JiuwenSwarm's tools): the model spawns and
    * collects sub-agents with JiuwenSwarm's own `subagent_spawn`/`subagent_wait`; ScienceDiscovery's `task`
@@ -210,6 +218,7 @@ export function jiuwenSwarmConfigFromEnv(env: NodeJS.ProcessEnv = process.env): 
     ...(env.SCIENCE_AGENT_JIUWENSWARM_PROMPT?.trim() === "replace" ? { prompt: "replace" as const } : {}),
     ...(env.SCIENCE_AGENT_JIUWENSWARM_TOOLS?.trim() === "ours" ? { tools: "ours" as const } : {}),
     ...(env.SCIENCE_AGENT_JIUWENSWARM_SKILLS?.trim() === "ours" ? { skills: "ours" as const } : {}),
+    ...(env.SCIENCE_AGENT_SKILL_SELECTION?.trim() === "desktop" ? { skillSelection: "desktop" as const } : {}),
     subagents,
   };
 }
@@ -462,8 +471,16 @@ class JiuwenSwarmAgent implements NativeAgentHandle {
     const root = this.options.skillPackagesRoot;
     const wanted = (this.config.skills ?? "jiuwenswarm") === "jiuwenswarm" && allJiuwenSwarmTools
       && (this.config.prompt ?? "prepend") === "prepend";
-    if (!wanted || !skills.length || !root || !tools.has("read_skill")) return;
-    const imported = await importSkillsToJiuwenSwarm(this.config, skills, root, this.controller.signal);
+    if (!wanted || !tools.has("read_skill")) return;
+    const imported = skills.length && root
+      ? await importSkillsToJiuwenSwarm(this.config, skills, root, this.controller.signal)
+      : new Map<string, string>();
+    // Desktop selection: align JiuwenSwarm's switches with what this run staged — also when that is nothing,
+    // so switching every skill off really turns them off there (a run with no staged skills installs none,
+    // and leftovers from earlier runs would otherwise stay on).
+    if (this.config.skillSelection === "desktop") {
+      await reconcileJiuwenSwarmSkills(this.config, new Set(imported.values()));
+    }
     for (const [id, name] of imported) {
       this.skillNames.set(id, name);
       this.skillIds.set(name, id);
