@@ -1,8 +1,8 @@
 // Copyright (C) 2026-2026 Huawei Technologies Co., Ltd
 // Licensed under the Apache License, Version 2.0 (the "License");
-// Tests for the F10.6 jiuwenswarm startup-chain hardening: bootstrap .env port
+// Tests for the  jiuwenswarm startup-chain hardening: bootstrap .env port
 // parsing (the TCP probe source), the startup diagnostics file, stderr tail
-// truncation, and the F10.6k uv-trampoline bypass (entry_points.txt
+// truncation, and the  uv-trampoline bypass (entry_points.txt
 // resolution). Tagged os:windows-safe: pure helpers + temp dirs, no network,
 // no python spawn.
 
@@ -17,7 +17,7 @@ import {
   startupDiagPath, stderrTail,
 } from "./jiuwenswarm.mjs";
 
-test("resolveVenvEntry bypasses uv trampolines via entry_points.txt (F10.6k)", async () => {
+test("resolveVenvEntry bypasses uv trampolines via entry_points.txt", async () => {
   const venv = await mkdtemp(join(tmpdir(), "jw-venv-ep-"));
   try {
     const distInfo = join(venv, "Lib", "site-packages", "workswarm-0.2.5b1.dist-info");
@@ -77,7 +77,7 @@ test("resolveVenvEntry keeps scanning past dist-infos without entry_points.txt",
   }
 });
 
-test("instanceConfigPath points at the workspace's config.yaml (F10.6l init idempotence gate)", () => {
+test("instanceConfigPath points at the workspace's config.yaml ( init idempotence gate)", () => {
   // The init gate must judge this file, not the workspace dir: a half-made
   // workspace (dir present, config missing) used to skip init and blow up
   // in applyConfig with "config.yaml not found" (local acid test 2026-10-17).
