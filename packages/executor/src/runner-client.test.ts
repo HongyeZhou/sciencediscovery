@@ -78,7 +78,9 @@ test("RunnerClient authenticates health and learns the clock before later reques
     server.close(() => done());
     server.closeAllConnections();
   }));
-  const client = new RunnerClient(`http://127.0.0.1:${(server.address() as AddressInfo).port}`, "test-token");
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const client = new RunnerClient(`http://127.0.0.1:${address.port}`, "test-token");
   assert.equal((await client.health()).runnerVersion, "fixture");
   assert.ok(Math.abs(client.clockOffsetMs - 120_000) < 5_000);
 });
