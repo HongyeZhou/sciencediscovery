@@ -43,10 +43,8 @@ test("parseDismFeatureState maps unknown feature to absent (Error 87)", () => {
 
 /** 剧本驱动的 wsl.exe/dism.exe 桩 */
 function scripted(steps: Record<string, { status: number | null; stdout?: string; stderr?: string }>): WslCommandRunner {
-  const seen: string[] = [];
   return async (command, args) => {
     const key = `${command} ${args.join(" ")}`;
-    seen.push(key);
     const step = steps[key];
     if (!step) return { status: 1, stderr: "unexpected command", stdout: "" };
     return { status: step.status ?? 0, stderr: step.stderr ?? "", stdout: step.stdout ?? "" };

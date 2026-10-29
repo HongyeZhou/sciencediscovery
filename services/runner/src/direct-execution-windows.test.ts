@@ -54,6 +54,13 @@ function gatewaysFor(context: TestContext, dataDir: string): EgressGatewayRegist
   return gateways;
 }
 
+function pythonEnvironmentStore(interpreterPath: string, prefixPath: string): EnvironmentStore {
+  return {
+    capability: { available: true },
+    resolveRuntime: () => ({ interpreterPath, prefixPath, revision: { id: "rev-python" } }),
+  } as unknown as EnvironmentStore;
+}
+
 /** A real interpreter for the direct-execution run; the test skips without one. */
 function hostPython(): string | undefined {
   const override = process.env.SCIENCE_AGENT_PYTHON_PATH?.trim();
@@ -239,14 +246,7 @@ test("executePython none runs the interpreter directly with conda activation pat
   // The prefix is deliberately fake: the assertion is that its activation
   // directories land at the head of PATH, not that they exist.
   const prefix = resolve(dataDir, "managed-env");
-  const store = {
-    capability: { available: true },
-    resolveRuntime: () => ({
-      interpreterPath: python,
-      prefixPath: prefix,
-      revision: { id: "rev-python" },
-    }),
-  } as unknown as EnvironmentStore;
+  const store = pythonEnvironmentStore(python, prefix);
   const result = await executePython(
     { bwrapPath: "unused", dataDir, sandboxProvider: "none", execTimeoutMs: 60_000, maxOutputBytes: 1_000_000, maxWorkspaceBytes: 0 },
     {
@@ -284,14 +284,7 @@ test("executePython none fails closed on network for the default none policy", a
   }
   const { dataDir, workspaceRoot } = await workspace(context);
   const prefix = resolve(dataDir, "managed-env");
-  const store = {
-    capability: { available: true },
-    resolveRuntime: () => ({
-      interpreterPath: python,
-      prefixPath: prefix,
-      revision: { id: "rev-python" },
-    }),
-  } as unknown as EnvironmentStore;
+  const store = pythonEnvironmentStore(python, prefix);
   // 默认 epoch 的网络策略就是 none：无沙箱直跑必须拿到 deny-all 网关的代理
   // 环境（而不是继承宿主机网络），且宿主代理槽位（含 NO_PROXY）不得残留。
   const result = await executePython(
@@ -332,14 +325,7 @@ test("executePython none blocks an outbound request through the deny-all gateway
   }
   const { dataDir, workspaceRoot } = await workspace(context);
   const prefix = resolve(dataDir, "managed-env");
-  const store = {
-    capability: { available: true },
-    resolveRuntime: () => ({
-      interpreterPath: python,
-      prefixPath: prefix,
-      revision: { id: "rev-python" },
-    }),
-  } as unknown as EnvironmentStore;
+  const store = pythonEnvironmentStore(python, prefix);
   const denied: Array<{ host?: string; reason?: string }> = [];
   const gateways = new EgressGatewayRegistry(dataDir, (event, detail) => {
     if (event === "denied") denied.push(detail);
