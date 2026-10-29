@@ -5,7 +5,7 @@
 > 干净 worktree 副本三命令全绿 + `pnpm architecture:check` 通过。
 > 范围说明：本文只覆盖**构建层**（install / build / typecheck）。
 > 启动脚本（`run-local.sh` / `start-stack.sh`）是 Linux/macOS 形态；Windows 原生
-> 启动链（`scripts/start-stack.mjs` 等）由后续运行时 PR 交付，届时更新本文。
+> 启动链（`scripts/start-stack.mjs` / `scripts/jiuwenswarm.mjs`）由本 PR 交付，见 §5。
 
 ## 1. 前置条件
 
@@ -66,13 +66,14 @@ echo registry=https://registry.npmmirror.com >> .npmrc
 
 启动链目前只有 Linux/macOS 的 bash 形态（`pnpm start` / `pnpm server` 实际执行
 `bash scripts/run-local.sh`，见 `package.json` 的 `scripts`）。Windows 原生等价物
-（`scripts/start-stack.mjs` / `scripts/jiuwenswarm.mjs`）由后续运行时 PR 交付，
-**本 PR 树内尚不存在**；在此之前请用 Git Bash 或 WSL 运行原命令。
+（`scripts/start-stack.mjs` / `scripts/jiuwenswarm.mjs`）由本 PR 交付：
+`node scripts/start-stack.mjs --mode local`（暂只支持 local 模式，`--mode docker`
+显式报错并指回 bash 版）。
 
 | 原命令（bash） | Windows 现状 |
 | --- | --- |
-| `pnpm start` / `pnpm server`（`run-local.sh`） | Git Bash / WSL 下可用；原生等价物（`start-stack.mjs`）后续 PR 交付 |
-| `pnpm start:jiuwenswarm` / `pnpm jiuwenswarm:*`（`start-stack.sh` / `jiuwenswarm.sh`） | 同上（`jiuwenswarm.mjs` 后续 PR 交付） |
+| `pnpm start` / `pnpm server`（`run-local.sh`） | Git Bash / WSL 下可用；原生等价物 `node scripts/start-stack.mjs --mode local` |
+| `pnpm start:jiuwenswarm` / `pnpm jiuwenswarm:*`（`start-stack.sh` / `jiuwenswarm.sh`） | 同上（`jiuwenswarm.mjs` 随 `start-stack.mjs` 一并交付） |
 
 仍不可用（无 Windows 等价物）：
 
