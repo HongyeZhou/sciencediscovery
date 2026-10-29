@@ -12,7 +12,7 @@ async function sourceFiles(path) {
   const files = [];
   for (const entry of entries) {
     if (entry.isDirectory() && ["dist", "node_modules"].includes(entry.name)) continue;
-    // [windows-desktop] reason: 炸点③-路径 —— keep forward slashes on Windows too:
+    // [windows-desktop] keep forward slashes on Windows too:
     // component-boundaries.mjs is posix-only by design (imports `node:path`.posix),
     // so backslashes from path.join break owner()/localFile() lookups there.
     const child = `${path}/${entry.name}`;
