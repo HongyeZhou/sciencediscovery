@@ -16,7 +16,7 @@
 //   whole stack.
 
 import { existsSync } from "node:fs";
-import { rename } from "node:fs/promises";
+import { copyFile, rename, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
@@ -258,11 +258,19 @@ async function uvSyncProject(projectDir, envDir, { locked, extraArgs = [] }) {
   if (process.env.SCIENCE_AGENT_PYPI_INDEX && locked) {
     const lockfile = join(projectDir, "uv.lock");
     const backup = join(projectDir, "uv.lock.stack-backup");
-    await rename(lockfile, backup);
+    // Copy, not rename: a rename parks the lockfile away, so a hard kill
+    // outside the finally (power loss, taskkill) would leave the tree without
+    // a lockfile at all. With a copy the original stays in place and the
+    // backup only ever adds a file. Restoring also copies and unlinks — on
+    // Windows a rename onto an existing target fails if uv still holds a
+    // handle to the rewritten lockfile, while an overwrite copy degrades
+    // gracefully.
+    await copyFile(lockfile, backup);
     try {
       await runStep(`uv sync ${projectDir}`, "uv", ["sync", ...extraArgs], env, projectDir);
     } finally {
-      await rename(backup, lockfile);
+      await copyFile(backup, lockfile);
+      await rm(backup, { force: true });
     }
     return;
   }
