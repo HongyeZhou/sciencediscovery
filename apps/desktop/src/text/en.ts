@@ -66,6 +66,7 @@ export const EN: Text = {
     /** The `+` on a Project fold; the name is in it because a column of
      *  identical buttons is not distinguishable to a screen reader. */
     newSessionInProject: (name: string) => `New session in ${name}`,
+    projectMenu: "Project menu",
     noTasks: "No sessions yet",
     showMore: "Show more",
     collapseSidebar: "Collapse sidebar",
@@ -128,8 +129,22 @@ export const EN: Text = {
     unlimited: "unlimited",
     busy: "Uploading…",
     tooLarge: (name: string, limit: string) => `${name} exceeds ${limit} and was not uploaded.`,
-    uploaded: (path: string) => `Uploaded ${path}`,
+    tooMany: (max: number) => `A message holds at most ${max} attachments.`,
     failed: (name: string, reason: string) => `${name}: ${reason}`,
+  },
+
+  /** The cards the composer holds: one per file, from the moment it is chosen
+   *  until the message that carries it is sent. */
+  attachment: {
+    uploading: "Uploading…",
+    failed: "Upload failed",
+    retry: "Retry",
+    remove: (name: string) => `Remove ${name}`,
+    delete: "Delete",
+    clear: "Clear attachments",
+    /** The line under the name once the upload landed. */
+    detail: (type: string, size: string) => (type === "" ? size : `${type} ${size}`),
+    tray: "Attached files",
   },
 
   conversation: {
@@ -250,6 +265,29 @@ export const EN: Text = {
         { label: "Material formulas", prompt: "Analyze this set of material formula data and find the ingredients that drive performance and how they interact." },
         { label: "Single-cell sequencing", prompt: "Plan a single-cell sequencing analysis: quality control, clustering, cell annotation, and differential expression." },
       ],
+    },
+  },
+
+  guide: {
+    label: "Interface guide",
+    step: (index: number, total: number) => `Step ${index} of ${total}`,
+    skip: "Skip",
+    back: "Back",
+    next: "Next",
+    done: "Start using it",
+    steps: {
+      composer: {
+        title: "The composer",
+        body: "Write what you need in the box in the middle and press Enter to send. The + on the left attaches files, the picker on the right chooses the model and the permission mode, and typing / references a Skill or a command directly. The first message turns this page into a conversation.",
+      },
+      settings: {
+        title: "Settings",
+        body: "“Settings” in the narrow left rail opens the configuration panel: models, Skills, MCP servers, specialists and networking all live there, and every change applies at once — there is nothing to save.",
+      },
+      panel: {
+        title: "The right panel",
+        body: "The workspace panel on the right lists the artifacts and files this session produces; open one to preview it. Drag the divider on its left to widen it, or use the button in its header to collapse it.",
+      },
     },
   },
 
@@ -381,6 +419,11 @@ export const EN: Text = {
         // someone who cannot yet read the page it sits on.
         chinese: "简体中文",
       },
+      guide: {
+        heading: "Interface guide",
+        field: "Interface tour",
+        action: "Replay",
+      },
     },
     loading: "Loading…",
     retry: "Retry",
@@ -497,6 +540,7 @@ export const EN: Text = {
         cpuCores: (count: number) => `${count} ${count === 1 ? "core" : "cores"}`,
         credentials: {
           cancel: "Cancel",
+          forget: "Forget the saved password, private key and passphrase",
           heading: "Login credentials",
           keyKeep: "Leave blank to keep the stored private key",
           note: "Credentials are write-only: the API never returns them, so leaving a field blank keeps the stored one.",
@@ -993,6 +1037,21 @@ export const EN: Text = {
     searchArtifacts: "Search artifacts",
     searchFiles: "Search files",
     searchEmpty: "Nothing matches.",
+    /** The caption under a table that holds all of the document's rows. */
+    tableRows: (count: number) => `${count} ${count === 1 ? "row" : "rows"}`,
+    /** The same caption when the panel holds only the head of a larger table. */
+    tableRowsShown: (shown: number, total: number) => `Showing the first ${shown} of ${total} rows`,
+    /** A column whose first cell named nothing, named by where it sits. */
+    tableColumn: (index: number) => `Column ${index}`,
+    tableEmpty: "This table has no data.",
+    workbookUnreadable: "This workbook could not be read. Download it to open it.",
+    worksheets: "worksheets",
+    imageAlt: (name: string) => `Preview of ${name}`,
+    imageActual: "Show at actual size",
+    imageFit: "Fit to the panel",
+    pdfFallback: "If the page does not appear, download it:",
+    tooLarge: "This file is too large to preview here. Download it to open it.",
+    sourceTruncated: "This file is long; only the beginning is shown.",
   },
 
   molstar: {
@@ -1012,6 +1071,8 @@ export const EN: Text = {
     rename: "Rename failed",
     deleteWarning: (title: string) =>
       `Deleting "${title}" also removes its workspace data, and cannot be undone.`,
+    deleteProjectWarning: (name: string) =>
+      `Deleting the project "${name}" also removes its sessions, their workspaces and their artifacts, and cannot be undone.`,
   },
 
   status: {

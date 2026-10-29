@@ -209,6 +209,16 @@ export class AgentNotifications {
     });
   }
 
+  /**
+   * Correct the text of a retained notice: the outcome it announced changed.
+   * A notice is retained once per (owner, kind, source), so the first message
+   * would otherwise keep announcing an outcome that no longer holds.
+   */
+  revise(owner: ExecutionOwner, kind: AgentNotification["kind"], sourceId: string, message: string): void {
+    this.db.prepare("UPDATE agent_notifications SET message = ? WHERE session = ? AND agent = ? AND kind = ? AND source = ?")
+      .run(this.validateMessage(message), owner.sessionId, owner.agentId, kind, sourceId);
+  }
+
   createTimer(owner: ExecutionOwner, input: { dueAt: number; message: string; executionId?: string }): AgentTimer {
     if (!this.canWakeAgent(owner)) throw new Error("Agent is stopped or Session is archived; resume before creating a timer");
     if (!Number.isSafeInteger(input.dueAt) || input.dueAt <= this.clock()) throw new Error("Timer must specify a future timestamp");

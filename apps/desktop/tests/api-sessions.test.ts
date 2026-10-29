@@ -119,7 +119,7 @@ describe("workspace files and artifacts", () => {
     assert.equal(stub.calls[2]!.path, "/api/sessions/session%2Fone/artifact-outputs");
   });
 
-  it("reads file and artifact bytes as text and encodes both path and id", async () => {
+  it("reads file and artifact bytes with their type, and encodes both path and id", async () => {
     const stub = new StubClient().stream("file body").stream("artifact body");
     const client = stub.asClient();
 
@@ -130,8 +130,12 @@ describe("workspace files and artifacts", () => {
     assert.equal(fileCall.pathname, "/api/sessions/session%2Fone/file");
     assert.equal(fileCall.query.get("path"), "data/a b.txt");
     assert.equal(stub.calls[1]!.path, "/api/sessions/session%2Fone/artifact-versions/version%2Fone/content");
-    assert.equal(file, "file body");
-    assert.equal(artifact, "artifact body");
+    // A picture or a workbook would arrive here too, so the reader hands back
+    // the bytes rather than the text a PNG would decode to.
+    assert.equal(new TextDecoder().decode(file.bytes), "file body");
+    assert.equal(new TextDecoder().decode(artifact.bytes), "artifact body");
+    assert.equal(file.mediaType, "text/plain;charset=UTF-8");
+    assert.equal(artifact.mediaType, "text/plain;charset=UTF-8");
   });
 });
 
@@ -144,6 +148,30 @@ describe("writes that must not be loose", () => {
     assert.equal(stub.calls[0]!.path, "/api/sessions/session%2Fone");
     assert.equal(stub.calls[0]!.init.method, "DELETE");
     assert.deepEqual(json(stub.calls[0]!), { confirmationId: "session/one" });
+  });
+
+  it("deletes a project by repeating its id back as confirmation", async () => {
+    const stub = new StubClient().reply({ deleted: "project/one" });
+
+    await sessions.deleteProject(stub.asClient(), "project/one");
+
+    assert.equal(stub.calls[0]!.path, "/api/projects/project%2Fone");
+    assert.equal(stub.calls[0]!.init.method, "DELETE");
+    // A Project takes its Sessions with it, so the same id gate applies.
+    assert.deepEqual(json(stub.calls[0]!), { confirmationId: "project/one" });
+  });
+
+  it("renames a project with the name alone", async () => {
+    const stub = new StubClient().reply({ id: "project/one", name: "脓毒症研究" });
+
+    const renamed = await sessions.renameProject(stub.asClient(), "project/one", "脓毒症研究");
+
+    assert.equal(stub.calls[0]!.path, "/api/projects/project%2Fone");
+    assert.equal(stub.calls[0]!.init.method, "PATCH");
+    assert.deepEqual(json(stub.calls[0]!), { name: "脓毒症研究" });
+    // The answer is the stored Project — trimming and duplicate checks are the
+    // server's, and the row shows what it returned.
+    assert.equal(renamed.name, "脓毒症研究");
   });
 
   it("sends the Runner allowlist whole, including an empty list", async () => {

@@ -291,8 +291,9 @@ minutes generation; DRB-59/64 allow 120 minutes. Nightly judge timeout is 10
 minutes. Team generation allows 55 minutes; PUCT generation 120 minutes.
 Its optional AI audit allows up to 65 more minutes when explicitly enabled
 locally; both daily and release leave that audit disabled. Job setup counts toward the four-hour worker
-ceiling. `fail-fast: false` retains evidence from independent workers; there
-are no automatic case retries. Rebuilding a merge group repeats its model calls.
+ceiling. `fail-fast: false` retains evidence from independent workers; the only
+automatic repeat is the one an early model-gateway fault earns, described
+below. Rebuilding a merge group repeats its model calls.
 Monthly usage is the sum of actual provider usage across queue attempts,
 approximately 30 daily runs and version candidates; provider rates and actual
 call counts, not timeout ceilings, determine money spent.
@@ -309,6 +310,58 @@ Both default to Python 3.14 independently of the product service environments;
 `SCIENCE_RESEARCH_PYTHON` overrides only the benchmark interpreter. The existing
 offline research UT check therefore exercises the same dependencies as real
 workers without model calls or gated dataset downloads.
+
+### Transient model-gateway faults in the real-model suite
+
+A real-model case can fail because the configured provider answered with a
+server error, not because the product ran and did not deliver. The suite
+tells the two apart. A failure that carries a gateway status (500, 502,
+503, 504) together with a provider marker — the gateway's own `181001`
+model-call code, `new_api_error`, `model_not_found`, "no available channel" —
+is recorded as `PROVIDER_FAULT` rather than `FAIL`:
+
+- the provider's own text is kept unchanged in the failure record;
+- the case counts as executed, and the cases that passed in the same job stay
+  `PASS`;
+- the accounting reports `PROVIDER_FAULT: <case>` instead of `FAIL: <case>`,
+  and the suite's status is `PROVIDER_FAULT` rather than `FAIL`;
+- the fault stays visible in the verdict, the step summary and the artifacts.
+
+**A soft classification is not a soft pass.** A planned case that only faulted
+is an unverified case: the product was never checked in it. The required
+real-E2E check — Daily, merge L3 and release L5 alike — therefore does **not**
+pass while a provider fault remains:
+
+| Outcome | Status | Exit code |
+| --- | --- | --- |
+| Every planned case passed | `PASS` | 0 |
+| A provider fault remains (no product failure) | `PROVIDER_FAULT` | non-zero |
+| A product failure | `FAIL` | non-zero |
+
+The two failure kinds stay apart in the accounting — a provider fault is never
+reported as a product `FAIL`, and a product failure is never softened into an
+outage — but neither one is a pass. The floor is the same in the worker, in
+the shard summary, in the suite reconcile and in the shared-plan summary, so
+no profile can turn an outage into a green required check.
+
+An authentication (401/403) or rate-limit (429) answer is a decision, not an
+outage, and is never soft-classified; neither is a semantic failure, a
+delivery miss or a timeout. The provider context has to name the gateway
+itself: a product delivery failure that merely quotes a provider status — the
+words "provider", "llm", "gateway" or "upstream" beside a `500` — is the
+product's own failure and stays a `FAIL`. A delivery miss or an assertion
+diff is the product's own report in the first place, so it stays a `FAIL`
+even when it carries the provider's words with it.
+
+A case whose first attempt died early on such a fault is run once more, on
+its own. Only an attempt that failed within five minutes is repeated, so a
+long research case that got that far is never repeated, and a product failure
+is never repeated at all. When a whole batch faults early, the batch reads as
+an outage and only a couple of cases are repeated as a probe. The repeat keeps
+its own evidence directory, and the first attempt's record stays in the
+artifacts. A repeat that did not work is recorded in the accounting
+(`PROVIDER_FAULT_REPEAT_FAILED`, `PROVIDER_FAULT_REPEAT_REPORT_MISSING`)
+instead of only in the log: the case stays unverified and the run says why.
 
 ### L5 full-public benchmark and baseline candidate
 

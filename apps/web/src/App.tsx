@@ -122,7 +122,7 @@ import { isAuthFailure } from "./api/auth.js";
 import { classifySessionPollMiss } from "./api/session-miss.js";
 import { TrajectoryViewer } from "@sciencediscovery/trajectory/web";
 import { createSessionActivity } from "./run-stream/session-activity.js";
-import { groupArtifactsBySession, upsertArtifactSession } from "./artifact-session-groups.js";
+import { artifactsForSession, groupArtifactsBySession, upsertArtifactSession } from "./artifact-session-groups.js";
 import { mergePermissionRequestSnapshot } from "./permission-state.js";
 import {
   clampWorkspaceWidth,
@@ -1655,7 +1655,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
   useEffect(() => {
     setArtifactSelectionMode(false);
     setSelectedArtifactIds(new Set());
-  }, [activeProjectId]);
+  }, [activeProjectId, activeSessionId]);
 
   useEffect(() => {
     setWorkspaceFileSelectionMode(false);
@@ -3770,7 +3770,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
 
   async function downloadSelectedArtifacts(): Promise<void> {
     if (!activeProjectId || artifactArchiveBusy) return;
-    const selected = artifacts.filter((artifact) => selectedArtifactIds.has(artifact.id));
+    const selected = sessionArtifacts.filter((artifact) => selectedArtifactIds.has(artifact.id));
     const countLimitError = artifactArchiveLimitError(selected.length, 0);
     if (!selected.length || countLimitError) {
       if (countLimitError) pushToast("error", t("artifact.archiveFailed"), countLimitError);
@@ -4117,8 +4117,9 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
   }
   const sessionArchived = Boolean(session?.archivedAt);
   const sessionPending = Boolean(activeSessionId) && session?.id !== activeSessionId;
+  const sessionArtifacts = artifactsForSession(artifacts, activeSessionId, artifactOutputs);
   const artifactGroups = groupArtifactsBySession({
-    artifacts,
+    artifacts: sessionArtifacts,
     catalogProjectId: artifactSessionCatalogProjectId,
     deletedSessionLabel: t("app.deletedSession"),
     projectId: activeProjectId,
@@ -4918,8 +4919,8 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
               </label>
             ) : <p className="muted">{sessionArchived ? t("app.archivedWorkspace") : t("app.createSessionWorkspace")}</p>}
 
-            {artifacts.length > 0 ? <details className="workspace-fold artifact-catalog-section">
-              <summary><ChevronRightIcon className="fold-chevron" size={15} /><strong>{t("app.artifacts")}</strong><span className="fold-meta">{artifacts.length}</span></summary>
+            {sessionArtifacts.length > 0 ? <details className="workspace-fold artifact-catalog-section">
+              <summary><ChevronRightIcon className="fold-chevron" size={15} /><strong>{t("app.artifacts")}</strong><span className="fold-meta">{sessionArtifacts.length}</span></summary>
               <div className="artifact-catalog">
                 {!projectsLoaded ? <SkeletonRows className="file-skeleton" count={3} /> : <ArtifactLifecycleProvider
                   onDelete={deleteArtifact}
@@ -4934,7 +4935,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
                           aria-label={artifactSelectionMode ? t("app.cancelArtifactSelection") : t("app.selectArtifacts")}
                           aria-pressed={artifactSelectionMode}
                           className="artifact-header-action"
-                          disabled={!artifacts.length}
+                          disabled={!sessionArtifacts.length}
                           onClick={(event) => {
                             event.preventDefault();
                             event.stopPropagation();
@@ -4970,7 +4971,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
                     </div>
                   </details>
                 ))}</ArtifactLifecycleProvider>}
-                {activeProjectId && artifacts.length === 0 ? <p className="muted centered">{t("app.noArtifacts")}</p> : null}
+                {activeProjectId && sessionArtifacts.length === 0 ? <p className="muted centered">{t("app.noArtifacts")}</p> : null}
               </div>
             </details> : null}
 

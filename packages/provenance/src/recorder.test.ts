@@ -288,3 +288,226 @@ test("observeNpuJob forwards parentSubagentId from options", async (context) => 
   assert.equal(client.executions.length, 1);
   assert.equal(client.executions[0]!.parentSubagentId, "subagent-7");
 });
+
+
+test("observation error without abort records unconfirmed and skips the memory graph", async (context) => {
+  const client = new CapturingClient();
+  const runs: Array<{ id: string; status: string }> = [];
+  const { dataDir, recorder } = await buildRecorder(client, {
+    listArtifacts: () => [],
+    listArtifactVersions: () => [],
+    listEnvironmentRevisions: () => [],
+    appendExecutionRun: async (run: { id: string; status: string; exitCode?: number | null }) => { runs.push({ id: run.id, status: run.status }); },
+    listExecutionRuns: async () => [],
+    replaceScientificEnvironmentCatalog: async () => undefined,
+  } as any);
+  context.after(() => rm(dataDir, { force: true, recursive: true }));
+  const permissionEpoch = {
+    createdAt: "2026-01-01T00:00:00.000Z",
+    environmentRevisionId: "env-1",
+    id: "epoch-1",
+    mounts: [],
+    networkPolicy: "none",
+    reason: "test",
+    secretRefs: [],
+    sessionId: "session-1",
+  } as const;
+  const runnerClient = {
+    health: async () => ({ sandbox: "bubblewrap" }),
+  } as any;
+  await assert.rejects(
+    recorder.executeShell({
+      agentId: "main",
+      code: "echo hi",
+      permissionEpoch: permissionEpoch as any,
+      runnerClient,
+      sessionId: "session-1",
+      turnId: "turn-1",
+      workspaceRoot: dataDir,
+      dispatch: async () => { throw new Error("status observation lost"); },
+    }),
+    /status observation lost/,
+  );
+  assert.equal(runs.length, 1);
+  assert.equal(runs[0]!.status, "unconfirmed");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(client.executions.length, 0, "unconfirmed must not be mirrored as a job failure");
+});
+
+test("abort during dispatch still records cancelled", async (context) => {
+  const runs: Array<{ status: string }> = [];
+  const { dataDir, recorder } = await buildRecorder(new CapturingClient(), {
+    listArtifacts: () => [],
+    listArtifactVersions: () => [],
+    listEnvironmentRevisions: () => [],
+    appendExecutionRun: async (run: { id: string; status: string; exitCode?: number | null }) => { runs.push({ status: run.status }); },
+    listExecutionRuns: async () => [],
+  } as any);
+  context.after(() => rm(dataDir, { force: true, recursive: true }));
+  const permissionEpoch = {
+    createdAt: "2026-01-01T00:00:00.000Z",
+    environmentRevisionId: "env-1",
+    id: "epoch-1",
+    mounts: [],
+    networkPolicy: "none",
+    reason: "test",
+    secretRefs: [],
+    sessionId: "session-1",
+  } as const;
+  const signal = AbortSignal.abort();
+  await assert.rejects(
+    recorder.executeShell({
+      agentId: "main",
+      code: "echo hi",
+      permissionEpoch: permissionEpoch as any,
+      runnerClient: { health: async () => ({ sandbox: "bubblewrap" }) } as any,
+      sessionId: "session-1",
+      signal,
+      turnId: "turn-1",
+      workspaceRoot: dataDir,
+      dispatch: async () => { throw new Error("aborted"); },
+    }),
+    /aborted/,
+  );
+  assert.equal(runs[0]!.status, "cancelled");
+});
+
+test("committed non-zero exit still records failed", async (context) => {
+  const client = new CapturingClient();
+  const runs: Array<{ status: string; exitCode: number | null }> = [];
+  const { dataDir, recorder } = await buildRecorder(client, {
+    listArtifacts: () => [],
+    listArtifactVersions: () => [],
+    listEnvironmentRevisions: () => [],
+    appendExecutionRun: async (run: { id: string; status: string; exitCode?: number | null }) => { runs.push({ status: run.status, exitCode: run.exitCode ?? null }); },
+    listExecutionRuns: async () => [],
+  } as any);
+  context.after(() => rm(dataDir, { force: true, recursive: true }));
+  const permissionEpoch = {
+    createdAt: "2026-01-01T00:00:00.000Z",
+    environmentRevisionId: "env-1",
+    id: "epoch-1",
+    mounts: [],
+    networkPolicy: "none",
+    reason: "test",
+    secretRefs: [],
+    sessionId: "session-1",
+  } as const;
+  const result = await recorder.executeShell({
+    agentId: "main",
+    code: "false",
+    permissionEpoch: permissionEpoch as any,
+    runnerClient: { health: async () => ({ sandbox: "bubblewrap" }) } as any,
+    sessionId: "session-1",
+    turnId: "turn-1",
+    workspaceRoot: dataDir,
+    dispatch: async () => ({
+      cgroupMode: "none" as const,
+      createdFiles: [],
+      environmentRevisionId: "env-1",
+      environmentVariables: {},
+      executionId: "exec-failed",
+      exitCode: 1,
+      finishedAt: "2026-01-01T00:01:00.000Z",
+      kernelId: "ephemeral:x",
+      kernelMode: "ephemeral" as const,
+      language: "shell" as const,
+      modifiedFiles: [],
+      networkPolicy: "none" as const,
+      runnerVersion: "test",
+      sandbox: "bubblewrap" as const,
+      startedAt: "2026-01-01T00:00:00.000Z",
+      stderr: "boom",
+      stdout: "",
+      workingDirectory: "/workspace",
+    }),
+  });
+  assert.equal(result.exitCode, 1);
+  assert.equal(runs[0]!.status, "failed");
+  assert.equal(runs[0]!.exitCode, 1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(client.executions.length, 1);
+  assert.equal(client.executions[0]!.status, "failed");
+});
+
+test("adoptShellOutcome appends a settled run for the same Execution ID", async (context) => {
+  const client = new CapturingClient();
+  const runs: Array<{ id: string; status: string }> = [];
+  const prior = {
+    id: "exec-adopt",
+    status: "unconfirmed" as const,
+    code: { hash: "abc", size: 1 },
+    cgroupMode: "unavailable" as const,
+    createdFiles: [],
+    environmentRevisionId: null,
+    envSnapshot: null,
+    exitCode: null,
+    finishedAt: "2026-01-01T00:00:00.000Z",
+    kernelId: "ephemeral:exec-adopt",
+    kernelMode: "ephemeral" as const,
+    language: "shell" as const,
+    modifiedFiles: [],
+    networkPolicy: "none" as const,
+    permissionEpochId: "epoch-1",
+    runnerVersion: "unavailable",
+    sandbox: "bubblewrap" as const,
+    sessionId: "session-1",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    stderr: { hash: "e", size: 1 },
+    stdout: { hash: "o", size: 1 },
+    tool: "run_shell" as const,
+    toolVersion: "1.1.0",
+    turnId: "turn-1",
+    workingDirectory: "unavailable",
+  };
+  const { dataDir, recorder } = await buildRecorder(client, {
+    listArtifacts: () => [],
+    listArtifactVersions: () => [],
+    listEnvironmentRevisions: () => [],
+    appendExecutionRun: async (run: { id: string; status: string; exitCode?: number | null }) => { runs.push({ id: run.id, status: run.status }); },
+    listExecutionRuns: async () => [prior as any],
+  } as any);
+  context.after(() => rm(dataDir, { force: true, recursive: true }));
+  await recorder.adoptShellOutcome({
+    agentId: "main",
+    executionId: "exec-adopt",
+    permissionEpoch: {
+      createdAt: "2026-01-01T00:00:00.000Z",
+      environmentRevisionId: "env-1",
+      id: "epoch-1",
+      mounts: [],
+      networkPolicy: "none",
+      reason: "test",
+      secretRefs: [],
+      sessionId: "session-1",
+    } as any,
+    result: {
+      exitCode: 0,
+      stdout: "ok",
+      stderr: "",
+      finishedAt: "2026-01-01T00:02:00.000Z",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      cgroupMode: "none",
+      createdFiles: [],
+      modifiedFiles: [],
+      environmentRevisionId: "env-1",
+      environmentVariables: {},
+      executionId: "exec-adopt",
+      language: "shell",
+      kernelId: "ephemeral:exec-adopt",
+      kernelMode: "ephemeral",
+      networkPolicy: "none",
+      runnerVersion: "test",
+      sandbox: "bubblewrap",
+      workingDirectory: "/workspace",
+    },
+    sessionId: "session-1",
+    status: "succeeded",
+    turnId: "turn-1",
+  });
+  assert.deepEqual(runs, [{ id: "exec-adopt", status: "succeeded" }]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(client.executions.length, 1);
+  assert.equal(client.executions[0]!.status, "succeeded");
+  assert.equal(client.executions[0]!.executionId, "exec-adopt");
+});

@@ -572,3 +572,97 @@ test("reconciliation adopts only Runner-committed outcomes and otherwise keeps t
     }
   }
 });
+
+test("lost observation completionStatus reports unconfirmed instead of failed", async (context) => {
+  const f = await fixture(context);
+  let reported = "";
+  const runner = {
+    startShellExecution: async (r: ShellExecutionRequest) => ({ ...owner, id: r.executionId, state: "running", queuedAt: "now" }),
+    getShellExecution: async () => { throw new TypeError("fetch failed"); },
+  } as unknown as RunnerClient;
+  const job = await f.service.start(owner, identity, () => runner, async (id, dispatch, status) => {
+    try { return await dispatch(request(id)); }
+    catch (error) { reported = status(); throw error; }
+  });
+  const result = await f.service.wait(job.id, owner, 1_000);
+  assert.equal(result.state, "unknown");
+  assert.equal(result.provenance, "unconfirmed");
+  assert.equal(reported, "unconfirmed");
+});
+
+test("reconcile adopts exit-code settled status and clears stale error/finishedAt", async (context) => {
+  const f = await fixture(context);
+  const cases: Array<{ exitCode: number; expected: "succeeded" | "failed"; label: string }> = [
+    { exitCode: 0, expected: "succeeded", label: "exit 0" },
+    { exitCode: 1, expected: "failed", label: "exit 1" },
+    { exitCode: 127, expected: "failed", label: "exit 127" },
+  ];
+  for (const { exitCode, expected, label } of cases) {
+    let submitted = 0;
+    let observations = 0;
+    const runner = {
+      startShellExecution: async (r: ShellExecutionRequest) => {
+        submitted++;
+        return { ...owner, id: r.executionId, state: "running", queuedAt: "now" };
+      },
+      getShellExecution: async (id: string) => {
+        observations++;
+        if (observations <= 5) throw new TypeError("fetch failed");
+        return {
+          ...owner, id, state: "completed", queuedAt: "now",
+          result: { ...f.result, exitCode }, version: f.ref,
+        } as ManagedExecution;
+      },
+    } as unknown as RunnerClient;
+    const adopted: Array<{ status: string; executionId: string }> = [];
+    const service = new ShellExecutions(f.db, f.versions, f.notices, 1);
+    service.setOutcomeAdopter(async ({ execution, status }) => {
+      adopted.push({ status, executionId: execution.id });
+    });
+    const job = await service.start(owner, identity, () => runner, (id, dispatch) => dispatch(request(id)));
+    const unknown = await service.wait(job.id, owner, 1_000);
+    assert.equal(unknown.state, "unknown", label);
+    assert.equal(unknown.provenance, "unconfirmed", label);
+    assert.ok(unknown.error, label);
+    const unknownFinishedAt = unknown.finishedAt;
+    assert.ok(unknownFinishedAt, label);
+    // Live observe and later adopt must agree: completionStatus already reported unconfirmed;
+    // reconcile through wait(runner) settles with exit-code rule.
+    const before = Date.now();
+    await new Promise((r) => setTimeout(r, 5)); // ensure finishedAt can move forward
+    const reconciled = await service.wait(job.id, owner, 0, undefined, () => runner);
+    assert.equal(reconciled.state, "completed", label);
+    assert.equal(reconciled.provenance, "committed", label);
+    assert.equal(reconciled.error, undefined, `${label}: stale observation error must be cleared`);
+    assert.equal(reconciled.result?.exitCode, exitCode, label);
+    assert.ok(reconciled.finishedAt, label);
+    assert.notEqual(reconciled.finishedAt, unknownFinishedAt, `${label}: finishedAt must be restamped by finish()`);
+    assert.ok(Date.parse(reconciled.finishedAt!) >= before, label);
+    assert.equal(submitted, 1, `${label}: never replayed`);
+    assert.deepEqual(adopted, [{ status: expected, executionId: job.id }], label);
+  }
+});
+
+test("live observe and reconcile write the same exit-code settled status", async (context) => {
+  const f = await fixture(context);
+  // Live path: observation never lost; completionStatus must use exit code.
+  for (const exitCode of [0, 1] as const) {
+    let reported = "";
+    const runner = {
+      startShellExecution: async (r: ShellExecutionRequest) => ({ ...owner, id: r.executionId, state: "running", queuedAt: "now" }),
+      getShellExecution: async (id: string) => ({
+        ...owner, id, state: "completed", queuedAt: "now",
+        result: { ...f.result, exitCode }, version: f.ref,
+      }),
+    } as unknown as RunnerClient;
+    const job = await f.service.start(owner, identity, () => runner, async (id, dispatch, status) => {
+      const result = await dispatch(request(id));
+      reported = status();
+      return result;
+    });
+    const done = await f.service.wait(job.id, owner, 1_000);
+    assert.equal(done.state, "completed");
+    assert.equal(done.provenance, "committed");
+    assert.equal(reported, exitCode === 0 ? "succeeded" : "failed", `live exit ${exitCode}`);
+  }
+});

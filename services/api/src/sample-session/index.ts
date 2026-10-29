@@ -18,7 +18,7 @@ import { dirname, resolve } from "node:path";
 import { gunzipSync } from "node:zlib";
 
 import { CasStore } from "@sciencediscovery/cas";
-import type { ArtifactOrigin, ArtifactOriginMeta, ScientificArtifactKind } from "@sciencediscovery/schema";
+import type { ArtifactOrigin, ArtifactOriginMeta, Project, ScientificArtifactKind } from "@sciencediscovery/schema";
 
 import { apiLog } from "../logging.js";
 import type { SessionStore } from "../store.js";
@@ -29,10 +29,10 @@ import { SAMPLE_SESSION_GZIP_BASE64 } from "./payload.js";
  *
  * A new user lands on an empty sidebar: nothing to read, nothing to try, and
  * no way to tell whether a run is worth waiting for. This seeds one real
- * Session — the conversation, its two runs and their run streams, the
- * workspace the analysis wrote, and the artifacts it published — so the
- * transcript, the tool blocks, the panel and the 产物 tab all have something in
- * them before the user has typed anything.
+ * Session — the conversation, its run and that run's streams, the workspace
+ * the analysis wrote, and the artifacts it published — so the transcript, the
+ * tool blocks, the panel and the 产物 tab all have something in them before the
+ * user has typed anything.
  *
  * The seed happens once, on an install that has no conversations of its own.
  * Its marker file is what makes that "once": deleting the sample is a decision
@@ -54,6 +54,11 @@ interface SampleArtifact {
   mediaType: string;
   origin: ArtifactOrigin;
   originMeta?: ArtifactOriginMeta;
+  /** The Artifact id the recorded transcript cites, when one of its messages
+   *  carries a chip for this document. Seeding mints new ids, so the reference
+   *  is rewritten to the new one — a citation has to open the seeded document,
+   *  not a row that does not exist on this install. */
+  recordedArtifactId?: string;
   sourcePath: string;
   title: string;
   turnId: string;
@@ -65,9 +70,9 @@ interface SampleArtifact {
 interface SampleSession {
   /** The workspace's text files, by the path the store reads them from. */
   files: Record<string, string>;
-  /** The ones that are not text — the analysis's two figures — as base64.
-   *  Kept apart so a text file is written back byte for byte through utf8 and
-   *  an image is not mangled through it. */
+  /** The ones that are not text — a figure, an image — as base64. Kept apart
+   *  so a text file is written back byte for byte through utf8 and an image is
+   *  not mangled through it. */
   encoded: Record<string, string>;
   /** The artifacts the analysis published, oldest version first. */
   artifacts: SampleArtifact[];
@@ -114,27 +119,51 @@ export async function seedSampleSession(store: SessionStore): Promise<boolean> {
     await writeMarker(store.dataDir, "existing workspace\n");
     return false;
   }
+  let created: Project | undefined;
   try {
     const sample = sampleSession();
     const project = await store.createProject(sample.projectName);
+    created = project;
     const session = await store.createSession(project.id, sample.sessionTitle, {}, {}, {
       allowUnconfiguredModel: true,
     });
     const ids = { dataDir: store.dataDir, projectId: project.id, sessionId: session.id };
+    const artifactIds = await seedArtifacts(store, session.id, sample.artifacts);
     for (const [path, text] of Object.entries(sample.files)) {
-      await writeSample(store.dataDir, path, ids, fillSampleSession(text, ids));
+      const filled = fillSampleSession(text, ids);
+      // Only the transcript carries chip references. A run stream is a
+      // recording of what happened, and its artifact events are snapshots of
+      // the ids the run minted — rewriting those would make the recording
+      // disagree with the version ids beside them.
+      await writeSample(store.dataDir, path, ids, path.startsWith("messages/")
+        ? rewriteArtifactIds(filled, artifactIds)
+        : filled);
     }
     for (const [path, base64] of Object.entries(sample.encoded)) {
       await writeSample(store.dataDir, path, ids, Buffer.from(base64, "base64"));
     }
-    await seedArtifacts(store, session.id, sample.artifacts);
     await writeMarker(store.dataDir, `${session.id}\n`);
     apiLog.info("sample_session_seeded", { projectId: project.id, sessionId: session.id });
     return true;
   } catch (error) {
-    apiLog.warn("sample_session_failed", {
-      reason: error instanceof Error ? error.message : String(error),
-    });
+    const reason = error instanceof Error ? error.message : String(error);
+    // All or nothing. A seed that stopped part-way leaves its own Project
+    // behind, and the next start reads any Project with a Session as "this
+    // install already has conversations" — so the half-written sample would
+    // stay forever, as the transcript this PR exists to stop shipping: a
+    // first step that reads a file nothing wrote. Removing it lets the next
+    // start seed the sample whole.
+    if (created) {
+      try {
+        await store.deleteProject(created.id, created.id);
+      } catch (cleanupError) {
+        apiLog.warn("sample_session_cleanup_failed", {
+          projectId: created.id,
+          reason: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+        });
+      }
+    }
+    apiLog.warn("sample_session_failed", { reason });
     return false;
   }
 }
@@ -149,14 +178,18 @@ export async function seedSampleSession(store: SessionStore): Promise<boolean> {
  *
  * A version whose predecessor is missing is skipped rather than flattened into
  * a first version: the panel would then claim a history that did not happen.
+ *
+ * Returns the ids the transcript has to be rewritten with: recorded id → the
+ * id this install minted.
  */
 async function seedArtifacts(
   store: SessionStore,
   sessionId: string,
   artifacts: SampleArtifact[],
-): Promise<void> {
+): Promise<Map<string, string>> {
   const cas = new CasStore(store.dataDir, "data");
   const previous = new Map<string, { artifactId: string; versionId: string }>();
+  const rewritten = new Map<string, string>();
   for (const artifact of artifacts) {
     const base = previous.get(artifact.logicalName);
     if (artifact.version > 1 && !base) continue;
@@ -177,7 +210,16 @@ async function seedArtifacts(
       ...(artifact.turnId ? { turnId: artifact.turnId } : {}),
     });
     previous.set(artifact.logicalName, { artifactId: written.artifact.id, versionId: written.version.id });
+    if (artifact.recordedArtifactId) rewritten.set(artifact.recordedArtifactId, written.artifact.id);
   }
+  return rewritten;
+}
+
+/** Point the transcript's chip references at the artifacts this install minted. */
+function rewriteArtifactIds(text: string, ids: ReadonlyMap<string, string>): string {
+  let rewritten = text;
+  for (const [recorded, seeded] of ids) rewritten = rewritten.split(recorded).join(seeded);
+  return rewritten;
 }
 
 async function writeSample(

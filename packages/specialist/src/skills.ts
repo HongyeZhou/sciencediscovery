@@ -60,6 +60,7 @@ import type {
   UpdateSkillFileRequest,
 } from "@sciencediscovery/schema";
 import { sha256 } from "@sciencediscovery/cas";
+import { settledExecutionRuns } from "@sciencediscovery/provenance";
 import { Unzip, UnzipInflate } from "fflate";
 import { parseDocument, stringify } from "yaml";
 
@@ -250,7 +251,12 @@ export function createSessionSkillDraft(input: {
   runs: ExecutionRun[];
   sessionTitle: string;
 }): SkillDraft {
-  if (input.messages.length < 2 && input.runs.length === 0) {
+  // Only executions with an observed outcome describe a reproducible step. An
+  // execution whose status observation was lost (`unconfirmed`) is neither a
+  // success nor a failure, and a reconciliation that later settles it replaces
+  // the observation with the real outcome.
+  const runs = settledExecutionRuns(input.runs);
+  if (input.messages.length < 2 && runs.length === 0) {
     throw validationError("The Session does not contain a completed workflow to distill");
   }
   const requestedName = input.request.name?.trim();
@@ -262,9 +268,9 @@ export function createSessionSkillDraft(input: {
     .filter((message) => message.role === "user")
     .slice(-5)
     .map((message) => message.content.replace(/\s+/g, " ").trim().slice(0, 240));
-  const languages = [...new Set(input.runs.map((run) => run.language).filter(Boolean))];
-  const outputPaths = [...new Set(input.runs.flatMap((run) => [...run.createdFiles, ...run.modifiedFiles]))].slice(0, 20);
-  const runSteps = input.runs.slice(-12).map((run, index) => (
+  const languages = [...new Set(runs.map((run) => run.language).filter(Boolean))];
+  const outputPaths = [...new Set(runs.flatMap((run) => [...run.createdFiles, ...run.modifiedFiles]))].slice(0, 20);
+  const runSteps = runs.slice(-12).map((run, index) => (
     `${index + 1}. Run an existing or generated ${run.language ?? "script"} step with the configured sandboxed environment; verify exit status and recorded outputs.`
   ));
   const workflow = runSteps.length ? runSteps : [
@@ -529,6 +535,7 @@ function compareSkillPaths(left: { path: string }, right: { path: string }): num
 export function validateSkillPackage(
   sourceFiles: ReadonlyMap<string, Buffer>,
   options: {
+    allowLegacyDescription?: boolean;
     directoryName?: string;
     readOnly?: boolean;
     revision?: number;
@@ -563,6 +570,9 @@ export function validateSkillPackage(
     throw validationError(`SKILL.md name ${name} must match package directory ${options.directoryName}`);
   }
   const description = typeof parsed.frontmatter.description === "string" ? parsed.frontmatter.description : "";
+  if (!options.allowLegacyDescription && !description.trim()) {
+    throw validationError("description must be a non-empty string");
+  }
   const metadata = normalizeMetadata(parsed.frontmatter.metadata);
   const diagnostics: SkillValidationDiagnostic[] = [];
   if (parsed.frontmatter["allowed-tools"] !== undefined) {
@@ -843,7 +853,7 @@ export class SkillCatalog {
   private async loadManaged(id: string, revision: number): Promise<ManagedPackage> {
     const root = this.revisionRoot(id, revision);
     const files = await readPackageDirectory(resolve(root, "package"));
-    const loaded = validateSkillPackage(files, { directoryName: id, revision });
+    const loaded = validateSkillPackage(files, { allowLegacyDescription: true, directoryName: id, revision });
     let createdAt = new Date(0).toISOString();
     let provenance: SkillVersionProvenance = { source: "manual" };
     try {
