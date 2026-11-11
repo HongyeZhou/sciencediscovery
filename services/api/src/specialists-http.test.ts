@@ -18,7 +18,7 @@ describe("the Specialist routes answer a rejected input as a client error", () =
   let server: Server;
   let request!: (method: "GET" | "POST" | "PUT" | "DELETE", path: string, body?: unknown) => Promise<Reply>;
   after(async () => {
-    const ordered = cleanups.reverse();
+    const ordered = cleanups.toReversed();
     await Promise.all(ordered.map((cleanup) => cleanup()));
   });
   before(async () => {
